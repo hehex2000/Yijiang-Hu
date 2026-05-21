@@ -1,0 +1,95 @@
+# 多因子选股系统配置文件
+
+# 数据源配置
+data_source:
+  # 主数据源: akshare (推荐) 或 tushare
+  primary: "tushare"
+  
+  # Tushare token (如果使用Tushare)
+  tushare_token: "761165a821532fe625262d6b33e144b9859a887c004acbcb981c319b"
+  
+  # 是否启用AkShare作为备用数据源
+  use_akshare_backup: true
+  
+  # 是否启用Tushare作为备用数据源（当Tushare为主源时通常为false）
+  use_tushare_backup: false
+  
+  # 数据获取重试次数
+  max_retries: 3
+  
+  # 请求延迟（秒）
+  request_delay: 1.0
+
+# 股票池配置
+stock_pool:
+  # 股票池类型: hs300, zz500, all
+  index_code: "000300"
+  
+  # 是否过滤ST股票
+  filter_st: true
+  
+  # 是否过滤停牌股票
+  filter_suspended: true
+  
+  # 最小上市天数
+  min_listing_days: 252
+
+# 数据处理配置
+processing:
+  # 去极值方法: winsorize, none
+  winsorize_method: "winsorize"
+  
+  # 去极值分位数
+  winsorize_lower: 0.01
+  winsorize_upper: 0.99
+  
+  # 缺失值处理方法: drop, fill_median, fill_mean
+  missing_value_method: "fill_median"
+  
+  # 标准化方法: zscore, rank
+  standardization_method: "zscore"
+  
+  # 是否进行行业中性化
+  neutralize_industry: true
+  
+  # 是否进行市值中性化
+  neutralize_market_cap: true
+
+# 选股配置
+selection:
+  # 因子加权方法: equal, ic_weighted, ir_weighted
+  weighting_method: "equal"
+  
+  # 输出TOP N股票
+  top_n: 50
+  
+  # 最小得分阈值
+  min_score: 0.0
+
+# 因子配置（默认只启用价值和成长因子）
+factors:
+  # 是否启用质量因子
+  enable_quality: false
+  
+  # 是否启用动量因子
+  enable_momentum: false
+  
+  # 是否启用技术因子
+  enable_technical: false
+
+# 输出配置
+output:
+  # 输出目录
+  output_dir: "data/results"
+  
+  # 输出格式: csv, excel
+  format: "csv"
+  
+  # 是否保存中间结果
+  save_intermediate: true
+
+# 日志配置
+logging:
+  level: "INFO"
+  file: "multi_factor_selection.log"
+  console: true

@@ -1,0 +1,37 @@
+# MANIFEST.in for multi_factor_selection package
+
+# Include configuration files
+include config/*.yaml
+include config/*.yml
+
+# Include documentation
+include README.md
+include LICENSE
+include .env.example
+
+# Include requirements
+include requirements.txt
+include requirements-dev.txt
+
+# Include setup files
+include setup.py
+include pyproject.toml
+
+# Exclude unnecessary files
+exclude *.pyc
+exclude *.pyo
+exclude __pycache__/*
+exclude .git/*
+exclude .gitignore
+exclude .env
+exclude logs/*
+exclude data/raw/*
+exclude data/processed/*
+exclude data/results/*
+exclude .pytest_cache/*
+exclude .mypy_cache/*
+exclude htmlcov/*
+exclude .coverage
+exclude *.egg-info/*
+exclude dist/*
+exclude build/*

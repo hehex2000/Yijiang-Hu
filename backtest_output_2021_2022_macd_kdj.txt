@@ -1,0 +1,162 @@
+[32m2026-05-20 13:22:52.570[0m | [1mINFO    [0m | [36mbacktest.data_loader[0m:[36m__init__[0m:[36m33[0m - [1mDataLoader initialized with db_path: D:/tu-shareData/astock_daily.db[0m
+[32m2026-05-20 13:22:52.577[0m | [1mINFO    [0m | [36mbacktest.data_loader[0m:[36m__init__[0m:[36m39[0m - [1m✓ SQLite database connection test successful[0m
+[32m2026-05-20 13:22:52.577[0m | [34m[1mDEBUG   [0m | [36mbacktest.data_loader[0m:[36mget_adjusted_prices[0m:[36m83[0m - [34m[1mLoading adjusted prices for 601919 from 20210101 to 20221231[0m
+[32m2026-05-20 13:22:52.749[0m | [34m[1mDEBUG   [0m | [36mbacktest.data_loader[0m:[36mget_adjusted_prices[0m:[36m138[0m - [34m[1m✓ Got 405 days of adjusted prices for 601919[0m
+[32m2026-05-20 13:22:52.749[0m | [1mINFO    [0m | [36mbacktest.macd_rsi_strategy[0m:[36m__init__[0m:[36m63[0m - [1mMACDRSIStrategy initialized: macd=12/26/9, rsi=14/70/30, take_profit=0.25, stop_loss=0.1[0m
+[32m2026-05-20 13:22:52.749[0m | [1mINFO    [0m | [36mbacktest.macd_rsi_strategy[0m:[36mrun[0m:[36m121[0m - [1mRunning MACD/RSI strategy on 405 days of data...[0m
+[32m2026-05-20 13:22:52.759[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20210225, price=8.15, shares=12200, cash=100558.67[0m
+[32m2026-05-20 13:22:52.759[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20210302, price=7.12, shares=12200, profit=-12673.19, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.760[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20210315, price=6.68, shares=14000, cash=93790.16[0m
+[32m2026-05-20 13:22:52.760[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20210331, price=8.28, shares=14000, profit=22214.53, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.763[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20210610, price=15.33, shares=6800, cash=105309.89[0m
+[32m2026-05-20 13:22:52.763[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20210615, price=15.98, shares=6800, profit=4303.63, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.765[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20210812, price=17.51, shares=6100, cash=106999.30[0m
+[32m2026-05-20 13:22:52.766[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20210902, price=15.86, shares=6100, profit=-10237.19, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.767[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20210910, price=17.85, shares=5700, cash=101862.36[0m
+[32m2026-05-20 13:22:52.768[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20210927, price=15.39, shares=5700, profit=-14100.37, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.769[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20211026, price=12.94, shares=7300, cash=95003.93[0m
+[32m2026-05-20 13:22:52.769[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20211115, price=11.63, shares=7300, profit=-9708.69, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.772[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20211229, price=15.48, shares=5800, cash=89983.08[0m
+[32m2026-05-20 13:22:52.772[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20211230, price=14.89, shares=5800, profit=-3584.20, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.774[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220228, price=13.95, shares=6300, cash=88336.75[0m
+[32m2026-05-20 13:22:52.774[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220303, price=14.70, shares=6300, profit=4635.39, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.774[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220401, price=13.57, shares=6600, cash=91257.19[0m
+[32m2026-05-20 13:22:52.774[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220408, price=12.40, shares=6600, profit=-7839.01, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.780[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220505, price=11.95, shares=7200, cash=86967.50[0m
+[32m2026-05-20 13:22:52.781[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220606, price=12.29, shares=7200, profit=2341.05, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.781[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220615, price=12.22, shares=7100, cash=88581.64[0m
+[32m2026-05-20 13:22:52.782[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220616, price=11.89, shares=7100, profit=-2435.85, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.783[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220705, price=12.02, shares=7100, cash=87583.63[0m
+[32m2026-05-20 13:22:52.784[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220726, price=11.74, shares=7100, profit=-2096.96, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.785[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20220812, price=11.64, shares=7300, cash=85859.40[0m
+[32m2026-05-20 13:22:52.786[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20220830, price=12.18, shares=7300, profit=3824.30, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.788[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_buy[0m:[36m224[0m - [34m[1mBuy: 20221019, price=9.80, shares=8900, cash=87385.61[0m
+[32m2026-05-20 13:22:52.790[0m | [34m[1mDEBUG   [0m | [36mbacktest.macd_rsi_strategy[0m:[36m_sell[0m:[36m273[0m - [34m[1mSell: 20221122, price=10.42, shares=8900, profit=5361.40, reason=macd_death_cross_or_rsi_overbought[0m
+[32m2026-05-20 13:22:52.791[0m | [1mINFO    [0m | [36mbacktest.macd_rsi_strategy[0m:[36mrun[0m:[36m172[0m - [1m✓ MACD/RSI strategy completed: 28 orders[0m
+[32m2026-05-20 13:22:52.800[0m | [1mINFO    [0m | [36mbacktest.metrics[0m:[36mcalculate_metrics[0m:[36m52[0m - [1m✓ Metrics calculated: total_return=-10.00%, sharpe=0.00[0m
+[32m2026-05-20 13:22:52.800[0m | [1mINFO    [0m | [36mbacktest.dual_ma_strategy[0m:[36m__init__[0m:[36m43[0m - [1mDualMAStrategy initialized: capital=200000, take_profit=0.25, stop_loss=0.1[0m
+[32m2026-05-20 13:22:52.800[0m | [1mINFO    [0m | [36mbacktest.dual_ma_strategy[0m:[36mrun[0m:[36m55[0m - [1mRunning Dual MA strategy on 405 days of data...[0m
+[32m2026-05-20 13:22:52.801[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20210302, price=8.02, shares=12400, cash=100523.16[0m
+[32m2026-05-20 13:22:52.802[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20210302, price=7.12, shares=12400, profit=-11286.28, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.802[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20210323, price=7.99, shares=11800, cash=94411.58[0m
+[32m2026-05-20 13:22:52.802[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20210324, price=6.71, shares=11800, profit=-15213.65, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.806[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20210813, price=17.47, shares=4900, cash=87868.28[0m
+[32m2026-05-20 13:22:52.807[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20210909, price=16.86, shares=4900, profit=-3119.60, reason=death_cross[0m
+[32m2026-05-20 13:22:52.807[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20210915, price=17.66, shares=4800, cash=85617.30[0m
+[32m2026-05-20 13:22:52.807[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20210927, price=15.39, shares=4800, profit=-10956.81, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.808[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20211105, price=12.61, shares=6300, cash=79972.52[0m
+[32m2026-05-20 13:22:52.809[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20211108, price=12.42, shares=6300, profit=-1313.33, reason=death_cross[0m
+[32m2026-05-20 13:22:52.809[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20211202, price=13.61, shares=5800, cash=79146.45[0m
+[32m2026-05-20 13:22:52.810[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20220111, price=14.32, shares=5800, profit=3993.54, reason=death_cross[0m
+[32m2026-05-20 13:22:52.811[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20220303, price=14.37, shares=5600, cash=81627.27[0m
+[32m2026-05-20 13:22:52.812[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20220314, price=13.21, shares=5600, profit=-6568.48, reason=death_cross[0m
+[32m2026-05-20 13:22:52.813[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20220527, price=12.22, shares=6300, cash=78542.02[0m
+[32m2026-05-20 13:22:52.814[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20220617, price=11.61, shares=6300, profit=-3914.48, reason=death_cross[0m
+[32m2026-05-20 13:22:52.815[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20220708, price=12.69, shares=5900, cash=76721.51[0m
+[32m2026-05-20 13:22:52.816[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20220728, price=11.70, shares=5900, profit=-5931.05, reason=death_cross[0m
+[32m2026-05-20 13:22:52.817[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20220826, price=11.89, shares=6100, cash=73149.40[0m
+[32m2026-05-20 13:22:52.817[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20220913, price=11.23, shares=6100, profit=-4117.34, reason=death_cross[0m
+[32m2026-05-20 13:22:52.818[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_buy[0m:[36m155[0m - [34m[1mBuy: 20221108, price=10.17, shares=6900, cash=71415.51[0m
+[32m2026-05-20 13:22:52.819[0m | [34m[1mDEBUG   [0m | [36mbacktest.dual_ma_strategy[0m:[36m_sell[0m:[36m210[0m - [34m[1mSell: 20221226, price=10.70, shares=6900, profit=3584.39, reason=death_cross[0m
+[32m2026-05-20 13:22:52.820[0m | [1mINFO    [0m | [36mbacktest.dual_ma_strategy[0m:[36mrun[0m:[36m98[0m - [1m✓ Dual MA strategy completed: 22 orders[0m
+[32m2026-05-20 13:22:52.821[0m | [1mINFO    [0m | [36mbacktest.metrics[0m:[36mcalculate_metrics[0m:[36m52[0m - [1m✓ Metrics calculated: total_return=-27.42%, sharpe=0.00[0m
+[32m2026-05-20 13:22:52.822[0m | [1mINFO    [0m | [36mbacktest.turtle_strategy[0m:[36m__init__[0m:[36m58[0m - [1mTurtleStrategy initialized: capital=200000, channel_period=40, position_mode=half, max_positions=3, take_profit=0.25, stop_loss=0.1[0m
+[32m2026-05-20 13:22:52.822[0m | [1mINFO    [0m | [36mbacktest.turtle_strategy[0m:[36mrun[0m:[36m70[0m - [1mRunning Turtle strategy on 405 days of data...[0m
+[32m2026-05-20 13:22:52.824[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210408, price=10.64, shares=9400, total_cost=99990.03, position_count=1[0m
+[32m2026-05-20 13:22:52.824[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210409, price=9.74, shares=9400, profit=-8590.14, reason=breakdown[0m
+[32m2026-05-20 13:22:52.824[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210413, price=9.42, shares=10100, total_cost=95127.64, position_count=1[0m
+[32m2026-05-20 13:22:52.825[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210414, price=8.87, shares=10100, profit=-5630.23, reason=breakdown[0m
+[32m2026-05-20 13:22:52.825[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210428, price=10.57, shares=8700, total_cost=92011.18, position_count=1[0m
+[32m2026-05-20 13:22:52.825[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210429, price=10.65, shares=8700, profit=509.65, reason=breakdown[0m
+[32m2026-05-20 13:22:52.825[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210430, price=11.00, shares=8400, total_cost=92439.24, position_count=1[0m
+[32m2026-05-20 13:22:52.826[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210506, price=12.18, shares=8400, profit=9733.43, reason=breakdown[0m
+[32m2026-05-20 13:22:52.826[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210507, price=12.00, shares=8100, total_cost=97223.24, position_count=1[0m
+[32m2026-05-20 13:22:52.826[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210512, price=11.52, shares=8100, profit=-4049.29, reason=breakdown[0m
+[32m2026-05-20 13:22:52.826[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210518, price=13.10, shares=7300, total_cost=95667.77, position_count=1[0m
+[32m2026-05-20 13:22:52.826[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210520, price=13.17, shares=7300, profit=357.15, reason=breakdown[0m
+[32m2026-05-20 13:22:52.827[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210524, price=13.83, shares=6900, total_cost=95454.05, position_count=1[0m
+[32m2026-05-20 13:22:52.827[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210525, price=12.98, shares=6900, profit=-5998.83, reason=breakdown[0m
+[32m2026-05-20 13:22:52.827[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210602, price=13.59, shares=6800, total_cost=92446.59, position_count=1[0m
+[32m2026-05-20 13:22:52.827[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210603, price=12.96, shares=6800, profit=-4454.17, reason=breakdown[0m
+[32m2026-05-20 13:22:52.828[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210610, price=14.36, shares=6300, total_cost=90471.63, position_count=1[0m
+[32m2026-05-20 13:22:52.828[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210617, price=15.59, shares=6300, profit=7655.75, reason=breakdown[0m
+[32m2026-05-20 13:22:52.828[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210618, price=16.35, shares=5700, total_cost=93199.83, position_count=1[0m
+[32m2026-05-20 13:22:52.828[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210624, price=16.41, shares=5700, profit=252.98, reason=breakdown[0m
+[32m2026-05-20 13:22:52.829[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210628, price=17.76, shares=5300, total_cost=94124.54, position_count=1[0m
+[32m2026-05-20 13:22:52.829[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210630, price=17.76, shares=5300, profit=-99.34, reason=breakdown[0m
+[32m2026-05-20 13:22:52.829[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210701, price=18.85, shares=5000, total_cost=94277.64, position_count=1[0m
+[32m2026-05-20 13:22:52.829[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210702, price=18.34, shares=5000, profit=-2700.41, reason=breakdown[0m
+[32m2026-05-20 13:22:52.829[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210705, price=18.42, shares=5000, total_cost=92134.27, position_count=1[0m
+[32m2026-05-20 13:22:52.830[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210706, price=18.67, shares=5000, profit=1124.68, reason=breakdown[0m
+[32m2026-05-20 13:22:52.830[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20210708, price=18.61, shares=5000, total_cost=93083.48, position_count=1[0m
+[32m2026-05-20 13:22:52.830[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20210712, price=17.63, shares=5000, profit=-5022.56, reason=breakdown[0m
+[32m2026-05-20 13:22:52.832[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211008, price=13.45, shares=6800, total_cost=91495.56, position_count=1[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20211015, price=12.44, shares=6800, profit=-6994.15, reason=breakdown[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211019, price=13.05, shares=6700, total_cost=87482.88, position_count=1[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20211115, price=11.63, shares=6700, profit=-9657.52, reason=stop_loss[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211119, price=12.00, shares=6900, total_cost=82787.88, position_count=1[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211208, price=14.72, shares=2800, total_cost=41219.18, position_count=2[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20211210, price=14.89, shares=9700, profit=20207.61, reason=breakdown[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211214, price=14.93, shares=6200, total_cost=92554.46, position_count=1[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20211215, price=14.33, shares=6200, profit=-3826.55, reason=breakdown[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20211230, price=15.42, shares=5900, total_cost=90988.40, position_count=1[0m
+[32m2026-05-20 13:22:52.833[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20211231, price=15.00, shares=5900, profit=-2566.58, reason=breakdown[0m
+[32m2026-05-20 13:22:52.838[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220321, price=13.21, shares=6800, total_cost=89871.38, position_count=1[0m
+[32m2026-05-20 13:22:52.838[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220328, price=12.10, shares=6800, profit=-7694.70, reason=breakdown[0m
+[32m2026-05-20 13:22:52.838[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220330, price=12.86, shares=6700, total_cost=86202.64, position_count=1[0m
+[32m2026-05-20 13:22:52.839[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220401, price=12.66, shares=6700, profit=-1452.37, reason=breakdown[0m
+[32m2026-05-20 13:22:52.839[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220406, price=13.12, shares=6500, total_cost=85285.45, position_count=1[0m
+[32m2026-05-20 13:22:52.839[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220412, price=11.86, shares=6500, profit=-8284.57, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220413, price=12.19, shares=6600, total_cost=80502.08, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220419, price=11.93, shares=6600, profit=-1844.31, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220420, price=12.10, shares=6600, total_cost=79871.52, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220422, price=11.55, shares=6600, profit=-3732.47, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220425, price=11.48, shares=6800, total_cost=78068.99, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220427, price=10.57, shares=6800, profit=-6272.53, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220428, price=11.06, shares=6800, total_cost=75253.74, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220802, price=11.22, shares=6800, profit=963.82, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220804, price=10.94, shares=6900, total_cost=75522.31, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220919, price=10.56, shares=6900, profit=-2726.36, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220921, price=10.36, shares=7200, total_cost=74606.96, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220926, price=9.89, shares=7200, profit=-3507.48, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20220929, price=9.50, shares=7600, total_cost=72199.85, position_count=1[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20220930, price=9.30, shares=7600, profit=-1640.54, reason=breakdown[0m
+[32m2026-05-20 13:22:52.840[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_buy[0m:[36m194[0m - [34m[1mTurtle buy: 20221017, price=9.57, shares=7500, total_cost=71820.36, position_count=1[0m
+[32m2026-05-20 13:22:52.848[0m | [34m[1mDEBUG   [0m | [36mbacktest.turtle_strategy[0m:[36m_sell[0m:[36m250[0m - [34m[1mTurtle sell: 20221230, price=10.15, shares=7500, profit=4213.29, reason=end_of_backtest[0m
+[32m2026-05-20 13:22:52.848[0m | [1mINFO    [0m | [36mbacktest.turtle_strategy[0m:[36mrun[0m:[36m115[0m - [1m✓ Turtle strategy completed: 61 orders[0m
+[32m2026-05-20 13:22:52.851[0m | [1mINFO    [0m | [36mbacktest.metrics[0m:[36mcalculate_metrics[0m:[36m52[0m - [1m✓ Metrics calculated: total_return=-25.29%, sharpe=0.00[0m
+============================================================
+多策略回测 - MACD/RSI vs 双均线 vs 海龟 vs MACD/KDJ
+============================================================
+
+============================================================
+回测股票: 601919
+============================================================
+  数据加载成功: 405 天
+
+  [1/3] MACD/RSI策略...
+    总收益率: -10.00%
+    胜率: 42.86%
+    交易次数: 28
+
+  [2/3] 双均线策略 (MA5/20)...
+    总收益率: -27.42%
+    胜率: 18.18%
+    交易次数: 22
+
+  [3/3] 海龟策略 (N=40)...
+    总收益率: -25.29%
+    胜率: 30.00%
+    交易次数: 61
+
+  [4/4] MACD/KDJ策略...
+Traceback (most recent call last):
+  File "C:\Users\99395\WorkBuddy\multi_factor_selection\run_backtest_simple.py", line 234, in <module>
+    main()
+  File "C:\Users\99395\WorkBuddy\multi_factor_selection\run_backtest_simple.py", line 182, in main
+    results = run_backtest_for_stock(stock_code, start_date, end_date)
+  File "C:\Users\99395\WorkBuddy\multi_factor_selection\run_backtest_simple.py", line 132, in run_backtest_for_stock
+    macd_kdj = MACDKDJStrategy(
+  File "C:\Users\99395\WorkBuddy\multi_factor_selection\backtest\macd_kdj_strategy.py", line 73, in __init__
+    f"oversold/overbought={kd_oversold}/{kd_overbought}, "
+NameError: name 'kd_oversold' is not defined

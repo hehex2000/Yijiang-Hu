@@ -10,6 +10,7 @@ from loguru import logger
 from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')  # 非交互式后端，避免显示问题
+import re
 
 
 def prepare_returns(daily_values: pd.DataFrame) -> pd.Series:
@@ -101,6 +102,9 @@ def generate_report(strategy_name: str,
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
+    # 清理文件名中的非法字符（Windows/Linux 通用）
+    safe_name = re.sub(r'[\\/*?:"<>|]', '_', strategy_name)
+    
     if returns.empty or len(returns) < 2:
         logger.warning(f"{strategy_name}: 收益率数据不足，跳过报告生成")
         return {}
@@ -122,7 +126,7 @@ def generate_report(strategy_name: str,
         
         # 1. 生成 HTML 报告
         try:
-            html_path = output_path / f"report_{strategy_name}.html"
+            html_path = output_path / f"report_{safe_name}.html"
             
             if aligned_benchmark is not None and len(aligned_benchmark) > 1:
                 qs.reports.html(aligned_returns, 
@@ -147,7 +151,7 @@ def generate_report(strategy_name: str,
             fig = qs.plots.returns(aligned_returns, 
                                   benchmark=aligned_benchmark)
             if fig:
-                chart_path = output_path / f"{strategy_name}_cum_returns.png"
+                chart_path = output_path / f"{safe_name}_cum_returns.png"
                 fig.savefig(chart_path, dpi=100, bbox_inches='tight')
                 charts['cum_returns'] = str(chart_path)
                 matplotlib.pyplot.close(fig)
@@ -158,7 +162,7 @@ def generate_report(strategy_name: str,
             # 回撤图
             fig = qs.plots.drawdown(aligned_returns)
             if fig:
-                chart_path = output_path / f"{strategy_name}_drawdown.png"
+                chart_path = output_path / f"{safe_name}_drawdown.png"
                 fig.savefig(chart_path, dpi=100, bbox_inches='tight')
                 charts['drawdown'] = str(chart_path)
                 matplotlib.pyplot.close(fig)
@@ -169,7 +173,7 @@ def generate_report(strategy_name: str,
             # 月度收益热力图
             fig = qs.plots.monthly_heatmap(aligned_returns)
             if fig:
-                chart_path = output_path / f"{strategy_name}_monthly_heatmap.png"
+                chart_path = output_path / f"{safe_name}_monthly_heatmap.png"
                 fig.savefig(chart_path, dpi=100, bbox_inches='tight')
                 charts['monthly_heatmap'] = str(chart_path)
                 matplotlib.pyplot.close(fig)

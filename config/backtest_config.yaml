@@ -1,0 +1,44 @@
+capital:
+  dca_monthly: 5000
+  per_strategy: 200000
+  total: 600000
+data:
+  end_date: '20231229'
+  start_date: '20230103'
+  stocks_file: data/results/backtest_5stocks.csv
+dca:
+  amount_per_month: 5000
+  enabled: true
+  min_shares: 100
+  stop_loss: 0.25
+  take_profit: 0.25
+  target_shares: 1000
+dual_ma:
+  enabled: true
+  ma_long: 20
+  ma_short: 5
+  stop_loss: 0.1
+  take_profit: 0.3
+hs300_end: 20221230
+hs300_return: -0.26502638780157955
+hs300_start: 20210104
+output:
+  format:
+  - xlsx
+  - markdown
+  save_charts: false
+turtle:
+  channel_period: 80
+  enabled: true
+  max_positions: 3
+  position_mode: half
+  stamp_duty_rate: 0.001
+  stop_loss: 0.1
+  take_profit: 0.3
+  trading_fee_rate: 0.0002
+tushare_token: your_tushare_token_here
+weekly_dca:
+  enabled: false
+  shares_per_week: 100
+  stop_loss: 0.1
+  take_profit: 0.3

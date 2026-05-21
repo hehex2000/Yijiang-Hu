@@ -1,0 +1,420 @@
+
+======================================================================
+多因子选股系统 (使用本地 SQLite 数据库)
+======================================================================
+
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36m==================================================[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36m多因子选股系统启动 (SQLite版本)[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36m==================================================[0m
+
+[1/6] 初始化模块...
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36mSQLiteDataFetcher initialized with db_path: D:/tu-shareData/astock_daily.db[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36m✓ SQLite database connection test successful[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36mFactorCalculator initialized (启用因子: 价值, 成长)[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36mFactorProcessor initialized[0m
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36mStockSelector initialized (top_n=50)[0m
+✓ 模块初始化完成
+
+[2/6] 获取股票池...
+  正在从 AkShare 获取沪深300成分股...
+  ✓ 从 AkShare 获取到 300 只沪深300成分股
+✓ 获取到 300 只股票
+
+[3/6] 计算因子（这可能需要几分钟）...
+[32m2026-05-13 13:05:02[0m | [1mINFO    [0m | [36mCalculating factors for 300 stocks (max_workers=1)...[0m
+[32m2026-05-13 13:05:02[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000001[0m
+[32m2026-05-13 13:05:02[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000002[0m
+[32m2026-05-13 13:05:02[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000063[0m
+[32m2026-05-13 13:05:02[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000100[0m
+[32m2026-05-13 13:05:02[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000157[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000166[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000301[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000333[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000338[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000408[0m
+[32m2026-05-13 13:05:03[0m | [1mINFO    [0m | [36mProgress: 10/300[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000425[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000538[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000568[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000596[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000617[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000625[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000630[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000651[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000661[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000708[0m
+[32m2026-05-13 13:05:03[0m | [1mINFO    [0m | [36mProgress: 20/300[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000725[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000768[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000776[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000786[0m
+[32m2026-05-13 13:05:03[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000792[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000807[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000858[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000876[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000895[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000938[0m
+[32m2026-05-13 13:05:04[0m | [1mINFO    [0m | [36mProgress: 30/300[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000963[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000975[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000977[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000983[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 000999[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 001391[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 001965[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 001979[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002001[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002027[0m
+[32m2026-05-13 13:05:04[0m | [1mINFO    [0m | [36mProgress: 40/300[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002028[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002049[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002050[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002074[0m
+[32m2026-05-13 13:05:04[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002142[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002179[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002230[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002236[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002241[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002252[0m
+[32m2026-05-13 13:05:05[0m | [1mINFO    [0m | [36mProgress: 50/300[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002304[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002311[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002352[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002371[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002384[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002415[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002422[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002459[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002460[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002463[0m
+[32m2026-05-13 13:05:05[0m | [1mINFO    [0m | [36mProgress: 60/300[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002466[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002475[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002493[0m
+[32m2026-05-13 13:05:05[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002594[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002600[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002601[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002625[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002648[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002709[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002714[0m
+[32m2026-05-13 13:05:06[0m | [1mINFO    [0m | [36mProgress: 70/300[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002736[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002916[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002920[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 002938[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 003816[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300014[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300015[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300033[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300059[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300122[0m
+[32m2026-05-13 13:05:06[0m | [1mINFO    [0m | [36mProgress: 80/300[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300124[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300251[0m
+[32m2026-05-13 13:05:06[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300274[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300308[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300316[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300347[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300394[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300408[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300413[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300418[0m
+[32m2026-05-13 13:05:07[0m | [1mINFO    [0m | [36mProgress: 90/300[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300433[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300442[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300476[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300498[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300502[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300628[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300661[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300750[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300759[0m
+[32m2026-05-13 13:05:07[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300760[0m
+[32m2026-05-13 13:05:07[0m | [1mINFO    [0m | [36mProgress: 100/300[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300782[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300803[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300832[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300866[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300896[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300979[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 300999[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 301236[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 301269[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 302132[0m
+[32m2026-05-13 13:05:08[0m | [1mINFO    [0m | [36mProgress: 110/300[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600000[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600009[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600010[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600011[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600015[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600016[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600018[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600019[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600023[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600025[0m
+[32m2026-05-13 13:05:08[0m | [1mINFO    [0m | [36mProgress: 120/300[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600026[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600027[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600028[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600029[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600030[0m
+[32m2026-05-13 13:05:08[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600031[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600036[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600039[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600048[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600050[0m
+[32m2026-05-13 13:05:09[0m | [1mINFO    [0m | [36mProgress: 130/300[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600061[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600066[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600085[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600089[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600104[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600111[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600115[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600150[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600160[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600161[0m
+[32m2026-05-13 13:05:09[0m | [1mINFO    [0m | [36mProgress: 140/300[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600176[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600183[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600188[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600196[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600219[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600233[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600276[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600309[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600346[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600362[0m
+[32m2026-05-13 13:05:09[0m | [1mINFO    [0m | [36mProgress: 150/300[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600372[0m
+[32m2026-05-13 13:05:09[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600377[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600406[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600415[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600426[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600436[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600438[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600460[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600482[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600489[0m
+[32m2026-05-13 13:05:10[0m | [1mINFO    [0m | [36mProgress: 160/300[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600515[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600519[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600522[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600547[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600570[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600584[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600585[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600588[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600600[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600660[0m
+[32m2026-05-13 13:05:10[0m | [1mINFO    [0m | [36mProgress: 170/300[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600674[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600690[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600741[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600760[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600795[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600803[0m
+[32m2026-05-13 13:05:10[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600809[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600845[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600875[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600886[0m
+[32m2026-05-13 13:05:11[0m | [1mINFO    [0m | [36mProgress: 180/300[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600887[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600893[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600900[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600905[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600918[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600919[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600926[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mNo history data for 600930[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600930[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600938[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600941[0m
+[32m2026-05-13 13:05:11[0m | [1mINFO    [0m | [36mProgress: 190/300[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600958[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600989[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 600999[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601006[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601009[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601012[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601018[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601021[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601058[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601059[0m
+[32m2026-05-13 13:05:11[0m | [1mINFO    [0m | [36mProgress: 200/300[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601066[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601077[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601088[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601100[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601111[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601117[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601127[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601136[0m
+[32m2026-05-13 13:05:11[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601138[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601166[0m
+[32m2026-05-13 13:05:12[0m | [1mINFO    [0m | [36mProgress: 210/300[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601169[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601186[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601211[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601225[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601229[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601236[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601238[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601288[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601298[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601318[0m
+[32m2026-05-13 13:05:12[0m | [1mINFO    [0m | [36mProgress: 220/300[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601319[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601328[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601336[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601360[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601377[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601390[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601398[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601456[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601600[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601601[0m
+[32m2026-05-13 13:05:12[0m | [1mINFO    [0m | [36mProgress: 230/300[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601607[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601618[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601628[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601633[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601658[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601668[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601669[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601688[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601689[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601698[0m
+[32m2026-05-13 13:05:12[0m | [1mINFO    [0m | [36mProgress: 240/300[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601728[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601766[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601788[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601800[0m
+[32m2026-05-13 13:05:12[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601808[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601816[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601818[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601825[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601838[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601857[0m
+[32m2026-05-13 13:05:13[0m | [1mINFO    [0m | [36mProgress: 250/300[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601868[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601872[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601877[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601878[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601881[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601888[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601898[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601899[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601901[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601916[0m
+[32m2026-05-13 13:05:13[0m | [1mINFO    [0m | [36mProgress: 260/300[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601919[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601939[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601985[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601988[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601995[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 601998[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603019[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603195[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603259[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603260[0m
+[32m2026-05-13 13:05:13[0m | [1mINFO    [0m | [36mProgress: 270/300[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603288[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603296[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603369[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603392[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603501[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603799[0m
+[32m2026-05-13 13:05:13[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603893[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603986[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 603993[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 605117[0m
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36mProgress: 280/300[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 605499[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688008[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688009[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688012[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688036[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688041[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688047[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688082[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688111[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688126[0m
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36mProgress: 290/300[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688169[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688187[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688223[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688256[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688271[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688303[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688396[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688472[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688506[0m
+[32m2026-05-13 13:05:14[0m | [33m[1mWARNING [0m | [36mFinancial data not available in SQLite database for 688981[0m
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36mProgress: 300/300[0m
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36m✓ Factor calculation completed: 300 stocks[0m
+✓ 因子计算完成: 300 只股票
+
+[4/6] 处理因子...
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36mProcessing 300 stocks with 14 factors...[0m
+[32m2026-05-13 13:05:14[0m | [1mINFO    [0m | [36m✓ Factor direction unified[0m
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+C:\Python39\lib\site-packages\numpy\lib\nanfunctions.py:1215: RuntimeWarning: Mean of empty slice
+  return np.nanmean(a, axis, out=out, keepdims=keepdims)
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m✓ Factor cleaning completed[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m✓ Factor standardization completed (method: zscore)[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36mScoring completed: 5 score components[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m✓ Scoring completed[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m✓ Factor processing completed: 300 stocks[0m
+✓ 因子处理完成
+
+[5/6] 执行选股...
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36mSelecting top 50 stocks (min_score=0.0)...[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36mSelected top 50 stocks[0m
+✓ 选股完成: 50 只股票
+
+[6/6] 导出结果...
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m✓ Results exported to CSV: data/results\selection_20260513_130515.csv[0m
+✓ 结果已保存到: data/results\selection_20260513_130515.csv
+
+
+======================================================================
+TOP 10 股票:
+======================================================================
+ rank   code name  total_score  current_price   market_cap
+    1 601186 中国铁建     0.560022           9.17 9.179770e+10
+    2 601800 中国交建     0.557950          10.45 1.121323e+11
+    3 601390 中国中铁     0.557709           6.39 1.266403e+11
+    4 601668 中国建筑     0.555732           6.00 2.061887e+11
+    5 600048 保利发展     0.552591           8.86 7.924434e+10
+    6 000002  万科Ａ     0.550969           7.26 4.891591e+10
+    7 600104 上汽集团     0.543690          20.76 1.540367e+11
+    8 601618 中国中冶     0.539245           3.30 6.154915e+10
+    9 601669 中国电建     0.529412           5.46 1.024956e+11
+   10 600016 民生银行     0.529244           4.13 1.611193e+11
+======================================================================
+
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m==================================================[0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m选股完成![0m
+[32m2026-05-13 13:05:15[0m | [1mINFO    [0m | [36m==================================================
+[0m
+======================================================================
+程序执行完成!
+======================================================================
+

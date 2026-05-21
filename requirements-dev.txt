@@ -1,0 +1,48 @@
+# 开发依赖包
+# Development dependencies for multi_factor_selection
+
+# 测试框架 / Testing frameworks
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-mock>=3.11.0
+pytest-xdist>=3.0.0
+
+# 代码质量 / Code quality
+black>=23.0.0
+flake8>=6.0.0
+flake8-bugbear>=23.0.0
+flake8-comprehensions>=3.10.0
+isort>=5.12.0
+mypy>=1.0.0
+
+# 安全检查 / Security checking
+safety>=2.3.0
+bandit>=1.7.5
+
+# 预提交钩子 / Pre-commit hooks
+pre-commit>=3.0.0
+commitizen>=3.0.0
+
+# 文档生成 / Documentation generation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.2.0
+myst-parser>=2.0.0
+
+# Jupyter 支持 / Jupyter support
+jupyter>=1.0.0
+nbqa>=1.6.0
+
+# 类型检查依赖 / Type checking dependencies
+types-pyyaml>=6.0.0
+types-python-dateutil>=2.8.0
+
+# 其他工具 / Other tools
+tox>=4.0.0
+twine>=4.0.0
+build>=1.0.0
+wheel>=0.40.0
+
+# 可选：数据分析工具 / Optional: Data analysis tools
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.17.0
