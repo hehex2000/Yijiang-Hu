@@ -140,7 +140,12 @@ def _calculate_max_drawdown(daily_values: pd.DataFrame) -> float:
 
 def _calculate_sharpe_ratio(daily_values: pd.DataFrame,
                              risk_free_rate: float = 0.03) -> float:
-    """计算夏普比率"""
+    """
+    计算夏普比率（标准方法）
+    
+    公式： Sharpe = Mean(日超额收益) / Std(日超额收益) * sqrt(252)
+    其中：日超额收益 = 日收益率 - 日无风险利率
+    """
     if len(daily_values) < 2:
         return 0.0
     
@@ -153,19 +158,22 @@ def _calculate_sharpe_ratio(daily_values: pd.DataFrame,
     if len(daily_returns) == 0:
         return 0.0
     
-    # 年化收益率和波动率
-    annualized_return = _calculate_annualized_return(daily_values)
+    # 标准夏普比率计算
+    # 1. 计算日无风险利率
+    daily_rf = risk_free_rate / 252
     
-    # 检查 annualized_return 是否有效
-    if pd.isna(annualized_return) or np.isinf(annualized_return):
+    # 2. 计算日超额收益
+    excess_returns = daily_returns - daily_rf
+    
+    # 3. 计算超额收益的均值和标准差
+    mean_excess = excess_returns.mean()
+    std_excess = excess_returns.std()
+    
+    if std_excess == 0 or pd.isna(std_excess) or pd.isna(mean_excess):
         return 0.0
     
-    annualized_vol = daily_returns.std() * np.sqrt(252)  # 252个交易日
-    
-    if annualized_vol == 0 or pd.isna(annualized_vol):
-        return 0.0
-    
-    sharpe = (annualized_return - risk_free_rate) / annualized_vol
+    # 4. 年化夏普比率
+    sharpe = mean_excess / std_excess * np.sqrt(252)
     
     # 检查 sharpe 是否为 nan 或 inf
     if pd.isna(sharpe) or np.isinf(sharpe):
