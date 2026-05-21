@@ -93,6 +93,15 @@ except ImportError:
     ENABLE_QUANTSTATS = False
     print("[WARN] QuantStats 未安装，跳过图表生成")
 
+# 导入 QF-Lib 分析器
+try:
+    from backtest.qflib_analyzer import analyze_backtest_results
+    ENABLE_QFLIB = True
+    print("[✓] QF-Lib 分析模块已加载")
+except ImportError:
+    ENABLE_QFLIB = False
+    print("[WARN] QF-Lib 未安装，跳过增强分析")
+
 print("\n[3/5] 运行回测...")
 print(f"  回测期间: {BACKTEST.get('start_date', '2023-01-01')} 至 {BACKTEST.get('end_date', '2023-12-31')}")
 print(f"  策略数量: {len(STRATEGY_CLASSES)} 种")
@@ -228,6 +237,31 @@ if ENABLE_QUANTSTATS and daily_values_dict:
                     print(f"  ⚠️ 生成报告失败 {code}_{strategy_name}: {e}")
     
     print(f"[OK] 已生成 {generated} 份 QuantStats 报告到: {qs_output_dir}")
+
+# 3.7 使用 QF-Lib 进行增强分析
+if ENABLE_QFLIB and daily_values_dict:
+    print("\n[3.7/5] 使用 QF-Lib 进行增强分析...")
+    
+    try:
+        # 分析回测结果
+        comparison_df = analyze_backtest_results(results, daily_values_dict)
+        
+        # 保存对比结果
+        qflib_output_path = os.path.join(output_dir, f"qflib_analysis_{datetime.now().strftime('%Y%m%d')}.csv")
+        comparison_df.to_csv(qflib_output_path, index=False, encoding='utf-8-sig')
+        print(f"[OK] QF-Lib 分析结果已保存到: {qflib_output_path}")
+        
+        # 打印 TOP 10 对比结果
+        print("\n📊 QF-Lib vs Pandas 指标对比 (TOP 10):")
+        top_comparison = comparison_df.sort_values('总收益率', ascending=False).head(10)
+        for _, row in top_comparison.iterrows():
+            print(f"  {row['股票代码']} {row['股票名称']} - {row['策略']}:")
+            print(f"    累计收益: {row['总收益率']:+.2%} (QF-Lib: {row['qf_累计收益']:+.2%})")
+            print(f"    夏普比率: {row['夏普比率']:.2f} (QF-Lib: {row['qf_夏普比率']:.2f})")
+            print(f"    最大回撤: {row['最大回撤']:.2%} (QF-Lib: {row['qf_最大回撤']:.2%})")
+        
+    except Exception as e:
+        print(f"[WARN] QF-Lib 分析失败: {e}")
 
 # 4. 保存和显示结果
 print("\n[4/5] 保存和显示结果...\n")
