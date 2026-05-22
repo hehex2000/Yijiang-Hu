@@ -100,6 +100,20 @@ TRANSLATIONS = {
     "Recovery Time": "恢复时间",
     "Skewness": "偏度",
     "Kurtosis": "峰度",
+    
+    # 图表标题和 Axis 标签
+    "Cumulative Returns": "累计收益率",
+    "Cumulative Returns (Log Scaled)": "累计收益率（对数坐标）",
+    "EOY Returns": "年末收益率",
+    "Returns Distribution": "收益率分布",
+    "Drawdown": "回撤",
+    "Volatility": "波动率",
+    "Rolling Sharpe": "滚动夏普比率",
+    "Rolling Sortino": "滚动索提诺比率",
+    "Rolling CAGR": "滚动年化收益率",
+    "Rolling Volatility": "滚动波动率",
+    "Rolling Max Drawdown": "滚动最大回撤",
+    "Rolling Stats": "滚动统计",
 }
 
 
