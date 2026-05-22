@@ -11,6 +11,136 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')  # 非交互式后端，避免显示问题
 import re
+from typing import Dict
+
+
+# ========= 英文→中文翻译词典 =========
+TRANSLATIONS = {
+    # 标题和章节
+    "Strategy Analysis": "策略分析",
+    "Strategy Report": "策略报告",
+    "Performance": "绩效表现",
+    "Risk": "风险指标",
+    "Monthly Returns": "月度收益率",
+    "Yearly Returns": "年度收益率",
+    "Returns Distribution": "收益率分布",
+    "Rolling Statistics": "滚动统计",
+    
+    # 指标名称
+    "Total Return": "累计收益",
+    "CAGR": "年化收益率",
+    "Sharpe": "夏普比率",
+    "Sortino": "索提诺比率",
+    "Calmar": "卡玛比率",
+    "Max Drawdown": "最大回撤",
+    "Volatility": "波动率",
+    "Win Rate": "胜率",
+    "Loss Rate": "亏损率",
+    "Avg Win": "平均盈利",
+    "Avg Loss": "平均亏损",
+    "Profit Factor": "盈利因子",
+    "Expectancy": "期望收益",
+    "SQN": "系统质量指数",
+    
+    # 基准对比
+    "vs Benchmark": "vs 基准",
+    "Outperformance": "跑赢基准",
+    "Underperformance": "跑输基准",
+    
+    # 时间相关
+    "Start Date": "开始日期",
+    "End Date": "结束日期",
+    "Duration": "持续时间",
+    
+    # 风险指标
+    "Value at Risk": "风险价值 (VaR)",
+    "Expected Shortfall": "预期损失",
+    "Tail Ratio": "尾部比率",
+    "Gain to Pain": "盈亏比",
+    
+    # 滚动指标
+    "Rolling Sharpe": "滚动夏普比率",
+    "Rolling Sortino": "滚动索提诺比率",
+    "Rolling CAGR": "滚动年化收益率",
+    "Rolling Volatility": "滚动波动率",
+    "Rolling Max Drawdown": "滚动最大回撤",
+    
+    # 表格标题
+    "Metric": "指标",
+    "Strategy": "策略",
+    "Benchmark": "基准",
+    
+    # 月份
+    "Jan": "1月",
+    "Feb": "2月",
+    "Mar": "3月",
+    "Apr": "4月",
+    "May": "5月",
+    "Jun": "6月",
+    "Jul": "7月",
+    "Aug": "8月",
+    "Sep": "9月",
+    "Oct": "10月",
+    "Nov": "11月",
+    "Dec": "12月",
+    
+    # 其他
+    "Annual": "年度",
+    "Monthly": "月度",
+    "Weekly": "周度",
+    "Daily": "日度",
+    "Positive Days": "盈利天数",
+    "Negative Days": "亏损天数",
+    "Positive Months": "盈利月数",
+    "Negative Months": "亏损月数",
+    "Best Day": "最佳单日收益",
+    "Worst Day": "最差单日收益",
+    "Best Month": "最佳单月收益",
+    "Worst Month": "最差单月收益",
+    "Recovery Time": "恢复时间",
+    "Skewness": "偏度",
+    "Kurtosis": "峰度",
+}
+
+
+def translate_html(html_content: str) -> str:
+    """
+    将 QuantStats HTML 报告中的英文翻译为中文
+    
+    Args:
+        html_content: 原始 HTML 内容（英文）
+        
+    Returns:
+        翻译后的 HTML 内容（中文）
+    """
+    translated = html_content
+    
+    # 按术语长度排序（长的优先，避免部分匹配）
+    sorted_translations = sorted(
+        TRANSLATIONS.items(), 
+        key=lambda x: len(x[0]), 
+        reverse=True
+    )
+    
+    # 使用简单的字符串替换（最可靠的方法）
+    for en, zh in sorted_translations:
+        # 直接替换（忽略大小写）
+        pattern = re.compile(re.escape(en), re.IGNORECASE)
+        translated = pattern.sub(zh, translated)
+    
+    logger.info(f"✓ HTML 翻译完成（替换 {len(TRANSLATIONS)} 个术语）")
+    
+    return translated
+
+
+def translate_text(text: str) -> str:
+    """
+    翻译纯文本内容（用于图表标题等）
+    """
+    translated = text
+    for en, zh in TRANSLATIONS.items():
+        translated = translated.replace(en, zh)
+    return translated
 
 
 def prepare_returns(daily_values: pd.DataFrame) -> pd.Series:
@@ -137,6 +267,21 @@ def generate_report(strategy_name: str,
                 qs.reports.html(aligned_returns, 
                                output=str(html_path),
                                title=f"{strategy_name} - 策略分析报告")
+            
+            # 翻译 HTML 报告（英文→中文）
+            try:
+                with open(html_path, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+                
+                translated_content = translate_html(html_content)
+                
+                # 保存翻译后的 HTML（覆盖原文件）
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(translated_content)
+                
+                logger.info(f"✓ HTML报告已翻译: {html_path}")
+            except Exception as e:
+                logger.warning(f"HTML翻译失败: {e}")
             
             result['html_path'] = str(html_path)
             logger.info(f"✓ HTML报告已生成: {html_path}")
