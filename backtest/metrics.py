@@ -16,26 +16,29 @@ def calculate_metrics(orders: List[Dict],
     计算策略的绩效指标
     
     Args:
-        orders: 交易记录列表
+        orders: 交易记录列表（可以为空，此时仅从 daily_values 计算指标）
         daily_values: 每日市值 DataFrame（包含 date, portfolio_value）
         risk_free_rate: 无风险利率（默认3%）
         
     Returns:
         绩效指标字典
     """
-    if len(orders) == 0:
-        logger.warning("No orders to calculate metrics")
+    # 即使没有订单，也计算基于 daily_values 的指标
+    if len(daily_values) < 2:
+        logger.warning("Insufficient daily_values to calculate metrics")
         return _empty_metrics()
     
-    # 计算各项指标
+    # 计算各项指标（优先使用 daily_values）
     total_return = _calculate_total_return(orders, daily_values)
     annualized_return = _calculate_annualized_return(daily_values)
     max_drawdown = _calculate_max_drawdown(daily_values)
     sharpe_ratio = _calculate_sharpe_ratio(daily_values, risk_free_rate)
-    win_rate = _calculate_win_rate(orders)
-    num_trades = len(orders)  # 统计所有订单（买入+卖出）
-    avg_holding_days = _calculate_avg_holding_days(orders)
-    max_profit, max_loss = _calculate_max_profit_loss(orders)
+    
+    # 以下指标需要订单数据
+    win_rate = _calculate_win_rate(orders) if len(orders) > 0 else 0.0
+    num_trades = len(orders)
+    avg_holding_days = _calculate_avg_holding_days(orders) if len(orders) > 0 else 0.0
+    max_profit, max_loss = _calculate_max_profit_loss(orders) if len(orders) > 0 else (0.0, 0.0)
     
     metrics = {
         'total_return': total_return,

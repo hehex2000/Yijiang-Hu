@@ -73,6 +73,16 @@ try:
         from backtest.dca_strategy import DCAStrategy
         STRATEGY_CLASSES["月定投"] = DCAStrategy
     
+    # 新增：RSI 超买超卖策略
+    if not STRATEGIES_TO_TEST or "RSI" in STRATEGIES_TO_TEST:
+        from backtest.rsi_strategy import RSIStrategy
+        STRATEGY_CLASSES["RSI"] = RSIStrategy
+    
+    # 新增：布林带均值回归策略
+    if not STRATEGIES_TO_TEST or "布林带" in STRATEGIES_TO_TEST:
+        from backtest.bollinger_strategy import BollingerStrategy
+        STRATEGY_CLASSES["布林带"] = BollingerStrategy
+    
     # 如果配置了策略列表，只保留配置的
     if STRATEGIES_TO_TEST:
         STRATEGY_CLASSES = {k: v for k, v in STRATEGY_CLASSES.items() if k in STRATEGIES_TO_TEST}
