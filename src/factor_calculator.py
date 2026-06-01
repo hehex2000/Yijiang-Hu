@@ -21,7 +21,8 @@ class FactorCalculator:
                  enable_momentum: bool = False,
                  enable_technical: bool = False,
                  enable_volatility: bool = False,
-                 enable_money_flow: bool = True):
+                 enable_money_flow: bool = True,
+                 enable_industry_momentum: bool = False):
         """
         初始化因子计算器
         
@@ -31,12 +32,14 @@ class FactorCalculator:
             enable_technical: 是否启用技术因子（默认关闭）
             enable_volatility: 是否启用低波动因子（默认关闭）
             enable_money_flow: 是否启用资金流因子（默认开启）
+            enable_industry_momentum: 是否启用行业动量因子（默认关闭）
         """
         self.enable_quality = enable_quality
         self.enable_momentum = enable_momentum
         self.enable_technical = enable_technical
         self.enable_volatility = enable_volatility
         self.enable_money_flow = enable_money_flow
+        self.enable_industry_momentum = enable_industry_momentum
         
         enabled = ["价值", "成长"]
         if enable_quality: enabled.append("质量")
@@ -44,18 +47,23 @@ class FactorCalculator:
         if enable_technical: enabled.append("技术")
         if enable_volatility: enabled.append("低波动")
         if enable_money_flow: enabled.append("资金流")
+        if enable_industry_momentum: enabled.append("行业动量")
         
         logger.info(f"FactorCalculator initialized (启用因子: {', '.join(enabled)})")
     
     def calculate_all_factors(self, stock_codes: List[str], 
-                              data_fetcher,
-                              max_workers: int = 5) -> pd.DataFrame:
+                             data_fetcher,
+                             start_date: str = None,
+                             end_date: str = None,
+                             max_workers: int = 5) -> pd.DataFrame:
         """
         计算所有股票的因子（支持多线程并行）
         
         Args:
             stock_codes: 股票代码列表
             data_fetcher: DataFetcher实例（用于获取数据）
+            start_date: 开始日期（格式: "20230101"），None表示自动计算
+            end_date: 结束日期（格式: "20241231"），None表示使用当前日期
             max_workers: 最大线程数（默认5）
             
         Returns:
@@ -74,7 +82,7 @@ class FactorCalculator:
             idx, code = code_with_idx
             try:
                 logger.debug(f"Processing {code} ({idx+1}/{len(stock_codes)})")
-                factors = self.calculate_single_stock_factors(code, data_fetcher)
+                factors = self.calculate_single_stock_factors(code, data_fetcher, start_date, end_date)
                 return factors, None
             except Exception as e:
                 logger.error(f"Failed to calculate factors for {code}: {e}")
@@ -126,11 +134,19 @@ class FactorCalculator:
         factors = {"code": code}
         
         # 设置默认日期范围
-        if start_date is None:
-            start_date = "20230101"
+        # 动量因子需要 250 个交易日 ≈ 1.2 年，低波动也需要 ≈ 1 年
+        # 默认取 end_date 前 2 年作为 start_date，确保数据足够
         if end_date is None:
             from datetime import datetime
             end_date = datetime.now().strftime("%Y%m%d")
+        if start_date is None:
+            from datetime import datetime, timedelta
+            try:
+                ed = datetime.strptime(end_date, "%Y%m%d")
+                sd = ed - timedelta(days=730)   # 前 2 年
+                start_date = sd.strftime("%Y%m%d")
+            except Exception:
+                start_date = "20200101"
         
         # 获取股票基本信息（名称和市值）
         stock_info = data_fetcher.get_stock_info(code)
@@ -196,6 +212,20 @@ class FactorCalculator:
         if self.enable_money_flow:
             money_flow_data = data_fetcher.get_money_flow_data(code)
             factors.update(self._calc_money_flow_factors(money_flow_data))
+        
+        # 计算行业动量因子（可选）
+        if self.enable_industry_momentum:
+            try:
+                # end_date 是方法的参数，表示选股日期
+                industry_momentum_data = data_fetcher.get_industry_momentum_factor(code, end_date)
+                if industry_momentum_data:
+                    factors["industry_momentum"] = industry_momentum_data.get("industry_momentum", np.nan)
+                    factors["industry_momentum_z"] = industry_momentum_data.get("industry_momentum_z", np.nan)
+                    logger.debug(f"✓ Industry momentum factor added for {code}")
+            except Exception as e:
+                logger.error(f"Error fetching industry momentum for {code}: {e}")
+                factors["industry_momentum"] = np.nan
+                factors["industry_momentum_z"] = np.nan
         
         return factors
     
@@ -271,6 +301,17 @@ class FactorCalculator:
                 if "股息率" in valuation_data.columns:
                     div_yield = valuation_data["股息率"].values[0]
                     factors["VF6_dividend_yield"] = float(div_yield) if not pd.isna(div_yield) else np.nan
+                
+                # VF5_EV_EBITDA: 企业价值/EBITDA
+                # 简化计算：EV/EBITDA ≈ PB（对于资本密集型行业可作为粗估代理）
+                # 完整实现需从资产负债表获取总负债、现金，从利润表获取折旧摊销
+                # 若无法获取，保持 NaN 并在标准化时被中位数填充
+                if "市净率" in valuation_data.columns:
+                    pb_val = factors["VF2_PB"]
+                    if not pd.isna(pb_val) and pb_val > 0:
+                        factors["VF5_EV_EBITDA"] = float(pb_val)
+                    else:
+                        factors["VF5_EV_EBITDA"] = np.nan
             
             # 从财务数据中获取 PEG (需要自己计算: PE / 净利润增长率)
             if financial_data is not None and len(financial_data) > 0:
@@ -334,11 +375,16 @@ class FactorCalculator:
                     roa = financial_data["总资产净利率"].values[0]
                     factors["GF4_ROA"] = float(roa) if not pd.isna(roa) else np.nan
                 
-                # 毛利率增长率（需要计算）
+                # 毛利率增长率（百分比变化，而非绝对差值）
                 if "销售毛利率" in financial_data.columns:
                     gross_margin = financial_data["销售毛利率"].values
-                    if len(gross_margin) >= 2:
-                        factors["GF5_gross_margin_growth"] = float(gross_margin[0] - gross_margin[1])
+                    if len(gross_margin) >= 2 and gross_margin[1] != 0:
+                        # 百分比变化: (本期-上期) / |上期| * 100
+                        pct_change = (float(gross_margin[0]) - float(gross_margin[1])) / abs(float(gross_margin[1])) * 100
+                        factors["GF5_gross_margin_growth"] = pct_change
+                    elif len(gross_margin) >= 2:
+                        # 上期为0时，无法计算百分比，设为0
+                        factors["GF5_gross_margin_growth"] = 0.0
             
             logger.debug(f"Growth factors calculated: ROE={factors['GF3_ROE']}")
             
@@ -421,8 +467,18 @@ class FactorCalculator:
         
         try:
             if hist_data is not None and len(hist_data) > 0:
-                # 获取收盘价
-                close_prices = hist_data["收盘"].values
+                # 获取收盘价（健壮的列名检测）
+                close_col = None
+                for col in ['收盘', 'close', 'Close', '收盘价']:
+                    if col in hist_data.columns:
+                        close_col = col
+                        break
+                
+                if close_col is None:
+                    logger.warning(f"No close price column found in hist_data. Columns: {list(hist_data.columns)}")
+                    return factors
+                
+                close_prices = hist_data[close_col].values
                 
                 # 检查数据长度是否足够
                 if len(close_prices) < 250:
@@ -456,11 +512,13 @@ class FactorCalculator:
                     if not np.isnan(roc_12m[-1]):
                         factors["MF4_return_12m"] = roc_12m[-1] / 100.0
                 
-                # 2. 相对强度（个股收益率 / 市场收益率）
-                # 这里假设市场收益率为0.05（5%），实际应该从指数计算
-                market_return = 0.05
-                if not np.isnan(factors["MF4_return_12m"]):
-                    factors["MF5_relative_strength"] = factors["MF4_return_12m"] / market_return
+                # 2. 相对强度（个股12个月收益率 vs 市场12个月收益率）
+                # 理想情况从沪深300指数计算市场收益率，简化版本用合理的市场均值估算
+                # A股长期年化收益约 8%-12%，此处用 8% 作为保守估计
+                market_return = 0.08
+                if not pd.isna(factors["MF4_return_12m"]):
+                    factors["MF5_relative_strength"] = factors["MF4_return_12m"] - market_return
+                    # 超额收益比简单比值更合理：(个股收益 - 市场收益)
             
             logger.debug(f"Momentum factors calculated: 1m return={factors['MF1_return_1m']}")
             
@@ -491,8 +549,25 @@ class FactorCalculator:
         
         try:
             if hist_data is not None and len(hist_data) > 0:
-                # 获取收盘价和成交量
-                close_prices = hist_data["收盘"].values
+                # 获取收盘价和成交量（健壮的列名检测）
+                close_col = None
+                volume_col = None
+                
+                for col in ['收盘', 'close', 'Close', '收盘价']:
+                    if col in hist_data.columns:
+                        close_col = col
+                        break
+                
+                for col in ['成交量', 'volume', 'Volume', 'vol']:
+                    if col in hist_data.columns:
+                        volume_col = col
+                        break
+                
+                if close_col is None:
+                    logger.warning(f"No close price column found in hist_data. Columns: {list(hist_data.columns)}")
+                    return factors
+                
+                close_prices = hist_data[close_col].values
                 
                 # 检查数据长度是否足够
                 if len(close_prices) < 26:
@@ -627,21 +702,23 @@ class FactorCalculator:
                     var_95 = np.percentile(returns, 5)  # 95% VaR
                     factors["LVF5_VAR"] = abs(var_95)  # 取绝对值，方便比较
                 
-                # 4. 贝塔系数（需要市场收益率，这里用0.8-1.2随机模拟）
-                # 实际使用时应该获取市场指数（如沪深300）的收益率
-                # 这里简化为：LVF2_beta = cov(个股收益, 市场收益) / var(市场收益)
-                if not np.isnan(factors["LVF1_hist_vol"]):
-                    # 假设市场波动率为0.2（20%），用相对波动率估算beta
-                    market_vol = 0.20
-                    estimated_beta = factors["LVF1_hist_vol"] / market_vol
-                    factors["LVF2_beta"] = estimated_beta
+                # 4. 贝塔系数
+                # 完整计算：beta = cov(个股收益, 市场收益) / var(市场收益)
+                # 当前简化版本：用个股波动率与市场波动率比值近似，并限制在合理范围
+                if not pd.isna(factors["LVF1_hist_vol"]):
+                    market_vol = 0.20  # 沪深300年化波动率通常在 18%-25% 之间
+                    raw_beta = factors["LVF1_hist_vol"] / market_vol
+                    # 限制 beta 在 [0, 3] 之间，避免极端值
+                    factors["LVF2_beta"] = max(0.0, min(raw_beta, 3.0))
                 
-                # 5. 特质波动率（总波动率 - 系统性波动率）
+                # 5. 特质波动率（总波动率² - 系统性波动率²，取非负）
                 if not np.isnan(factors["LVF1_hist_vol"]) and not np.isnan(factors["LVF2_beta"]):
                     market_vol = 0.20
                     systematic_vol = abs(factors["LVF2_beta"]) * market_vol
-                    idiosyncratic_vol = np.sqrt(factors["LVF1_hist_vol"]**2 - systematic_vol**2)
-                    factors["LVF4_idiosyncratic_vol"] = max(idiosyncratic_vol, 0)  # 不能为负
+                    # 防止负数开平方
+                    vol_squared_diff = np.maximum(0, factors["LVF1_hist_vol"]**2 - systematic_vol**2)
+                    idiosyncratic_vol = np.sqrt(vol_squared_diff)
+                    factors["LVF4_idiosyncratic_vol"] = idiosyncratic_vol
             
             logger.debug(f"Volatility factors calculated: HistVol={factors['LVF1_hist_vol']:.4f}")
             
@@ -653,25 +730,25 @@ class FactorCalculator:
 
     def _calc_money_flow_factors(self, money_flow_data: Optional[pd.DataFrame]) -> Dict[str, float]:
         """
-        计算资金流因子
+        计算资金流因子（前缀 MWF = Money_Flow，与动量 MF 区分）
         
         因子列表:
-        - MF1_ultra_large_inflow: 超大单净流入（正向）
-        - MF2_large_inflow: 大单净流入（正向）
-        - MF3_medium_inflow: 中单净流入（正向）
-        - MF4_small_inflow: 小单净流入（反向，散户通常是反向指标）
-        - MF5_main_inflow: 主力资金净流入（超大单+大单，正向）
-        - MF6_inflow_intensity: 资金流强度（净流入/成交额，正向）
+        - MWF1_ultra_large_inflow: 超大单净流入（正向）
+        - MWF2_large_inflow: 大单净流入（正向）
+        - MWF3_medium_inflow: 中单净流入（正向）
+        - MWF4_small_inflow: 小单净流入（反向，散户通常是反向指标）
+        - MWF5_main_inflow: 主力资金净流入（超大单+大单，正向）
+        - MWF6_inflow_intensity: 资金流强度（净流入/成交额，正向）
         """
         factors = {}
         
         # 默认值
-        factors["MF1_ultra_large_inflow"] = np.nan
-        factors["MF2_large_inflow"] = np.nan
-        factors["MF3_medium_inflow"] = np.nan
-        factors["MF4_small_inflow"] = np.nan
-        factors["MF5_main_inflow"] = np.nan
-        factors["MF6_inflow_intensity"] = np.nan
+        factors["MWF1_ultra_large_inflow"] = np.nan
+        factors["MWF2_large_inflow"] = np.nan
+        factors["MWF3_medium_inflow"] = np.nan
+        factors["MWF4_small_inflow"] = np.nan
+        factors["MWF5_main_inflow"] = np.nan
+        factors["MWF6_inflow_intensity"] = np.nan
         
         try:
             if money_flow_data is not None and len(money_flow_data) > 0:
@@ -681,28 +758,28 @@ class FactorCalculator:
                 # 超大单净流入
                 if "超大单净流入" in money_flow_data.columns:
                     ultra_large = money_flow_data["超大单净流入"].values[0]
-                    factors["MF1_ultra_large_inflow"] = float(ultra_large) if not pd.isna(ultra_large) else np.nan
+                    factors["MWF1_ultra_large_inflow"] = float(ultra_large) if not pd.isna(ultra_large) else np.nan
                 
                 # 大单净流入
                 if "大单净流入" in money_flow_data.columns:
                     large = money_flow_data["大单净流入"].values[0]
-                    factors["MF2_large_inflow"] = float(large) if not pd.isna(large) else np.nan
+                    factors["MWF2_large_inflow"] = float(large) if not pd.isna(large) else np.nan
                 
                 # 中单净流入
                 if "中单净流入" in money_flow_data.columns:
                     medium = money_flow_data["中单净流入"].values[0]
-                    factors["MF3_medium_inflow"] = float(medium) if not pd.isna(medium) else np.nan
+                    factors["MWF3_medium_inflow"] = float(medium) if not pd.isna(medium) else np.nan
                 
                 # 小单净流入（反向指标，取负值）
                 if "小单净流入" in money_flow_data.columns:
                     small = money_flow_data["小单净流入"].values[0]
                     small_val = float(small) if not pd.isna(small) else np.nan
                     # 小单净流入越大，说明散户买入越多，通常是反向指标，所以取负值
-                    factors["MF4_small_inflow"] = -small_val if not pd.isnan(small_val) else np.nan
+                    factors["MWF4_small_inflow"] = -small_val if not pd.isnan(small_val) else np.nan
                 
                 # 主力资金净流入（超大单 + 大单）
-                if not pd.isna(factors["MF1_ultra_large_inflow"]) and not pd.isna(factors["MF2_large_inflow"]):
-                    factors["MF5_main_inflow"] = factors["MF1_ultra_large_inflow"] + factors["MF2_large_inflow"]
+                if not pd.isna(factors["MWF1_ultra_large_inflow"]) and not pd.isna(factors["MWF2_large_inflow"]):
+                    factors["MWF5_main_inflow"] = factors["MWF1_ultra_large_inflow"] + factors["MWF2_large_inflow"]
                 
                 # 资金流强度（净流入 / 成交额）
                 if "净流入" in money_flow_data.columns and "成交额" in money_flow_data.columns:
@@ -710,9 +787,9 @@ class FactorCalculator:
                     turnover = money_flow_data["成交额"].values[0]
                     
                     if not pd.isna(net_inflow) and not pd.isna(turnover) and turnover != 0:
-                        factors["MF6_inflow_intensity"] = float(net_inflow) / float(turnover)
+                        factors["MWF6_inflow_intensity"] = float(net_inflow) / float(turnover)
                 
-                logger.debug(f"Money flow factors calculated: MainInflow={factors['MF5_main_inflow']}")
+                logger.debug(f"Money flow factors calculated: MainInflow={factors['MWF5_main_inflow']}")
             else:
                 logger.debug(f"No money flow data available")
             

@@ -66,16 +66,22 @@ selection:
   # 最小得分阈值
   min_score: 0.0
 
-# 因子配置（默认只启用价值和成长因子）
+# 因子配置
 factors:
   # 是否启用质量因子
-  enable_quality: false
+  enable_quality: true
   
   # 是否启用动量因子
-  enable_momentum: false
+  enable_momentum: true
   
   # 是否启用技术因子
-  enable_technical: false
+  enable_technical: true
+  
+  # 是否启用低波动因子
+  enable_volatility: true
+  
+  # 是否启用资金流因子（回测历史时建议关闭）
+  enable_money_flow: false
 
 # 输出配置
 output:

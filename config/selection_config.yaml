@@ -16,25 +16,30 @@ data:
 # ==================== 因子配置 ====================
 factors:
   # 选择要使用的因子类别（true/false）
-  value: true        # 价值因子（PE、PB、PS、股息率）
-  growth: false      # 成长因子（需要财务数据）
-  quality: false     # 质量因子（需要财务数据）
+  value: true        # 价值因子（PE、PB、PS、股息率、EV/EBITDA）
+  growth: true       # 成长因子（营收/利润增长率、ROE、ROA）
+  quality: true      # 质量因子（资产负债率、流动比率、现金流质量）
   momentum: true     # 动量因子（1/3/6/12个月收益率）
-  technical: true    # 技术因子（均线多头、量比）
-  volatility: true   # 低波动因子（历史波动率、下行波动、VaR）
+  technical: true    # 技术因子（均线多头、MACD、RSI、量比、布林带）
+  volatility: true   # 低波动因子（历史波动率、beta、下行波动、VaR）
+  money_flow: false  # 资金流因子（主力净流入、资金强度，回测时建议关）
 
-  # 因子权重（总和应为1.0，仅启用的因子生效）
+  # 加权方式: "equal"(等权重) 或 "custom"(自定义权重)
+  weighting_method: "custom"
+
+  # 因子权重（weighting_method=custom时生效，总和自动归一化）
   weights:
-    value: 0.20
-    growth: 0.0
-    quality: 0.0
-    momentum: 0.25
-    technical: 0.20
-    volatility: 0.35  # 低波动因子权重最高（A股低波动异象显著）
-  
+    value_score: 0.25       # 价值因子 25%
+    growth_score: 0.15      # 成长因子 15%
+    quality_score: 0.10     # 质量因子 10%
+    momentum_score: 0.20    # 动量因子 20%
+    technical_score: 0.10   # 技术因子 10%
+    volatility_score: 0.15  # 低波动因子 15%（A股低波动异象显著）
+    money_flow_score: 0.05  # 资金流因子 5%
+
 # ==================== 选股配置 ====================
 selection:
-  top_n: 5           # 选择TOP N股票
+  top_n: 20          # 选择TOP N股票
   min_score: 0.0      # 最小得分阈值（0表示不筛选）
   
   # 排序方式

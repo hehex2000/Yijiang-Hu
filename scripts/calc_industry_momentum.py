@@ -52,7 +52,7 @@ def calc_industry_momentum_for_date(db_path, trade_date, lookback_months=6):
     start_date = start_date_dt.strftime("%Y%m%d")
     
     # 1. 获取行业分类（从 stock_basic 表）
-    industry_df = pd.read_sql("""
+    industry_df = pd.read_sql_query("""
         SELECT ts_code, industry
         FROM stock_basic
         WHERE industry IS NOT NULL AND industry != ''
@@ -64,7 +64,7 @@ def calc_industry_momentum_for_date(db_path, trade_date, lookback_months=6):
         return None
     
     # 2. 获取日线数据（回看期内）
-    daily_df = pd.read_sql("""
+    daily_df = pd.read_sql_query("""
         SELECT ts_code, trade_date, close
         FROM daily
         WHERE trade_date >= ? AND trade_date <= ?

@@ -23,7 +23,7 @@ class FactorProcessor:
         
         # 定义因子方向："positive" 表示正向因子，"negative" 表示反向因子
         self.factor_directions = {
-            # 价值因子（反向）
+            # 价值因子（反向：越低越便宜越好）
             "VF1_PE": "negative",
             "VF2_PB": "negative",
             "VF3_PS": "negative",
@@ -31,7 +31,7 @@ class FactorProcessor:
             "VF5_EV_EBITDA": "negative",
             "VF6_dividend_yield": "positive",
             
-            # 成长因子（正向）
+            # 成长因子（正向：越高成长越好）
             "GF1_revenue_growth": "positive",
             "GF2_net_profit_growth": "positive",
             "GF3_ROE": "positive",
@@ -39,25 +39,40 @@ class FactorProcessor:
             "GF5_gross_margin_growth": "positive",
             
             # 质量因子（混合）
-            "QF1_asset_liab_ratio": "negative",
-            "QF2_current_ratio": "positive",
-            "QF3_asset_turnover": "positive",
-            "QF4_cash_flow_quality": "positive",
+            "QF1_asset_liab_ratio": "negative",   # 负债越高风险越大
+            "QF2_current_ratio": "positive",       # 流动性越高越好
+            "QF3_asset_turnover": "positive",      # 运营效率越高越好
+            "QF4_cash_flow_quality": "positive",   # 现金流质量越高越好
             "QF5_cash_flow_to_revenue": "positive",
             
-            # 动量因子（正向）
+            # 动量因子（正向：近期涨幅越高动量越强）
             "MF1_return_1m": "positive",
             "MF2_return_3m": "positive",
             "MF3_return_6m": "positive",
             "MF4_return_12m": "positive",
             "MF5_relative_strength": "positive",
             
-            # 技术因子（正向）
-            "TF1_ma_bullish": "positive",
-            "TF2_MACD": "positive",
-            "TF3_RSI": "positive",
-            "TF4_volume_ratio": "positive",
-            "TF5_bollinger_position": "positive",
+            # 技术因子（方向需要审慎定义）
+            "TF1_ma_bullish": "positive",          # 均线多头排列是看涨信号
+            "TF2_MACD": "positive",                # MACD > 0 看涨（注：未标准化，见factor_calculator说明）
+            "TF3_RSI": "negative",                 # RSI低=超卖=买入机会，RSI高=超买=卖出信号
+            "TF4_volume_ratio": "positive",        # 放量上涨是积极信号
+            "TF5_bollinger_position": "negative",  # 接近下轨=低估买入区（0=下轨，1=上轨）
+            
+            # 低波动因子（反向：波动越低越稳健）
+            "LVF1_hist_vol": "negative",
+            "LVF2_beta": "negative",
+            "LVF3_downside_vol": "negative",
+            "LVF4_idiosyncratic_vol": "negative",
+            "LVF5_VAR": "negative",
+            
+            # 资金流因子（机构和主力资金流为正向，散户为反向）
+            "MWF1_ultra_large_inflow": "positive",     # 超大单流入=机构看好
+            "MWF2_large_inflow": "positive",           # 大单流入=主力看好
+            "MWF3_medium_inflow": "positive",          # 中单流入
+            "MWF4_small_inflow": "negative",           # 小单流入=散户买入，通常为反向指标
+            "MWF5_main_inflow": "positive",            # 主力净流入（超大单+大单）
+            "MWF6_inflow_intensity": "positive",       # 资金流强度
         }
         
         logger.info("FactorProcessor initialized")
@@ -141,8 +156,8 @@ class FactorProcessor:
         Returns:
             因子列名列表
         """
-        # 因子列以 VF, GF, QF, MF, TF 开头
-        factor_prefixes = ('VF', 'GF', 'QF', 'MF', 'TF')
+        # 因子列以 VF, GF, QF, MF, TF, LVF, MWF 开头
+        factor_prefixes = ('VF', 'GF', 'QF', 'MF', 'TF', 'LVF', 'MWF')
         factor_cols = [col for col in df.columns if col.startswith(factor_prefixes)]
         return factor_cols
     
@@ -245,7 +260,7 @@ class FactorProcessor:
         df = df.merge(industry_data[["code", "industry"]], on="code", how="left")
         
         # 对每个因子进行行业中性化
-        factor_columns = [col for col in df.columns if col.startswith(("VF", "GF", "QF", "MF", "TF"))]
+        factor_columns = self._get_factor_columns(df)
         
         for column in factor_columns:
             # 计算每个行业的平均因子值
@@ -280,7 +295,7 @@ class FactorProcessor:
             df["log_market_cap"] = np.log(market_cap_data[df["code"]].values)
             
             # 对每个因子进行市值中性化
-            factor_columns = [col for col in df.columns if col.startswith(("VF", "GF", "QF", "MF", "TF"))]
+            factor_columns = self._get_factor_columns(df)
             
             for column in factor_columns:
                 X = sm.add_constant(df["log_market_cap"])
@@ -299,47 +314,72 @@ class FactorProcessor:
     
     def _calculate_scores(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算综合得分（等权重）
+        计算综合得分（支持等权重和自定义权重）
         
         打分逻辑：
-        1. 计算每个大类因子的平均分
-        2. 计算五大类因子的平均分（等权重）
+        1. 计算每个大类因子内的子因子等权平均分
+        2. 按配置的权重（或等权重）计算各大类因子的加权总分
         """
-        # 定义大类因子分组
+        # 定义大类因子分组（含子因子列表）
         factor_groups = {
             "value_score": ["VF1_PE", "VF2_PB", "VF3_PS", "VF4_PEG", "VF5_EV_EBITDA", "VF6_dividend_yield"],
             "growth_score": ["GF1_revenue_growth", "GF2_net_profit_growth", "GF3_ROE", "GF4_ROA", "GF5_gross_margin_growth"],
             "quality_score": ["QF1_asset_liab_ratio", "QF2_current_ratio", "QF3_asset_turnover", "QF4_cash_flow_quality", "QF5_cash_flow_to_revenue"],
             "momentum_score": ["MF1_return_1m", "MF2_return_3m", "MF3_return_6m", "MF4_return_12m", "MF5_relative_strength"],
             "technical_score": ["TF1_ma_bullish", "TF2_MACD", "TF3_RSI", "TF4_volume_ratio", "TF5_bollinger_position"],
+            "volatility_score": ["LVF1_hist_vol", "LVF2_beta", "LVF3_downside_vol", "LVF4_idiosyncratic_vol", "LVF5_VAR"],
+            "money_flow_score": ["MWF1_ultra_large_inflow", "MWF2_large_inflow", "MWF3_medium_inflow", "MWF4_small_inflow", "MWF5_main_inflow", "MWF6_inflow_intensity"],
         }
         
-        # 计算每个大类因子的平均分
+        # 计算每个大类因子的平均分（子因子内部等权重）
         for group_name, factor_list in factor_groups.items():
-            # 只使用存在的因子
             available_factors = [f for f in factor_list if f in df.columns]
-            
             if len(available_factors) > 0:
                 df[group_name] = df[available_factors].mean(axis=1)
             else:
                 df[group_name] = np.nan
         
-        # 计算综合得分（五大类因子等权重）
-        score_columns = list(factor_groups.keys())
-        available_scores = [s for s in score_columns if s in df.columns]
+        # 读取自定义权重（如果配置了）
+        configured_weights = self.config.get("weights", {})
+        weighting_method = self.config.get("weighting_method", "equal")
         
-        if len(available_scores) > 0:
-            df["total_score"] = df[available_scores].mean(axis=1)
+        if weighting_method == "custom" and configured_weights:
+            # 使用配置的自定义权重进行大类因子加权
+            logger.info("Using custom weights for factor aggregation")
+            total_weight = 0.0
+            weighted_sum = pd.Series(0.0, index=df.index)
+            
+            for group_name in factor_groups.keys():
+                if group_name in df.columns and not df[group_name].isna().all():
+                    w = configured_weights.get(group_name, 0.0)
+                    if w > 0:
+                        weighted_sum += df[group_name].fillna(0) * w
+                        total_weight += w
+            
+            if total_weight > 0:
+                df["total_score"] = weighted_sum / total_weight  # 归一化
+            else:
+                logger.warning("All configured weights are zero, falling back to equal weight")
+                df["total_score"] = self._equal_weight_score(df, factor_groups)
         else:
-            df["total_score"] = np.nan
+            # 等权重：各大类因子权重相等
+            df["total_score"] = self._equal_weight_score(df, factor_groups)
         
         # 按综合得分排序
         df = df.sort_values("total_score", ascending=False).reset_index(drop=True)
         df["rank"] = df.index + 1
         
-        logger.info(f"Scoring completed: {len(available_scores)} score components")
+        logger.info(f"Scoring completed: method={weighting_method}, "
+                   f"groups={len([k for k in factor_groups if k in df.columns])}")
         
         return df
+    
+    def _equal_weight_score(self, df: pd.DataFrame, factor_groups: dict) -> pd.Series:
+        """等权重计算综合得分"""
+        score_columns = [k for k in factor_groups.keys() if k in df.columns]
+        if len(score_columns) > 0:
+            return df[score_columns].mean(axis=1)
+        return pd.Series(np.nan, index=df.index)
 
 
 if __name__ == "__main__":

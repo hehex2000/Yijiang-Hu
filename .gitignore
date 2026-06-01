@@ -53,3 +53,15 @@ temp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 回测结果文本（由程序生成，不需版本管理）
+backtest_result_*.txt
+*_result_*.txt
+*_log.txt
+multi_year_log.txt
+run_log.txt
+
+# 临时/误发文件
+nul
+NUL
+

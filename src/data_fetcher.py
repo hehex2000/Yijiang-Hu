@@ -1,10 +1,11 @@
-"""
+﻿"""
 数据获取模块 - DataFetcher Class
 支持 AkShare、Tushare 和本地 SQLite 数据库
 """
 
 import akshare as ak
 import pandas as pd
+import numpy as np
 import time
 import threading
 import sqlite3
@@ -97,8 +98,8 @@ class DataFetcher:
         self.akshare_backup_available = use_akshare_backup and self.use_akshare
         self.tushare_backup_available = use_tushare_backup and self.use_tushare
         
-        # 初始化速率限制器（Tushare限制200次/分钟）
-        self.rate_limiter = RateLimiter(calls_per_minute=200)
+        # 初始化速率限制器（Tushare限制：付费账户约50-100次/分钟，这里设保守值）
+        self.rate_limiter = RateLimiter(calls_per_minute=50)
         
         # 预取股票名称缓存（从本地数据库或Tushare批量获取）
         self._stock_name_cache = {}
@@ -132,6 +133,28 @@ class DataFetcher:
                    f"LocalDB: {self.local_db_available}, "
                    f"AkShare backup: {self.akshare_backup_available}, "
                    f"Tushare backup: {self.tushare_backup_available})")
+    
+    def _convert_code_to_ts_format(self, code: str) -> str:
+        """
+        将简单代码格式转换为Tushare格式
+        000001 -> 000001.SZ
+        600000 -> 600000.SH
+        """
+        code = str(code).strip()
+        
+        # 判断交易所
+        if code.startswith('6'):
+            # 上海交易所
+            return f"{code}.SH"
+        elif code.startswith(('0', '3')):
+            # 深圳交易所
+            return f"{code}.SZ"
+        elif code.startswith('8') or code.startswith('4'):
+            # 新三板
+            return f"{code}.BJ"
+        else:
+            # 默认深圳
+            return f"{code}.SZ"
     
     def fetch_with_fallback(self, func_ak: Callable, func_ts: Callable, 
                           *args, **kwargs) -> Any:
@@ -173,23 +196,26 @@ class DataFetcher:
             primary_name: 主数据源名称（用于日志）
             backup_name: 备用数据源名称（用于日志）
         """
-        # 尝试使用主数据源（最多3次）
-        for attempt in range(3):
+        # 尝试使用主数据源（最多5次）
+        for attempt in range(5):
             try:
                 # 速率限制（仅对Tushare API）
                 if primary_name == "Tushare":
                     self.rate_limiter.wait()
                 
-                logger.debug(f"Trying {primary_name}: {func_primary.__name__} (attempt {attempt+1}/3)")
+                logger.debug(f"Trying {primary_name}: {func_primary.__name__} (attempt {attempt+1}/5)")
                 result = func_primary(*args, **kwargs)
-                time.sleep(0.1)  # 避免请求过快
+                time.sleep(0.3)  # 避免请求过快（从0.1增加到0.3）
                 return result
             except Exception as e:
-                logger.warning(f"{primary_name} failed (attempt {attempt+1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(2)  # 重试前等待2秒
+                logger.warning(f"{primary_name} failed (attempt {attempt+1}/5): {e}")
+                if attempt < 4:
+                    # 指数退避：2秒, 4秒, 8秒, 16秒
+                    sleep_time = 2 ** (attempt + 1)
+                    logger.info(f"Waiting {sleep_time}s before retry...")
+                    time.sleep(sleep_time)
                 else:
-                    # 3次都失败，尝试备用数据源
+                    # 5次都失败，尝试备用数据源
                     if func_backup is not None:
                         try:
                             logger.info(f"Trying {backup_name} fallback: {func_backup.__name__}")
@@ -262,18 +288,125 @@ class DataFetcher:
             
             raise Exception("No HS300 components data available from Tushare")
         
+        # 根据配置标志决定使用哪些数据源
         try:
-            result = self.fetch_with_fallback(_get_hs300_ak, _get_hs300_ts)
+            if self.akshare_backup_available and self.tushare_backup_available:
+                # 两个数据源都可用，按优先级尝试
+                if self.primary_source == "akshare":
+                    result = self.fetch_with_fallback(_get_hs300_ak, _get_hs300_ts)
+                else:
+                    result = self.fetch_with_fallback(_get_hs300_ts, _get_hs300_ak)
+            elif self.tushare_backup_available:
+                # 只用 Tushare
+                logger.info("AkShare backup disabled, using Tushare only for HS300")
+                result = _get_hs300_ts()
+                if result is None or len(result) == 0:
+                    raise Exception("No HS300 components data from Tushare")
+            elif self.akshare_backup_available:
+                # 只用 AkShare
+                logger.info("Tushare backup disabled, using AkShare only for HS300")
+                result = _get_hs300_ak()
+                if result is None or len(result) == 0:
+                    raise Exception("No HS300 components data from AkShare")
+            else:
+                # 两个数据源都禁用
+                logger.error("Both AkShare and Tushare backup disabled, cannot fetch HS300 components")
+                raise Exception("No data source available for HS300 components")
+            
             logger.info(f"✓ Got {len(result)} HS300 components")
             return result
         except Exception as e:
             logger.error(f"Failed to fetch HS300 components: {e}")
             raise
     
+    def get_zz800_components(self) -> pd.DataFrame:
+        """
+        获取中证800成分股（沪深300 + 中证500）
+        指数代码：000906.SH
+        """
+        logger.info("Fetching CSI 800 (ZZ800) components...")
+
+        def _get_zz800_ak():
+            """使用AkShare获取中证800成分股"""
+            # 正确代码：000906=中证800，000985=中证全指（全市场≈5000只）
+            df = ak.index_stock_cons_csindex(symbol="000906")
+            result = df[['成分券代码', '成分券名称']].copy()
+            result.columns = ['code', 'name']
+            return result
+
+        def _get_zz800_ts():
+            """使用Tushare获取中证800成分股"""
+            if self.ts_pro is None:
+                raise Exception("Tushare not initialized")
+
+            # 中证800 = 沪深300 + 中证500
+            df300 = self.ts_pro.index_member(index_code='000300.SH')
+            df500 = self.ts_pro.index_member(index_code='000906.SH')
+
+            if (df300 is not None and len(df300) > 0 and
+                df500 is not None and len(df500) > 0):
+                # 过滤出当前仍在成分股中的股票 (out_date 为 NaN)
+                if 'out_date' in df300.columns:
+                    current300 = df300[df300['out_date'].isna()]
+                else:
+                    # 如果没有 out_date 列，假设所有都是当前成分股
+                    logger.warning("df300 没有 out_date 列，使用所有成分股")
+                    current300 = df300
+                
+                if 'out_date' in df500.columns:
+                    current500 = df500[df500['out_date'].isna()]
+                else:
+                    logger.warning("df500 没有 out_date 列，使用所有成分股")
+                    current500 = df500
+                
+                combined = pd.concat([current300, current500]).drop_duplicates(subset=['con_code'])
+                
+                # 验证数量（ZZ800 应该 ≈800 只）
+                if len(combined) > 3000:
+                    logger.warning(f"ZZ800 成分股数量异常: {len(combined)} 只，可能包含历史数据")
+                
+                result = combined[['con_code']].copy()
+                result['code'] = result['con_code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+                result['name'] = ''
+                logger.info(f"Tushare ZZ800: 获取 {len(combined)} 只成分股（过滤后）")
+                return result[['code', 'name']]
+            raise Exception("No ZZ800 components data available from Tushare")
+        
+        # 根据配置标志决定使用哪些数据源
+        try:
+            if self.akshare_backup_available and self.tushare_backup_available:
+                # 两个数据源都可用，按优先级尝试
+                if self.primary_source == "akshare":
+                    result = self.fetch_with_fallback(_get_zz800_ak, _get_zz800_ts)
+                else:
+                    result = self.fetch_with_fallback(_get_zz800_ts, _get_zz800_ak)
+            elif self.tushare_backup_available:
+                # 只用 Tushare
+                logger.info("AkShare backup disabled, using Tushare only for ZZ800")
+                result = _get_zz800_ts()
+                if result is None or len(result) == 0:
+                    raise Exception("No ZZ800 components data from Tushare")
+            elif self.akshare_backup_available:
+                # 只用 AkShare
+                logger.info("Tushare backup disabled, using AkShare only for ZZ800")
+                result = _get_zz800_ak()
+                if result is None or len(result) == 0:
+                    raise Exception("No ZZ800 components data from AkShare")
+            else:
+                # 两个数据源都禁用
+                logger.error("Both AkShare and Tushare backup disabled, cannot fetch ZZ800 components")
+                raise Exception("No data source available for ZZ800 components")
+            
+            logger.info(f"✓ Got {len(result)} ZZ800 components")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to fetch ZZ800 components: {e}")
+            raise
+
     def get_stock_info(self, code: str) -> dict:
         """
         获取股票基本信息（名称、市值）
-        优先使用Tushare批量缓存，失败后用AkShare单只查询
+        优先从本地数据库读取，失败后用Tushare/AkShare
         
         Args:
             code: 股票代码
@@ -283,7 +416,40 @@ class DataFetcher:
         """
         logger.debug(f"Fetching stock info for {code}")
         
-        # 1. 优先使用Tushare缓存（启动时已批量获取）
+        # 1. 优先从本地数据库读取（stock_basic表）
+        if self.local_db_available:
+            try:
+                import sqlite3
+                ts_code = self._convert_code_to_ts_format(code)
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    SELECT name, market_cap 
+                    FROM stock_basic 
+                    WHERE ts_code = ? 
+                    ORDER BY trade_date DESC 
+                    LIMIT 1
+                """, (ts_code,))
+                
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row is not None:
+                    name = row[0] if row[0] else ''
+                    market_cap = float(row[1]) if row[1] else None
+                    logger.debug(f"✓ 从本地DB获取股票信息: {code} = {name}")
+                    return {
+                        'code': code,
+                        'name': name,
+                        'market_cap': market_cap
+                    }
+                else:
+                    logger.debug(f"本地DB中没有股票信息: {code}")
+            except Exception as e:
+                logger.debug(f"从本地DB读取股票信息失败: {e}")
+        
+        # 2. 使用Tushare批量缓存（启动时已批量获取）
         if hasattr(self, '_stock_name_cache') and code in self._stock_name_cache:
             name = self._stock_name_cache[code]
             logger.debug(f"✓ 从Tushare缓存获取股票名称: {code} = {name}")
@@ -293,34 +459,37 @@ class DataFetcher:
                 'market_cap': None  # 市值从valuation数据获取
             }
         
-        # 2. 使用AkShare单只股票查询（高效，不需要拉全市场数据）
-        try:
-            df = ak.stock_individual_info_em(symbol=code)
-            if df is not None and len(df) > 0:
-                info = dict(zip(df['item'], df['value']))
-                name = info.get('股票简称', '')
-                market_cap = info.get('总市值', None)
-                # 解析市值字符串（如 "123.45亿" 或 "123456.78万"）
-                if market_cap is not None and isinstance(market_cap, str):
-                    market_cap = market_cap.replace(',', '')
-                    try:
-                        if '亿' in market_cap:
-                            market_cap = float(market_cap.replace('亿', '')) * 1e8
-                        elif '万' in market_cap:
-                            market_cap = float(market_cap.replace('万', '')) * 1e4
-                        else:
-                            market_cap = float(market_cap)
-                    except Exception:
-                        market_cap = None
-                return {
-                    'code': code,
-                    'name': name,
-                    'market_cap': market_cap
-                }
-        except Exception as e:
-            logger.debug(f"AkShare get_stock_info 失败 {code}: {e}")
+        # 3. 使用AkShare单只股票查询（高效，不需要拉全市场数据）
+        if self.akshare_backup_available:
+            try:
+                df = ak.stock_individual_info_em(symbol=code)
+                if df is not None and len(df) > 0:
+                    info = dict(zip(df['item'], df['value']))
+                    name = info.get('股票简称', '')
+                    market_cap = info.get('总市值', None)
+                    # 解析市值字符串（如 "123.45亿" 或 "123456.78万"）
+                    if market_cap is not None and isinstance(market_cap, str):
+                        market_cap = market_cap.replace(',', '')
+                        try:
+                            if '亿' in market_cap:
+                                market_cap = float(market_cap.replace('亿', '')) * 1e8
+                            elif '万' in market_cap:
+                                market_cap = float(market_cap.replace('万', '')) * 1e4
+                            else:
+                                market_cap = float(market_cap)
+                        except Exception:
+                            market_cap = None
+                    return {
+                        'code': code,
+                        'name': name,
+                        'market_cap': market_cap
+                    }
+            except Exception as e:
+                logger.debug(f"AkShare get_stock_info 失败 {code}: {e}")
+        else:
+            logger.debug(f"AkShare backup disabled, skipping get_stock_info for {code}")
         
-        # 3. 兜底：返回空名称（不中断流程）
+        # 4. 兜底：返回空名称（不中断流程）
         logger.warning(f"未能获取股票信息: {code}")
         return {
             'code': code,
@@ -356,49 +525,74 @@ class DataFetcher:
             except Exception as e:
                 logger.error(f"Failed to fetch history from local DB for {code}: {e}")
         
-        # 否则使用AkShare/Tushare
+        # 定义 AkShare / Tushare 内嵌获取函数
         def _get_history_ak():
-            """使用AkShare获取历史行情"""
+            """使用 AkShare 获取历史行情"""
+            ak_adjust = ""
+            if adjust == "qfq":
+                ak_adjust = "qfq"
+            elif adjust == "hfq":
+                ak_adjust = "hfq"
             df = ak.stock_zh_a_hist(
                 symbol=code,
                 period="daily",
                 start_date=start_date,
                 end_date=end_date,
-                adjust=adjust
+                adjust=ak_adjust
             )
             return df
-        
+
         def _get_history_ts():
-            """使用Tushare获取历史行情"""
+            """使用 Tushare 获取历史行情"""
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
-            
-            # 转换股票代码格式 (000001 -> 000001.SZ)
             ts_code = self._convert_code_to_ts_format(code)
-            
             df = self.ts_pro.daily(
                 ts_code=ts_code,
                 start_date=start_date,
                 end_date=end_date
             )
-            
-            # 转换为AkShare格式（中文字段名）
-            df = self._convert_ts_to_ak_format(df, "history")
-            
+            if df is not None and len(df) > 0:
+                df = df.rename(columns={
+                    'trade_date': '日期',
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'close': '收盘',
+                    'vol': '成交量',
+                    'amount': '成交额',
+                    'pct_chg': '涨跌幅',
+                    'change': '涨跌额'
+                })
             return df
-        
-        try:
-            result = self.fetch_with_fallback(_get_history_ak, _get_history_ts)
-            
-            if result is None or len(result) == 0:
-                logger.warning(f"No history data for {code}")
-                return None
-            
-            logger.debug(f"✓ Got {len(result)} days of history for {code}")
-            return result
-        except Exception as e:
-            logger.error(f"Failed to fetch history for {code}: {e}")
+
+        # 否则根据配置决定是否尝试AkShare/Tushare
+        # 根据配置标志决定使用哪些数据源
+        if self.akshare_backup_available and self.tushare_backup_available:
+            # 两个数据源都可用，按优先级尝试
+            if self.primary_source == "akshare":
+                result = self.fetch_with_fallback(_get_history_ak, _get_history_ts)
+            else:
+                result = self.fetch_with_fallback(_get_history_ts, _get_history_ak)
+        elif self.tushare_backup_available:
+            # 只用 Tushare
+            logger.info(f"AkShare backup disabled, using Tushare only for {code} history")
+            result = _get_history_ts()
+        elif self.akshare_backup_available:
+            # 只用 AkShare
+            logger.info(f"Tushare backup disabled, using AkShare only for {code} history")
+            result = _get_history_ak()
+        else:
+            # 两个数据源都禁用
+            logger.debug(f"Both AkShare and Tushare backup disabled, skipping for {code}")
             return None
+        
+        if result is None or len(result) == 0:
+            logger.warning(f"No history data for {code}")
+            return None
+            
+        logger.debug(f"✓ Got {len(result)} days of history for {code}")
+        return result
     
     def _get_history_from_local_db(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """从本地数据库获取历史行情"""
@@ -551,7 +745,15 @@ class DataFetcher:
                     logger.debug(f"✓ Got valuation data for {code} (local DB)")
                     return result
                 else:
-                    logger.warning(f"No valuation data in local DB for {code}, trying fallback...")
+                    # 根据配置决定fallback行为
+                    if not self.tushare_backup_available and not self.akshare_backup_available:
+                        logger.warning(f"No valuation data in local DB for {code}, and all backups disabled")
+                    elif not self.tushare_backup_available:
+                        logger.warning(f"No valuation data in local DB for {code}, trying AkShare backup...")
+                    elif not self.akshare_backup_available:
+                        logger.warning(f"No valuation data in local DB for {code}, trying Tushare backup...")
+                    else:
+                        logger.warning(f"No valuation data in local DB for {code}, trying fallback...")
             except Exception as e:
                 logger.error(f"Failed to fetch valuation from local DB for {code}: {e}")
         
@@ -589,8 +791,34 @@ class DataFetcher:
             
             return df
         
+        # 根据配置标志决定使用哪些数据源
         try:
-            result = self.fetch_with_fallback(_get_valuation_ak, _get_valuation_ts)
+            if self.tushare_backup_available:
+                # Tushare 可用，优先使用
+                if self.akshare_backup_available:
+                    # Tushare 失败后用 AkShare 备份
+                    result = self._fetch_with_order(_get_valuation_ts, _get_valuation_ak, "Tushare", "AkShare")
+                else:
+                    # 不允许 AkShare 备份，只用 Tushare
+                    try:
+                        result = _get_valuation_ts()
+                        if result is not None and len(result) > 0:
+                            logger.debug(f"✓ Got valuation data for {code} (Tushare only)")
+                            return result
+                        else:
+                            logger.warning(f"No valuation data from Tushare for {code}")
+                            return None
+                    except Exception as e:
+                        logger.error(f"Failed to fetch valuation for {code}: {e}")
+                        return None
+            elif self.akshare_backup_available:
+                # 只用 AkShare
+                logger.info("Tushare backup disabled, using AkShare only for valuation")
+                result = _get_valuation_ak()
+            else:
+                # 两个数据源都禁用
+                logger.warning(f"Both Tushare and AkShare backup disabled, skipping valuation for {code}")
+                return None
             
             if result is None or len(result) == 0:
                 logger.warning(f"No valuation data for {code}")
@@ -623,7 +851,15 @@ class DataFetcher:
                     logger.debug(f"✓ Got financial data for {code} (local DB)")
                     return result
                 else:
-                    logger.warning(f"No financial data in local DB for {code}, trying fallback...")
+                    # 根据配置决定fallback行为
+                    if not self.tushare_backup_available and not self.akshare_backup_available:
+                        logger.warning(f"No financial data in local DB for {code}, and all backups disabled")
+                    elif not self.tushare_backup_available:
+                        logger.warning(f"No financial data in local DB for {code}, trying AkShare backup...")
+                    elif not self.akshare_backup_available:
+                        logger.warning(f"No financial data in local DB for {code}, trying Tushare backup...")
+                    else:
+                        logger.warning(f"No financial data in local DB for {code}, trying fallback...")
             except Exception as e:
                 logger.error(f"Failed to fetch financial from local DB for {code}: {e}")
         
@@ -665,8 +901,34 @@ class DataFetcher:
                 logger.warning(f"Tushare financial API failed: {e}")
                 raise Exception(f"Failed to fetch financial data from Tushare: {e}")
         
+        # 根据配置标志决定使用哪些数据源
         try:
-            result = self.fetch_with_fallback(_get_financial_ak, _get_financial_ts)
+            if self.tushare_backup_available:
+                # Tushare 可用，优先使用
+                if self.akshare_backup_available:
+                    # Tushare 失败后用 AkShare 备份
+                    result = self._fetch_with_order(_get_financial_ts, _get_financial_ak, "Tushare", "AkShare")
+                else:
+                    # 不允许 AkShare 备份，只用 Tushare
+                    try:
+                        result = _get_financial_ts()
+                        if result is not None and len(result) > 0:
+                            logger.debug(f"✓ Got financial data for {code} (Tushare only)")
+                            return result
+                        else:
+                            logger.warning(f"No financial data from Tushare for {code}")
+                            return None
+                    except Exception as e:
+                        logger.error(f"Failed to fetch financial for {code}: {e}")
+                        return None
+            elif self.akshare_backup_available:
+                # 只用 AkShare
+                logger.info("Tushare backup disabled, using AkShare only for financial")
+                result = _get_financial_ak()
+            else:
+                # 两个数据源都禁用
+                logger.warning(f"Both Tushare and AkShare backup disabled, skipping financial for {code}")
+                return None
             
             if result is None or len(result) == 0:
                 logger.warning(f"No financial data for {code}")
@@ -678,140 +940,61 @@ class DataFetcher:
             logger.error(f"Failed to fetch financial data for {code}: {e}")
             return None
     
-    def get_money_flow_data(self, code: str) -> Optional[pd.DataFrame]:
+    def get_industry_momentum_factor(self, code: str, trade_date: str) -> dict:
         """
-        获取股票资金流数据
+        获取股票在指定交易日的行业动量因子
         
         Args:
-            code: 股票代码
+            code: 股票代码（如 "000001"）
+            trade_date: 交易日期（格式: "20230101"）
             
         Returns:
-            资金流指标DataFrame
+            字典 {"industry_momentum": value, "industry_momentum_z": value}
+            如果未找到，返回 {"industry_momentum": np.nan, "industry_momentum_z": np.nan}
         """
-        logger.debug(f"Fetching money flow data for {code}")
+        logger.debug(f"Fetching industry momentum factor for {code} on {trade_date}")
         
-        def _get_money_flow_ak():
-            """使用AkShare获取资金流数据"""
-            # 使用个股资金流排名接口（可以获取最新一天的资金流数据）
-            try:
-                # 获取沪深A股资金流排名（最新一天）
-                df = ak.stock_individual_fund_flow_rank(indicator="今日")
-                
-                if df is not None and len(df) > 0:
-                    # 筛选出目标股票
-                    # AkShare 返回格式: 代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 超大单净流入, 大单净流入, 中单净流入, 小单净流入, 净流入, ...
-                    # 注意：列名可能不同，需要根据实际返回结果调整
-                    
-                    # 尝试匹配股票代码（可能有不同格式）
-                    code_match = None
-                    for col in ['代码', 'code', '股票代码']:
-                        if col in df.columns:
-                            # 尝试不同格式匹配
-                            match_rows = df[df[col].astype(str).str.contains(code)]
-                            if len(match_rows) > 0:
-                                code_match = col
-                                df = match_rows
-                                break
-                    
-                    if code_match is not None and len(df) > 0:
-                        logger.debug(f"✓ Got money flow data for {code}")
-                        return df.iloc[:1]  # 返回第一行
-                    else:
-                        logger.warning(f"Stock {code} not found in money flow ranking")
-                        return None
-                else:
-                    logger.warning(f"No money flow data available")
-                    return None
-            except Exception as e:
-                logger.error(f"Error fetching money flow from AkShare: {e}")
-                raise
-        
-        def _get_money_flow_ts():
-            """使用Tushare获取资金流数据"""
-            if self.ts_pro is None:
-                raise Exception("Tushare not initialized")
-            
-            # 转换股票代码格式
-            ts_code = self._convert_code_to_ts_format(code)
-            
-            # 获取最近一天的资金流数据
-            from datetime import datetime, timedelta
-            end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-            
-            try:
-                # Tushare moneyflow 接口
-                df = self.ts_pro.moneyflow(
-                    ts_code=ts_code,
-                    start_date=start_date,
-                    end_date=end_date
-                )
-                
-                if df is not None and len(df) > 0:
-                    # 选取最新的一天数据
-                    df = df.sort_values('trade_date', ascending=False).head(1)
-                    
-                    # 转换为AkShare格式（中文字段名）
-                    column_mapping = {
-                        'trade_date': '日期',
-                        'ts_code': '代码',
-                        'buy_lg_amount': '超大单净流入',
-                        'buy_elg_amount': '大单净流入',
-                        'buy_md_amount': '中单净流入',
-                        'buy_sm_amount': '小单净流入',
-                        'net_mf_amount': '净流入'
-                    }
-                    df = df.rename(columns=column_mapping)
-                    
-                    logger.debug(f"✓ Got money flow data for {code} from Tushare")
-                    return df
-                else:
-                    logger.warning(f"No money flow data for {code} from Tushare")
-                    return None
-            except Exception as e:
-                logger.warning(f"Tushare moneyflow API failed: {e}")
-                raise Exception(f"Failed to fetch money flow data from Tushare: {e}")
+        if not self.local_db_available:
+            logger.warning(f"Local DB not available, cannot fetch industry momentum for {code}")
+            return {"industry_momentum": np.nan, "industry_momentum_z": np.nan}
         
         try:
-            result = self.fetch_with_fallback(_get_money_flow_ak, _get_money_flow_ts)
+            import sqlite3
+            conn = sqlite3.connect(self.local_db_path)
+            cursor = conn.cursor()
             
-            if result is None or len(result) == 0:
-                logger.warning(f"No money flow data for {code}")
-                return None
+            # 查询 industry_momentum 表
+            cursor.execute("""
+                SELECT industry_momentum, industry_momentum_z
+                FROM industry_momentum
+                WHERE ts_code = ? AND trade_date = ?
+            """, (code, trade_date))
             
-            logger.debug(f"✓ Got money flow data for {code}")
-            return result
+            row = cursor.fetchone()
+            conn.close()
+            
+            if row is not None:
+                result = {
+                    "industry_momentum": float(row[0]) if row[0] is not None else np.nan,
+                    "industry_momentum_z": float(row[1]) if row[1] is not None else np.nan
+                }
+                logger.debug(f"✓ Got industry momentum for {code}: {result}")
+                return result
+            else:
+                logger.debug(f"No industry momentum data for {code} on {trade_date}")
+            return {"industry_momentum": np.nan, "industry_momentum_z": np.nan}
+                
         except Exception as e:
-            logger.error(f"Failed to fetch money flow data for {code}: {e}")
-            return None
-    
-    def _convert_code_to_ts_format(self, code: str) -> str:
-        """
-        将股票代码转换为Tushare格式
-        
-        Args:
-            code: 股票代码（如 "000001" 或 "600000" 或 "000001.SZ"）
-            
-        Returns:
-            Tushare格式代码（如 "000001.SZ" 或 "600000.SH"）
-        """
-        # 如果已经包含后缀，直接返回
-        if '.' in code:
-            return code
-        
-        # 简单判断：6开头为上海，0或3开头为深圳
-        if code.startswith('6'):
-            return f"{code}.SH"
-        else:
-            return f"{code}.SZ"
+            logger.error(f"Error fetching industry momentum for {code}: {e}")
+            return {"industry_momentum": np.nan, "industry_momentum_z": np.nan}
     
     def _convert_ts_to_ak_format(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
         """
-        将Tushare数据转换为AkShare格式（中文字段名）
+        将Tushare格式的数据转换为AkShare格式
         
         Args:
             df: Tushare格式的DataFrame
-            data_type: 数据类型 ("history", "valuation", "financial")
+            data_type: 数据类型 ("valuation" 或 "financial")
             
         Returns:
             AkShare格式的DataFrame
@@ -819,469 +1002,115 @@ class DataFetcher:
         if df is None or len(df) == 0:
             return df
         
-        df_ak = df.copy()
+        logger.debug(f"Converting Tushare format to AkShare format (type: {data_type})")
         
-        if data_type == "history":
-            # 历史行情：英文字段 → 中文字段
-            column_mapping = {
-                'trade_date': '日期',
-                'ts_code': '代码',
-                'open': '开盘',
-                'high': '最高',
-                'low': '最低',
-                'close': '收盘',
-                'pre_close': '前收盘',
-                'change': '涨跌额',
-                'pct_chg': '涨跌幅',
-                'vol': '成交量',
-                'amount': '成交额'
-            }
-            df_ak = df_ak.rename(columns=column_mapping)
+        if data_type == "valuation":
+            # Tushare估值数据 -> AkShare格式
+            # Tushare列名: ts_code, trade_date, pe, pb, ps, dv_ratio, etc.
+            # AkShare列名: 代码, 名称, 市盈率, 市净率, 市销率, 股息率, etc.
             
-        elif data_type == "valuation":
-            # 估值数据
-            column_mapping = {
-                'trade_date': '日期',
-                'ts_code': '代码',
-                'pe': '市盈率',
-                'pb': '市净率',
-                'ps': '市销率',
-                'total_mv': '总市值',
-                'circ_mv': '流通市值'
-            }
-            df_ak = df_ak.rename(columns=column_mapping)
+            # 创建新的DataFrame
+            ak_df = pd.DataFrame()
+            ak_df["代码"] = df["ts_code"].apply(lambda x: x.split('.')[0] if '.' in str(x) else x)
+            
+            # 获取股票名称
+            try:
+                from src.data_fetcher import DataFetcher
+                ak_df["名称"] = ak_df["代码"].apply(lambda x: self._get_stock_name(x))
+            except:
+                ak_df["名称"] = ""
+            
+            # 映射估值指标
+            if "pe" in df.columns:
+                ak_df["市盈率"] = df["pe"]
+            if "pb" in df.columns:
+                ak_df["市净率"] = df["pb"]
+            if "ps" in df.columns:
+                ak_df["市销率"] = df["ps"]
+            if "dv_ratio" in df.columns:
+                ak_df["股息率"] = df["dv_ratio"]
+            if "total_mv" in df.columns:
+                ak_df["总市值"] = df["total_mv"]
+            if "circ_mv" in df.columns:
+                ak_df["流通市值"] = df["circ_mv"]
+            
+            return ak_df
             
         elif data_type == "financial":
-            # 财务数据 - 根据实际返回的列进行映射
-            column_mapping = {
-                'end_date': '截止日期',
-                'ts_code': '代码',
-                'roe': '净资产收益率',
-                'roa': '总资产报酬率',
-                'netprofit_yoy': '净利润同比增长率',
-                'revenue_yoy': '营业收入同比增长率'
-            }
-            df_ak = df_ak.rename(columns=column_mapping)
+            # Tushare财务数据 -> AkShare格式
+            # Tushare列名: ts_code, end_date, eps, roe, debt_to_assets, etc.
+            # AkShare列名: 代码, 名称, 每股收益, 净资产收益率, 资产负债率, etc.
+            
+            # 创建新的DataFrame
+            ak_df = pd.DataFrame()
+            ak_df["代码"] = df["ts_code"].apply(lambda x: x.split('.')[0] if '.' in str(x) else x)
+            
+            # 获取股票名称
+            try:
+                ak_df["名称"] = ak_df["代码"].apply(lambda x: self._get_stock_name(x))
+            except:
+                ak_df["名称"] = ""
+            
+            # 映射财务指标
+            if "eps" in df.columns:
+                ak_df["每股收益"] = df["eps"]
+            if "roe" in df.columns:
+                ak_df["净资产收益率"] = df["roe"]
+            if "debt_to_assets" in df.columns:
+                ak_df["资产负债率"] = df["debt_to_assets"]
+            if "assets_to_eqt" in df.columns:
+                ak_df["资产周转率"] = df["assets_to_eqt"]
+            if "ocf_to_or" in df.columns:
+                ak_df["经营现金流收益率"] = df["ocf_to_or"]
+            if "grossprofit_margin" in df.columns:
+                ak_df["毛利率"] = df["grossprofit_margin"]
+            if "netprofit_margin" in df.columns:
+                ak_df["净利润率"] = df["netprofit_margin"]
+            
+            return ak_df
         
-        return df_ak
-    
-    def batch_fetch_histories(self, codes: list, start_date: str, end_date: str,
-                            max_workers: int = 5, sleep_interval: float = 0.1) -> dict:
-        """
-        批量获取历史行情数据
-        
-        Args:
-            codes: 股票代码列表
-            start_date: 开始日期
-            end_date: 结束日期
-            max_workers: 最大线程数
-            sleep_interval: 请求间隔（秒）
-            
-        Returns:
-            {code: DataFrame} 字典
-        """
-        logger.info(f"Batch fetching histories for {len(codes)} stocks...")
-        
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        def fetch_single(code):
-            time.sleep(sleep_interval)  # 避免请求过快
-            return code, self.get_stock_history(code, start_date, end_date)
-        
-        results = {}
-        failed = []
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(fetch_single, code): code for code in codes}
-            
-            for future in as_completed(futures):
-                code = futures[future]
-                try:
-                    _, data = future.result()
-                    if data is not None:
-                        results[code] = data
-                    else:
-                        failed.append(code)
-                except Exception as e:
-                    logger.error(f"Failed to fetch {code}: {e}")
-                    failed.append(code)
-        
-        logger.info(f"✓ Batch fetch completed: {len(results)} success, {len(failed)} failed")
-        
-        if len(failed) > 0:
-            logger.warning(f"Failed codes: {failed[:10]}")  # 只显示前10个
-        
-        return results
-
-
-if __name__ == "__main__":
-    # 测试代码
-    from loguru import logger
-    
-    # 初始化日志
-    logger.add("data_fetcher_test.log", rotation="500 MB")
-    
-    # 创建数据获取器
-    fetcher = DataFetcher(use_tushare=False)
-    
-    # 测试1: 获取沪深300成分股
-    print("\n" + "="*50)
-    print("Test 1: Get HS300 components")
-    print("="*50)
-    hs300 = fetcher.get_hs300_components()
-    print(f"✓ Got {len(hs300)} components")
-    print(hs300.head())
-    
-    # 测试2: 获取单只股票历史行情
-    print("\n" + "="*50)
-    print("Test 2: Get stock history (000001)")
-    print("="*50)
-    history = fetcher.get_stock_history("000001", "20240101", "20240301")
-    if history is not None:
-        print(f"✓ Got {len(history)} days of history")
-        print(history.head())
-    
-    # 测试3: 获取估值指标
-    print("\n" + "="*50)
-    print("Test 3: Get valuation data (000001)")
-    print("="*50)
-    valuation = fetcher.get_valuation_data("000001")
-    if valuation is not None:
-        print(f"✓ Got valuation data")
-        print(valuation.head())
-    
-    # 测试4: 获取财务指标
-    print("\n" + "="*50)
-    print("Test 4: Get financial data (000001)")
-    print("="*50)
-    financial = fetcher.get_financial_data("000001")
-    if financial is not None:
-        print(f"✓ Got financial data")
-        print(financial.head())
-    
-    print("\n" + "="*50)
-    print("All tests completed!")
-    print("="*50)
-
-
-class SQLiteDataFetcher:
-    """从本地 SQLite 数据库读取股票数据"""
-    
-    def __init__(self, db_path: str = "D:/tu-shareData/astock_daily.db"):
-        """
-        初始化 SQLite 数据获取器
-        
-        Args:
-            db_path: SQLite 数据库文件路径
-        """
-        self.db_path = db_path
-        logger.info(f"SQLiteDataFetcher initialized with db_path: {db_path}")
-        
-        # 测试数据库连接（创建临时连接测试）
-        try:
-            test_conn = sqlite3.connect(self.db_path)
-            test_conn.close()
-            logger.info("✓ SQLite database connection test successful")
-        except Exception as e:
-            logger.error(f"Failed to connect to SQLite database: {e}")
-            raise
-    
-    def _get_connection(self):
-        """创建并返回一个新的数据库连接"""
-        return sqlite3.connect(self.db_path)
-    
-    def get_hs300_components(self) -> pd.DataFrame:
-        """
-        获取沪深300成分股
-        注意：如果数据库中不包含指数成分股信息，则返回所有股票
-        """
-        logger.info("Fetching stock list from SQLite database...")
-        
-        try:
-            conn = self._get_connection()
-            
-            # 从 stock_basic 表获取所有股票
-            query = """
-                SELECT ts_code, symbol as code, name
-                FROM stock_basic
-                WHERE ts_code LIKE '%.SZ' OR ts_code LIKE '%.SH'
-                ORDER BY symbol
-            """
-            
-            df = pd.read_sql_query(query, conn)
-            
-            # 移除 .SZ 和 .SH 后缀
-            df['code'] = df['code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
-            
-            # 如果数据库中没有行业信息，添加空列
-            if 'industry' not in df.columns:
-                df['industry'] = ''
-            
-            logger.info(f"✓ Got {len(df)} stocks from database")
-            return df[['code', 'name', 'industry']]
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch stock list from SQLite: {e}")
-            raise
-    
-    def get_stock_info(self, code: str) -> dict:
-        """
-        获取股票基本信息（名称、市值等）
-        
-        Args:
-            code: 股票代码（如 "000001"）
-            
-        Returns:
-            包含股票信息的字典
-        """
-        logger.debug(f"Fetching stock info for {code} from SQLite")
-        
-        try:
-            conn = self._get_connection()
-            
-            # 转换代码格式（000001 -> 000001.SZ 或 600000.SH）
-            ts_code = self._convert_code_to_ts_format(code)
-            
-            # 从 stock_basic 获取股票名称
-            query = f"""
-                SELECT name
-                FROM stock_basic
-                WHERE ts_code = '{ts_code}'
-            """
-            
-            cursor = conn.cursor()
-            cursor.execute(query)
-            result = cursor.fetchone()
-            
-            name = result[0] if result else ''
-            
-            # 获取最新市值为最近交易日的 total_mv
-            query = f"""
-                SELECT total_mv
-                FROM daily_basic
-                WHERE ts_code = '{ts_code}'
-                ORDER BY trade_date DESC
-                LIMIT 1
-            """
-            
-            cursor.execute(query)
-            result = cursor.fetchone()
-            
-            market_cap = result[0] if result else None
-            
-            # 注意：Tushare daily_basic 表中的 total_mv 单位是万元
-            # 转换为亿元（除以 10000）
-            if market_cap is not None:
-                market_cap = float(market_cap) / 10000
-            
-            return {
-                'code': code,
-                'name': name,
-                'market_cap': market_cap
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch stock info for {code} from SQLite: {e}")
-            return {
-                'code': code,
-                'name': '',
-                'market_cap': None
-            }
-    
-    def get_stock_history(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """
-        获取股票历史行情数据
-        
-        Args:
-            code: 股票代码（如 "000001"）
-            start_date: 开始日期（格式: "20230101"）
-            end_date: 结束日期（格式: "20241231"）
-            
-        Returns:
-            历史行情DataFrame
-        """
-        logger.debug(f"Fetching history for {code} from {start_date} to {end_date}")
-        
-        try:
-            conn = self._get_connection()
-            
-            # 转换代码格式
-            ts_code = self._convert_code_to_ts_format(code)
-            
-            # 从 daily 表获取历史行情
-            query = f"""
-                SELECT 
-                    trade_date as '日期',
-                    open as '开盘',
-                    high as '最高',
-                    low as '最低',
-                    close as '收盘',
-                    pre_close as '前收盘',
-                    change as '涨跌额',
-                    pct_chg as '涨跌幅',
-                    vol as '成交量',
-                    amount as '成交额'
-                FROM daily
-                WHERE ts_code = '{ts_code}'
-                  AND trade_date BETWEEN '{start_date}' AND '{end_date}'
-                ORDER BY trade_date
-            """
-            
-            df = pd.read_sql_query(query, conn)
-            
-            if len(df) == 0:
-                logger.warning(f"No history data for {code}")
-                return None
-            
-            logger.debug(f"✓ Got {len(df)} days of history for {code}")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch history for {code} from SQLite: {e}")
-            return None
-    
-    def get_valuation_data(self, code: str) -> pd.DataFrame:
-        """
-        获取股票估值指标（PE、PB、PS等）
-        
-        Args:
-            code: 股票代码
-            
-        Returns:
-            估值指标DataFrame
-        """
-        logger.debug(f"Fetching valuation data for {code} from SQLite")
-        
-        try:
-            conn = self._get_connection()
-            
-            # 转换代码格式
-            ts_code = self._convert_code_to_ts_format(code)
-            
-            # 从 daily_basic 表获取最新估值指标
-            query = f"""
-                SELECT 
-                    trade_date as '日期',
-                    ts_code as '代码',
-                    pe as '市盈率',
-                    pb as '市净率',
-                    ps as '市销率',
-                    ps_ttm as '市销率(TTM)',
-                    total_mv as '总市值',
-                    circ_mv as '流通市值'
-                FROM daily_basic
-                WHERE ts_code = '{ts_code}'
-                ORDER BY trade_date DESC
-                LIMIT 1
-            """
-            
-            df = pd.read_sql_query(query, conn)
-            
-            if len(df) == 0:
-                logger.warning(f"No valuation data for {code}")
-                return None
-            
-            # 注意：Tushare daily_basic 表中的 total_mv 和 circ_mv 单位是万元
-            # 转换为亿元（除以 10000）
-            if '总市值' in df.columns:
-                df['总市值'] = df['总市值'] / 10000
-            if '流通市值' in df.columns:
-                df['流通市值'] = df['流通市值'] / 10000
-            
-            # 添加股票代码列（简单格式）
-            df['code'] = code
-            
-            logger.debug(f"✓ Got valuation data for {code}")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch valuation for {code} from SQLite: {e}")
-            return None
-    
-    def get_financial_data(self, code: str) -> pd.DataFrame:
-        """
-        获取股票财务指标数据
-        
-        Args:
-            code: 股票代码
-            
-        Returns:
-            财务指标DataFrame
-        """
-        logger.debug(f"Fetching financial data for {code} from SQLite")
-        
-        # 注意：当前数据库中可能没有详细的财务指标表
-        # 如果有 fina_indicator 表，可以在这里查询
-        # 如果没有，返回 None 或使用 daily_basic 中的数据
-        
-        logger.warning(f"Financial data not available in SQLite database for {code}")
-        return None
-    
-    def get_latest_price(self, code: str) -> float:
-        """
-        获取股票最新收盘价
-        
-        Args:
-            code: 股票代码
-            
-        Returns:
-            最新收盘价
-        """
-        logger.debug(f"Fetching latest price for {code} from SQLite")
-        
-        try:
-            conn = self._get_connection()
-            
-            # 转换代码格式
-            ts_code = self._convert_code_to_ts_format(code)
-            
-            # 从 daily 表获取最新收盘价
-            query = f"""
-                SELECT close
-                FROM daily
-                WHERE ts_code = '{ts_code}'
-                ORDER BY trade_date DESC
-                LIMIT 1
-            """
-            
-            cursor = conn.cursor()
-            cursor.execute(query)
-            result = cursor.fetchone()
-            
-            if result:
-                return float(result[0])
-            else:
-                logger.warning(f"No price data for {code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Failed to fetch latest price for {code} from SQLite: {e}")
-            return None
-    
-    def _convert_code_to_ts_format(self, code: str) -> str:
-        """
-        将股票代码转换为Tushare格式
-        
-        Args:
-            code: 股票代码（如 "000001" 或 "600000" 或 "000001.SZ"）
-            
-        Returns:
-            Tushare格式代码（如 "000001.SZ" 或 "600000.SH"）
-        """
-        # 如果已经包含后缀，直接返回
-        if '.' in code:
-            return code
-        
-        # 简单判断：6开头为上海，0或3开头为深圳
-        if code.startswith('6'):
-            return f"{code}.SH"
         else:
-            return f"{code}.SZ"
+            logger.warning(f"Unknown data_type: {data_type}, returning original DataFrame")
+            return df
     
-    def close(self):
-        """关闭数据库连接"""
-        if self.conn is not None:
-            self.conn.close()
-            self.conn = None
-            logger.info("SQLite connection closed")
-
+    def _get_stock_name(self, code: str) -> str:
+        """
+        获取股票名称（从缓存或数据库）
+        
+        Args:
+            code: 股票代码
+            
+        Returns:
+            股票名称
+        """
+        # 先从缓存查找
+        if hasattr(self, '_stock_name_cache') and code in self._stock_name_cache:
+            return self._stock_name_cache[code]
+        
+        # 从本地数据库查找
+        if self.local_db_available:
+            try:
+                import sqlite3
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                # 查询股票名称（从valuation表或stock_basic表）
+                cursor.execute("""
+                    SELECT name FROM stock_basic WHERE ts_code = ? LIMIT 1
+                """, (code,))
+                
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row is not None:
+                    name = row[0]
+                    # 缓存结果
+                    if not hasattr(self, '_stock_name_cache'):
+                        self._stock_name_cache = {}
+                    self._stock_name_cache[code] = name
+                    return name
+            except Exception as e:
+                logger.debug(f"Error fetching stock name for {code}: {e}")
+        
+        # 默认返回空字符串
+        return ""

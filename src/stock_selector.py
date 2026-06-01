@@ -49,6 +49,14 @@ class StockSelector:
         
         df = factors_df.copy()
         
+        # 0. 过滤 current_price 为 NaN 的行（选股日停牌/无数据，无法交易）
+        if "current_price" in df.columns:
+            before = len(df)
+            df = df[df["current_price"].notna()]
+            filtered = before - len(df)
+            if filtered > 0:
+                logger.warning(f"Filtered {filtered} stocks with NaN current_price (suspended on selection date)")
+        
         # 1. 按综合得分排序（如果还没有排序）
         if "total_score" in df.columns:
             df = df.sort_values("total_score", ascending=False).reset_index(drop=True)
@@ -113,6 +121,18 @@ class StockSelector:
         
         export_df = export_df[export_cols]
         
+        # 将市值转换为亿元（如果不是 already in 亿元）
+        if '市值' in export_df.columns:
+            # 如果市值 > 1e6，认为是"元"，需要转换为"亿元"
+            if export_df['市值'].max() > 1e6:
+                export_df['市值'] = export_df['市值'] / 1e8
+            # 格式化为字符串（保留两位小数）
+            export_df['市值'] = export_df['市值'].map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+        
+        # 确保'股票代码'列为字符串格式（保留前导零）
+        if '股票代码' in export_df.columns:
+            export_df['股票代码'] = export_df['股票代码'].astype(str)
+        
         # 导出到CSV（使用utf-8-sig编码，支持中文）
         export_df.to_csv(output_path, index=False, encoding="utf-8-sig")
         
@@ -169,6 +189,12 @@ class StockSelector:
         
         export_df = export_df[export_cols]
         
+        # 将市值转换为亿元（如果不是 already in 亿元）
+        if '市值' in export_df.columns:
+            # 如果市值 > 1e6，认为是"元"，需要转换为"亿元"
+            if export_df['市值'].max() > 1e6:
+                export_df['市值'] = export_df['市值'] / 1e8
+        
         # 确保'股票代码'列为字符串格式（保留前导零）
         if '股票代码' in export_df.columns:
             export_df['股票代码'] = export_df['股票代码'].astype(str).str.zfill(6)
@@ -176,6 +202,19 @@ class StockSelector:
         # 导出到Excel
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            # 设置'市值'列为数字格式（保留两位小数）
+            if '市值' in export_df.columns:
+                worksheet = writer.sheets[sheet_name]
+                col_idx = export_df.columns.get_loc('市值') + 1  # Excel is 1-based
+                for row in range(2, len(export_df) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    if cell.value is not None:
+                        try:
+                            cell.number_format = '0.00"亿元"'
+                            cell.value = float(cell.value)
+                        except:
+                            pass
             
             # 设置'股票代码'列为文本格式（保留前导零）
             if '股票代码' in export_df.columns:
@@ -228,9 +267,20 @@ class StockSelector:
         display_cols = list(actual_rename.values())
         display_cols = [col for col in display_cols if col in display_df.columns]
         
+        # 打印前，将市值转换为亿元（如果不是 already in 亿元）
+        df_display = display_df[display_cols].head(n).copy()
+        if '市值' in df_display.columns:
+            # 如果市值 > 1e6，认为是"元"，需要转换为"亿元"
+            if df_display['市值'].max() > 1e6:
+                df_display['市值'] = df_display['市值'] / 1e8
+            # 格式化为字符串（保留两位小数，加"亿元"后缀）
+            df_display['市值'] = df_display['市值'].map(lambda x: f"{x:.2f}亿" if pd.notna(x) else "")
+        
         # 打印
         if display_cols:
-            print(display_df[display_cols].head(n).to_string(index=False))
+            # 设置 Pandas 显示选项，避免科学计数法
+            pd.set_option('display.float_format', lambda x: '%.2f' % x)
+            print(df_display.to_string(index=False))
         else:
             print(df.head(n).to_string(index=False))
         
