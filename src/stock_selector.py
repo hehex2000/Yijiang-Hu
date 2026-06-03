@@ -6,6 +6,7 @@
 import pandas as pd
 import os
 from typing import Optional
+from datetime import datetime
 from loguru import logger
 
 
@@ -82,6 +83,17 @@ class StockSelector:
         
         Args:
             df: 要导出的DataFrame
+            filename: 文件名（可选，自动生成，格式: multi-YYYYMM-selection.csv）
+            output_dir: 输出目录（可选，使用配置值）
+            
+        Returns:
+            保存的文件路径
+        """
+        """
+        导出结果到CSV文件（简化格式）
+        
+        Args:
+            df: 要导出的DataFrame
             filename: 文件名（可选，自动生成）
             output_dir: 输出目录（可选，使用配置值）
             
@@ -93,11 +105,11 @@ class StockSelector:
         # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         
-        # 生成文件名
+        # 生成文件名（格式: multi-YYYYMM-selection.csv）
         if filename is None:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m")
-            filename = f"selection_{timestamp}.csv"
+            filename = f"multi-{timestamp}-selection.csv"
         
         output_path = os.path.join(output_dir, filename)
         

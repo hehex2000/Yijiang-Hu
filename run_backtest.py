@@ -6,7 +6,7 @@
   1. 修改 config.py 配置参数
   2. 运行: python run_backtest.py
 """
-import sys, os, sqlite3
+import sys, os, sqlite3, glob, argparse
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
@@ -141,11 +141,58 @@ def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 
+def calculate_max_drawdown(portfolio_values):
+    """
+    计算最大回撤
+    Max Drawdown = max((历史最高净值 - 当前净值) / 历史最高净值 * 100)
+    """
+    if not portfolio_values or len(portfolio_values) < 2:
+        return 0.0
+    
+    peak = portfolio_values[0]
+    max_dd = 0.0
+    
+    for val in portfolio_values:
+        if val > peak:
+            peak = val
+        dd = (peak - val) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+    
+    return max_dd
+
+
 def backtest_buy_hold(df, capital, start_idx=0):
     """买入持有"""
-    p0 = df["close"].iloc[start_idx]
-    p1 = df["close"].iloc[-1]
-    return (p1 / p0 - 1) * 100
+    close = df["close"].values
+    n = len(close)
+    
+    # 买入持有：全部资金在 start_idx 买入，一直持有
+    p0 = close[start_idx]
+    shares = int(capital / p0 / 100) * 100
+    if shares == 0:
+        return 0.0, 0, 0.0
+    
+    cash = capital - shares * p0 * 1.0002  # 买入成本
+    
+    portfolio_values = []
+    for i in range(n):
+        if i < start_idx:
+            portfolio_values.append(capital)  # 未买入前，保持现金
+        else:
+            portfolio_values.append(cash + shares * close[i])
+    
+    final = portfolio_values[-1]
+    ret = (final / capital - 1) * 100
+    max_dd = calculate_max_drawdown(portfolio_values)
+
+    # 调试打印 → 写到文件（避免 stderr 被忽略）
+    with open("debug_buy_hold.log", "a", encoding="utf-8") as f:
+        f.write(f"pv[0]={portfolio_values[0]:.2f}, pv[-1]={portfolio_values[-1]:.2f}, "
+                 f"min={min(portfolio_values):.2f}, max={max(portfolio_values):.2f}, "
+                 f"max_dd={max_dd:.2f}%\n")
+    
+    return ret, 0, max_dd
 
 
 def backtest_rsi(df, capital, cfg, start_idx=0):
@@ -168,11 +215,15 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
 
     cash, pos, cost = capital, 0, 0.0
     trades = 0
+    portfolio_values = []
+    
     for i in range(n):
         if i < start_idx:
+            portfolio_values.append(capital)
             continue
         p = close[i]
         prev_rsi = rsi[i-1] if i > 0 else 50
+        
         if pos == 0 and prev_rsi < ovs:
             amt = cash * 0.5
             pos = int(amt / p / 100) * 100
@@ -184,8 +235,15 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
                 cash += pos * p * 0.9988
                 pos, cost = 0, 0.0
                 trades += 1
-    final = cash + pos * close[-1]
-    return (final / capital - 1) * 100, trades
+        
+        portfolio_values.append(cash + pos * p)
+    
+    # 循环结束后计算最终收益率和最大回撤
+    final = portfolio_values[-1] if portfolio_values else capital
+    ret = (final / capital - 1) * 100
+    max_dd = calculate_max_drawdown(portfolio_values)
+    
+    return ret, trades, max_dd
 
 
 def backtest_macd_kdj(df, capital, cfg, start_idx=0):
@@ -197,7 +255,7 @@ def backtest_macd_kdj(df, capital, cfg, start_idx=0):
     s = df["close"]
     n = len(close)
     if n < 35:
-        return None, 0
+        return None, 0, 0.0
 
     dif = ema(s, fast) - ema(s, slow)
     dea = ema(dif, sig)
@@ -212,8 +270,11 @@ def backtest_macd_kdj(df, capital, cfg, start_idx=0):
 
     cash, pos, cost = capital, 0, 0.0
     trades = 0
+    portfolio_values = []
+    
     for i in range(n):
         if i < start_idx:
+            portfolio_values.append(capital)
             continue
         p = close[i]
         if pos == 0 and i >= 34:
@@ -232,8 +293,14 @@ def backtest_macd_kdj(df, capital, cfg, start_idx=0):
                 cash += pos * p * 0.9988
                 pos, cost = 0, 0.0
                 trades += 1
-    final = cash + pos * close[-1]
-    return (final / capital - 1) * 100, trades
+        
+        portfolio_values.append(cash + pos * p)
+    
+    final = portfolio_values[-1] if portfolio_values else capital
+    ret = (final / capital - 1) * 100
+    max_dd = calculate_max_drawdown(portfolio_values)
+    
+    return ret, trades, max_dd
 
 
 def backtest_bollinger(df, capital, cfg, start_idx=0):
@@ -252,8 +319,11 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
 
     cash, pos, cost = capital, 0, 0.0
     trades = 0
+    portfolio_values = []
+    
     for i in range(n):
         if i < start_idx:
+            portfolio_values.append(capital)
             continue
         p = close[i]
         if i >= period and pos == 0 and p <= lower[i] > 0:
@@ -267,8 +337,13 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
                 cash += pos * p * 0.9988
                 pos, cost = 0, 0.0
                 trades += 1
-    final = cash + pos * close[-1]
-    return (final / capital - 1) * 100, trades
+        portfolio_values.append(cash + pos * p)
+    
+    final = portfolio_values[-1] if portfolio_values else capital
+    ret = (final / capital - 1) * 100
+    max_dd = calculate_max_drawdown(portfolio_values)
+    
+    return ret, trades, max_dd
 
 
 def backtest_turtle(df, capital, cfg, start_idx=0):
@@ -561,7 +636,9 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
         cash += s2_pos * final_price * sell_cost
 
     final = cash
-    return (final / capital - 1) * 100, trades
+    ret = (final / capital - 1) * 100
+    max_dd = calculate_max_drawdown(portfolio_values)
+    return ret, trades, max_dd
 
 
 # ════════════════════════════════════════════════════════
@@ -575,25 +652,18 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
 
 def backtest_rsi_trend(df, capital, cfg, start_idx=0):
     """
-    RSI趋势跟踪策略（调用RSITrendStrategy类）
+    RSI趋势跟踪策略（调用RSITrendPlugin类）
     RSI上穿50 → 买入，RSI下穿50 → 卖出
     """
     try:
-        from backtest.rsi_trend_strategy_v2 import RSITrendStrategy
+        from backtest.rsi_trend_plugin import RSITrendPlugin
     except ImportError:
-        print("  [ERR] 无法导入 RSITrendStrategy")
-        return None, 0
+        print("  [ERR] 无法导入 RSITrendPlugin")
+        return None, 0, 0.0
 
-    # ── 解析配置 ─────────────────────────────────────
-    rsi_period = cfg.get("rsi_period", 14)
-    rsi_center = cfg.get("rsi_center", 50)
-    take_profit = cfg.get("take_profit", 0.50)
-    stop_loss = cfg.get("stop_loss", 0.15)
-    position_mode = cfg.get("position_mode", "half")
-
-    # ── 数据检查 ─────────────────────────────────────
+    # ── 数据检查 ──────────────────────────
     if df is None or len(df) == 0:
-        return None, 0
+        return None, 0, 0.0
 
     # 确保有必要的列
     if "adj_open" not in df.columns:
@@ -601,31 +671,31 @@ def backtest_rsi_trend(df, capital, cfg, start_idx=0):
     if "adj_close" not in df.columns:
         df["adj_close"] = df["close"]
 
-    # ── 初始化策略 ──────────────────────────────────
-    strategy = RSITrendStrategy(
-        total_capital=capital,
-        rsi_period=rsi_period,
-        rsi_center=rsi_center,
-        take_profit=take_profit,
-        stop_loss=stop_loss,
-        position_mode=position_mode,
+    # ── 初始化策略 ──────────────────────────
+    strategy = RSITrendPlugin(
+        capital=capital,
+        cfg=cfg,
     )
 
-    # ── 运行策略 ──────────────────────────────────
-    result = strategy.run(df)
+    # ── 运行策略 ──────────────────────────
+    result = strategy.run(df, start_idx=start_idx)
 
-    # ── 计算收益率 ──────────────────────────────────
+    # ── 计算收益率 ──────────────────────────
     trades = result.get("trades", [])
     daily_values = result.get("daily_values", [])
 
     if not daily_values:
-        return 0.0, len(trades)
+        return 0.0, len(trades), 0.0
 
     # 计算最终资产
     final_value = daily_values[-1]["portfolio_value"] if daily_values else capital
     ret = (final_value / capital - 1) * 100
+    
+    # 计算最大回撤
+    portfolio_values = [v["portfolio_value"] for v in daily_values]
+    max_dd = calculate_max_drawdown(portfolio_values)
 
-    return ret, len(trades)
+    return ret, len(trades), max_dd
 
 def run_selection():
     """执行多因子选股，返回 TOP N 股票列表"""
@@ -704,10 +774,12 @@ def run_selection():
 
     selector.print_top_stocks(selected, n=min(20, len(selected)))
 
-    # 保存选股结果 CSV（供后续回测复用）
+    # 保存选股结果 CSV（命名规则: multi-YYYYMM-selection.csv）
     if OUTPUT.get("save_csv"):
         os.makedirs(OUTPUT["dir"], exist_ok=True)
-        csv_path = os.path.join(OUTPUT["dir"], f"selection_{SELECTION['date']}.csv")
+        from datetime import datetime
+        ym = SELECTION["date"][:6]  # "20220103" -> "202201"
+        csv_path = os.path.join(OUTPUT["dir"], f"multi-{ym}-selection.csv")
         selected[["code", "name"]].to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"  选股结果已保存 → {csv_path}")
 
@@ -719,6 +791,22 @@ def run_backtest(stocks):
     capital = BACKTEST["initial_capital"]
     start, end = BACKTEST["start_date"], BACKTEST["end_date"]
     benchmark = BACKTEST["benchmark"]
+
+    # ── 补全股票名称（CSV 中可能没有 name 列，强制从数据库补全）───
+    try:
+        _conn = sqlite3.connect(DB_PATH)
+        _names = {}
+        for _code in stocks["code"].tolist():
+            _r = _conn.execute(
+                "SELECT name FROM stock_basic WHERE ts_code=?",
+                (ts_code(str(_code)),)
+            ).fetchone()
+            _names[_code] = _r[0] if _r else str(_code)
+        _conn.close()
+        stocks["name"] = stocks["code"].map(_names).fillna("")
+    except Exception as _e:
+        print(f"  [WARN] 补全股票名称失败: {_e}")
+        stocks["name"] = stocks.get("name", "")
 
     # 使用持久连接（避免 sandbox 反复拦截）
     conn = sqlite3.connect(DB_PATH)
@@ -775,7 +863,7 @@ def run_backtest(stocks):
         sname = scfg["name"]
         print(f"\n{'─'*100}")
         print(f"  【{sname}】")
-        print(f"  {'代码':<8} {'名称':<8} {'收益率':>8} {'超额':>8} {'vs买入持有':>10} {'交易':>6} {'跑赢':>6}")
+        print(f"  {'代码':<8} {'名称':<8} {'收益率':>8} {'超额':>8} {'vs买入持有':>10} {'交易':>6} {'跑赢':>6} {'最大回撤':>10}")
         print(f"  {'─'*60}")
 
         results = []
@@ -788,58 +876,74 @@ def run_backtest(stocks):
                     result = strategy.run(df, start_idx)
                     ret = result.get("returns", 0.0)
                     trades = len(result.get("trades", []))
-
+                    # 计算最大回撤
+                    daily_values = result.get("daily_values", [])
+                    if daily_values:
+                        portfolio_values = [v["portfolio_value"] for v in daily_values]
+                        max_dd = calculate_max_drawdown(portfolio_values)
+                    else:
+                        max_dd = 0.0
+                    
                 # ═─ 回退到硬编码函数（兼容旧策略）══─
                 elif skey in strategy_funcs:
                     func = strategy_funcs[skey][0]
                     if skey == "buy_hold":
-                        ret = func(df, capital, start_idx)
-                        trades = 0
+                        ret, trades, max_dd = func(df, capital, start_idx)
                     else:
-                        ret, trades = func(df, capital, scfg, start_idx)
+                        ret, trades, max_dd = func(df, capital, scfg, start_idx)
                 else:
                     print(f"  [ERR] 未找到策略: {skey}")
                     continue
-
+                
                 if ret is None:
                     continue
                 exc = ret - idx_ret
                 bh = bh_results.get(code, 0)
-                vs_bh = ret - bh
+                vs_bh = ret - bh if skey != "buy_hold" else 0.0
                 beat = "[OK]" if ret > idx_ret else "[ERR]"
-                print(f"  {code:<8} {name:<8} {ret:>+7.2f}% {exc:>+7.2f}% {vs_bh:>+9.2f}% {trades:>6} {beat:>6}")
-                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret})
+                print(f"  {code:<8} {name:<8} {ret:>+7.2f}% {exc:>+7.2f}% {vs_bh:>+9.2f}% {trades:>6} {beat:>6}  {max_dd:>6.2f}%")
+                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd})
             except Exception as e:
                 print(f"  {code:<8} {name:<8} {'ERR':>8} ({e})")
 
         if results:
             rets = [r["ret"] for r in results]
+            # 买入持有策略不计算"优于BH"（自己不需要比自己）
+            n_better_bh = 0 if skey == "buy_hold" else sum(1 for r in results if r["vs_bh"] > 0)
             s = all_summaries[sname] = {
                 "mean": np.mean(rets), "median": np.median(rets),
                 "best": np.max(rets), "worst": np.min(rets),
                 "n_pos": sum(1 for r in rets if r > 0),
                 "n_beat": sum(1 for r in results if r["beat"]),
-                "n_better_bh": sum(1 for r in results if r["vs_bh"] > 0),
+                "n_better_bh": n_better_bh,
                 "n": len(results),
                 "trades_mean": np.mean([r["trades"] for r in results]),
+                "max_dd_mean": np.mean([r["max_dd"] for r in results]),
             }
+            # 买入持有不显示"优于BH"
+            if skey == "buy_hold":
+                better_bh_str = "优于BH N/A"
+            else:
+                better_bh_str = f"优于BH {s['n_better_bh']}/{len(results)}"
             print(f"  {'─'*60}")
             print(f"  汇总: 均值{s['mean']:+.2f}% 中位数{s['median']:+.2f}% "
                   f"正收益{s['n_pos']}/{len(results)} 跑赢{s['n_beat']}/{len(results)} "
-                  f"优于BH{s['n_better_bh']}/{len(results)} 均交易{s['trades_mean']:.1f}次")
+                  f"{better_bh_str} 均交易{s['trades_mean']:.1f}次 "
+                  f"均最大回撤{s['max_dd_mean']:.2f}%")
 
     # ══ 总表 ══
     print(f"\n\n{'='*100}")
     print(f"  【策略对比总表】")
     print(f"{'='*100}")
-    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'最佳':>10} {'最差':>10}")
+    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'均最大回撤':>12} {'最佳':>10} {'最差':>10}")
     print(f"  {'─'*90}")
     for skey, scfg in enabled:
         s = all_summaries.get(scfg["name"], {})
         if s:
+            better_bh_display = f"{s['n_better_bh']}/{s['n']}" if skey != "buy_hold" else "N/A"
             print(f"  {scfg['name']:<16} {s['mean']:>+7.2f}% {s['median']:>+7.2f}% "
-                  f"{s['n_pos']}/{s['n']:>4}  {s['n_beat']}/{s['n']:>4}  {s['n_better_bh']}/{s['n']:>4}  "
-                  f"{s['trades_mean']:>5.1f}  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%")
+                  f"{s['n_pos']}/{s['n']:>4}  {s['n_beat']}/{s['n']:>4}  {better_bh_display:>6}  "
+                  f"{s['trades_mean']:>5.1f}  {s['max_dd_mean']:>11.2f}%  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%")
     bh_mean = np.mean(list(bh_results.values()))
     print(f"  {'─'*90}")
     print(f"  {'买入持有(等权)':<16} {bh_mean:>+7.2f}%")
@@ -858,6 +962,7 @@ def run_backtest(stocks):
                     "中位数%": round(s["median"], 2), "正收益比": f"{s['n_pos']}/{s['n']}",
                     "跑赢指数比": f"{s['n_beat']}/{s['n']}", "优于买入持有比": f"{s['n_better_bh']}/{s['n']}",
                     "平均交易次数": round(s["trades_mean"], 1),
+                    "均最大回撤%": round(s["max_dd_mean"], 2),
                     "最佳%": round(s["best"], 2), "最差%": round(s["worst"], 2),
                 })
         rows.append({"策略": "买入持有(等权)", "均值收益%": round(bh_mean, 2)})
@@ -872,40 +977,153 @@ def run_backtest(stocks):
 # 入口
 # ════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # ── 命令行参数解析 ──────────────────────────────────────────────────
+    # 用法:
+    #   python run_backtest.py                # 使用 config.py 默认配置
+    #   python run_backtest.py --source multi # 使用最新 multi-*.csv
+    #   python run_backtest.py --source ml    # 使用最新 ml-*.csv
+    # ─────────────────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(
+        description="多因子选股 + 回测系统",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  python run_backtest.py                # 使用 config.py 默认配置
+  python run_backtest.py --source multi # 使用最新 multi-*.csv 进行回测
+  python run_backtest.py --source ml    # 使用最新 ml-*.csv 进行回测
+  python run_backtest.py --list         # 列出所有可用的 CSV 文件
+"""
+    )
+    parser.add_argument(
+        "--source", "-s",
+        type=str,
+        choices=["multi", "ml", "csv", "manual"],
+        default=None,
+        help="选股策略来源: multi(多因子) / ml(机器学习) / csv(指定文件) / manual(手动列表)"
+    )
+    parser.add_argument(
+        "--file", "-f",
+        type=str,
+        default=None,
+        help="手动指定 CSV 文件路径（--source csv 时生效）"
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="列出 data/results/ 下所有可用的 CSV 文件"
+    )
+    args = parser.parse_args()
+
+    # 列出可用 CSV 文件
+    if args.list:
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
+        csv_files = sorted(glob.glob(os.path.join(results_dir, "*.csv")))
+        print("\n  可用 CSV 文件 (data/results/):")
+        print("  " + "-" * 50)
+        for f in csv_files:
+            mtime = os.path.getmtime(f)
+            mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            size_kb = os.path.getsize(f) / 1024
+            fname = os.path.basename(f)
+            # 标记类型
+            tag = ""
+            if fname.startswith("ml-"):
+                tag = "  [ML机器学习]"
+            elif fname.startswith("multi-"):
+                tag = "  [多因子选股]"
+            elif fname.startswith("backtest_comparison"):
+                tag = "  [回测结果]"
+            print(f"  {fname:<35} {mtime_str}  {size_kb:.1f}KB{tag}")
+        print("  " + "-" * 50 + "\n")
+        sys.exit(0)
+
     print("\n" + "=" * 60)
     print("  多因子选股 + 回测系统")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    source = BACKTEST.get("stocks_source", "selection")
+    # 根据命令行参数决定股票池来源
+    if args.source == "multi":
+        # 自动匹配最新的 multi-*.csv
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
+        multi_files = sorted(glob.glob(os.path.join(results_dir, "multi-*.csv")), key=os.path.getmtime, reverse=True)
+        if not multi_files:
+            print(f"\n  [ERROR] 未找到 multi-*.csv 文件在 {results_dir}")
+            print(f"  请先运行多因子选股 (src/stock_selector.py)\n")
+            sys.exit(1)
+        csv_path = multi_files[0]
+        stocks = pd.read_csv(csv_path, dtype={"code": str})
+        stocks["name"] = stocks.get("name", "")
+        print(f"\n  使用多因子选股结果: {os.path.basename(csv_path)} ({len(stocks)} 只)")
+        run_backtest(stocks)
+        sys.exit(0)
 
-    if SELECTION.get("enabled") or source == "selection":
-        # 运行选股 → 回测
-        stocks = run_selection()
-    elif source == "csv":
-        # 从 CSV 读取上次选股结果
-        csv_path = BACKTEST.get("stocks_file", "")
+    elif args.source == "ml":
+        # 自动匹配最新的 ml-*.csv
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
+        ml_files = sorted(glob.glob(os.path.join(results_dir, "ml-*.csv")), key=os.path.getmtime, reverse=True)
+        if not ml_files:
+            print(f"\n  [ERROR] 未找到 ml-*.csv 文件在 {results_dir}")
+            print(f"  请先运行机器学习选股 (ml_stock_selector_v4.py)\n")
+            sys.exit(1)
+        csv_path = ml_files[0]
+        stocks = pd.read_csv(csv_path, dtype={"code": str})
+        stocks["name"] = stocks.get("name", "")
+        print(f"\n  使用机器学习选股结果: {os.path.basename(csv_path)} ({len(stocks)} 只)")
+        run_backtest(stocks)
+        sys.exit(0)
+
+    elif args.source == "csv":
+        # 使用手动指定的 CSV 文件
+        csv_path = args.file if args.file else BACKTEST.get("stocks_file", "")
         if not csv_path or not os.path.exists(csv_path):
-            # 尝试自动匹配
-            csv_path = os.path.join(OUTPUT["dir"], f"selection_{SELECTION['date']}.csv")
-        if os.path.exists(csv_path):
-            stocks = pd.read_csv(csv_path, dtype={"code": str})
-            stocks["name"] = stocks.get("name", "")
-            print(f"\n  从 CSV 加载股票池: {csv_path} ({len(stocks)} 只)")
-        else:
-            print(f"\n  CSV 文件不存在: {csv_path}，回退到手动模式")
-            manual = BACKTEST.get("stocks_manual", [])
-            stocks = pd.DataFrame(manual, columns=["code", "name"])
-    elif source == "manual":
+            print(f"\n  [ERROR] CSV 文件不存在: {csv_path}")
+            print(f"  请使用 --file 指定有效路径\n")
+            sys.exit(1)
+        stocks = pd.read_csv(csv_path, dtype={"code": str})
+        stocks["name"] = stocks.get("name", "")
+        print(f"\n  从 CSV 加载股票池: {os.path.basename(csv_path)} ({len(stocks)} 只)")
+        run_backtest(stocks)
+        sys.exit(0)
+
+    elif args.source == "manual":
         # 手动股票列表
         manual = BACKTEST.get("stocks_manual", [])
         stocks = pd.DataFrame(manual, columns=["code", "name"])
         print(f"\n  使用手动股票池: {len(stocks)} 只")
-    else:
-        manual = BACKTEST.get("stocks_manual", [])
-        stocks = pd.DataFrame(manual, columns=["code", "name"])
+        run_backtest(stocks)
+        sys.exit(0)
 
-    run_backtest(stocks)
+    else:
+        # 使用 config.py 中的默认配置
+        source = BACKTEST.get("stocks_source", "selection")
+
+        if source == "selection":
+            # 运行选股 → 回测
+            stocks = run_selection()
+        elif source == "csv":
+            # 从 CSV 读取上次选股结果
+            csv_path = BACKTEST.get("stocks_file", "")
+            if not csv_path or not os.path.exists(csv_path):
+                # 尝试自动匹配
+                csv_path = os.path.join(OUTPUT["dir"], f"selection_{SELECTION['date']}.csv")
+            if os.path.exists(csv_path):
+                stocks = pd.read_csv(csv_path, dtype={"code": str})
+                stocks["name"] = stocks.get("name", "")
+                print(f"\n  从 CSV 加载股票池: {csv_path} ({len(stocks)} 只)")
+            else:
+                print(f"\n  CSV 文件不存在: {csv_path}，回退到手动模式")
+                manual = BACKTEST.get("stocks_manual", [])
+                stocks = pd.DataFrame(manual, columns=["code", "name"])
+        elif source == "manual":
+            # 手动股票列表
+            manual = BACKTEST.get("stocks_manual", [])
+            stocks = pd.DataFrame(manual, columns=["code", "name"])
+            print(f"\n  使用手动股票池: {len(stocks)} 只")
+        else:
+            manual = BACKTEST.get("stocks_manual", [])
+            stocks = pd.DataFrame(manual, columns=["code", "name"])
+
+        run_backtest(stocks)
 
     print(f"\n{'='*60}")
     print("  完成！修改 config.py 参数后可再次运行。")

@@ -14,15 +14,15 @@ DATA = {
 
     # 主数据源: "local_db" | "akshare" | "tushare"
     # 行情数据优先本地DB，财务/估值数据优先Tushare
-    "primary_source": "local_db",       # 改为本地数据库优先（避免网络问题）
+    "primary_source": "local_db",      # ← 优先使用本地数据库
 
-    "local_db_path": r"D:\tu-sharedata\astock_daily.db",
+    "local_db_path": r"D:\tu-shareData\astock_daily.db",  # 注意大小写：tu-shareData
 
     "tushare_token": "761165a821532fe625262d6b33e144b9859a887c004acbcb981c319b",
 
-    "use_akshare_backup": True,      # AkShare作为备用
+    "use_akshare_backup": False,      # ← 禁用AkShare备份（用户确认不通）
 
-    "use_tushare_backup": True,      # Tushare作为备用（付费账户，数据更全）
+    "use_tushare_backup": True,      # ← 启用Tushare备份（替代本地数据库）
 }
 
 
@@ -38,7 +38,7 @@ SELECTION = {
     "enabled": True,
 
     # 选股基准日期（YYYYMMDD，必须是交易日）
-    "date": "20170102",
+    "date": "20220103",  # ← 2022年初第一个交易日
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
     "stock_pool": "hs300",
@@ -108,8 +108,8 @@ FACTOR_PROCESSOR = {
 BACKTEST = {
 
     # 回测时间范围
-    "start_date": "20170102",
-    "end_date": "20171229",
+    "start_date": "20220102",
+    "end_date": "20221230",
 
     # 每只股票初始资金（元）
     "initial_capital": 100000,
@@ -117,14 +117,27 @@ BACKTEST = {
     # 基准指数（用于对比）
     "benchmark": "000300.SH",
 
-    # 股票来源: "selection" | "csv" | "manual"
+    # ═══════════════════════════════════════════════════════
+    # 股票来源（可被命令行参数覆盖）
+    # ═══════════════════════════════════════════════════════
+    #
+    # 【推荐】使用命令行参数（无需修改此文件）：
+    #   python run_backtest.py                # 使用下面默认配置
+    #   python run_backtest.py --source multi # 使用最新 multi-*.csv
+    #   python run_backtest.py --source ml    # 使用最新 ml-*.csv
+    #   python run_backtest.py --list         # 列出所有可用 CSV 文件
+    #
+    # 【或】修改下面配置（被 --source 参数覆盖）：
     #   "selection": 自动运行选股 -> 回测（同时保存CSV）
     #   "csv":       从 stocks_file 读取选股结果（无需重跑选股）
     #   "manual":    使用下面 stocks_manual 列表
-    "stocks_source": "selection",
+    "stocks_source": "selection",  # ← 先选股再回测
 
     # CSV 文件路径（stocks_source="csv" 时生效）
-    "stocks_file": "",
+    # 命名规则:
+    #   ML选股:     ml-YYYYMMDD-topN.csv    (如 ml-20260603-top20.csv)
+    #   多因子选股: multi-YYYYMM-xxx.csv   (如 multi-202606-selection.csv)
+    "stocks_file": "data/results/ml-20260603-top20.csv",  # ← ML选股结果（示例）
 
     # 手动指定股票（stocks_source="manual" 时生效）
     "stocks_manual": [],
@@ -168,7 +181,7 @@ STRATEGIES = {
         "stop_loss": 0.15,
     },
     "turtle": {
-        "enabled": True,
+        "enabled": False,  # ← 禁用简化版，使用完整版
         "name": "海龟策略（双周期+ATR动态风控）",
         # ── 双周期趋势识别（海龟原版）──
         "short_period": 20,       # 短期系统：20日高点突破
@@ -194,6 +207,36 @@ STRATEGIES = {
         "min_listed_days": 250,    # 上市不足 250 个交易日过滤
         # ── 系统选择 ──
         "use_short_system": True,   # 恢复双系统同时运行（海龟原版）
+        "use_long_system": True,    # 启用长期系统
+        "system_weight": [0.5, 0.5],  # 短期/长期系统资金分配权重
+    },
+    "turtle_full": {
+        "enabled": True,   # ← 启用完整版海龟策略（与插件key匹配）
+        "name": "海龟策略（完整版-双周期+ATR动态风控）",
+        # ── 双周期趋势识别（海龟原版）──
+        "short_period": 20,       # 短期系统：20日高点突破
+        "long_period": 55,        # 长期系统：55日高点突破
+        "short_exit_period": 10,   # 短期离场：10日低点跌破
+        "long_exit_period": 20,    # 长期离场：20日低点跌破
+        # ── ATR 波动量化 ──
+        "atr_period": 14,         # ATR 计算周期
+        "risk_pct": 0.02,         # 单笔风险：总资金的 2%
+        "max_risk_per_day": 0.02,  # 单日最大亏损：总资金的 2%
+        "max_pos_pct": 1.0,       # 单品种最大仓位：总资金的 100%
+        # ── 金字塔加仓（海龟原版）──
+        "max_adds": 4,            # 最多加仓次数（海龟原版）
+        "add_step_atr": 0.5,      # 加仓步长：0.5×ATR
+        "pos_unit_decay": True,     # 加仓单位递减（True=海龟原版）
+        # ── 动态止损（基于 ATR）──
+        "stop_atr_mult": 4.0,     # 止损距离：4×ATR
+        "trail_atr_mult": 4.0,    # 追踪止损：4×ATR
+        # ── A股本土化过滤 ──
+        "trend_filter": False,     # 暂时关闭趋势过滤
+        "volume_filter": False,    # 暂时关闭成交量过滤
+        "volume_ma_period": 20,    # 成交量 MA 周期
+        "min_listed_days": 250,    # 上市不足 250 个交易日过滤
+        # ── 系统选择 ──
+        "use_short_system": True,   # 启用短期系统
         "use_long_system": True,    # 启用长期系统
         "system_weight": [0.5, 0.5],  # 短期/长期系统资金分配权重
     },
@@ -224,7 +267,8 @@ INDUSTRY_MOMENTUM = {
 # ============================================================
 
 OUTPUT = {
-    "dir": "outputs",
-    "save_csv": False,       # 禁用CSV保存，直接打印结果
+    # ══ 输出目录（CSV文件存放位置，如 ml-*.csv / multi-*.csv）
+    "dir": "data/results",
+    "save_csv": True,        # ← 选股时保存CSV
     "print_top_n": 20,
 }

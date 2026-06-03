@@ -199,7 +199,7 @@ class RSITrendPlugin(BaseStrategy):
         }
 
     def _buy(self, date, price):
-        """买入操作"""
+        """买入操作（复用基类 buy()，含手续费计算）"""
         if self.position > 0:
             return  # 已持仓，不再买入
 
@@ -213,38 +213,11 @@ class RSITrendPlugin(BaseStrategy):
         if shares <= 0:
             return
 
-        cost = shares * price
-        self.cash -= cost
-        self.position += shares
-        self.avg_cost = price
-
-        trade = {
-            "date": date,
-            "action": "BUY",
-            "price": price,
-            "shares": shares,
-            "cost": cost,
-            "reason": "RSI上穿中心",
-        }
-        self.trades.append(trade)
+        self.buy(date, price, shares, "RSI上穿中心")
 
     def _sell(self, date, price, reason=""):
-        """卖出操作"""
+        """卖出操作（复用基类 sell()，含手续费+印花税）"""
         if self.position == 0:
             return
 
-        revenue = self.position * price
-        self.cash += revenue
-
-        trade = {
-            "date": date,
-            "action": "SELL",
-            "price": price,
-            "shares": self.position,
-            "revenue": revenue,
-            "reason": reason,
-        }
-        self.trades.append(trade)
-
-        self.position = 0
-        self.avg_cost = 0.0
+        self.sell(date, price, reason=reason)

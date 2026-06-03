@@ -87,10 +87,11 @@ class DataFetcher:
         if tushare_token:
             try:
                 import tushare as ts
-                ts.set_token(tushare_token)
-                self.ts_pro = ts.pro_api()
+                # 不调用 ts.set_token()（会写入 ~/tk.csv，沙箱环境会权限拒绝）
+                # 直接传 token 给 pro_api()，避免文件访问
+                self.ts_pro = ts.pro_api(token=tushare_token)
                 self.use_tushare = True
-                logger.info("Tushare initialized successfully")
+                logger.info("Tushare initialized successfully (token passed to pro_api)")
             except Exception as e:
                 logger.warning(f"Failed to initialize Tushare: {e}")
         
@@ -98,8 +99,8 @@ class DataFetcher:
         self.akshare_backup_available = use_akshare_backup and self.use_akshare
         self.tushare_backup_available = use_tushare_backup and self.use_tushare
         
-        # 初始化速率限制器（Tushare限制：付费账户约50-100次/分钟，这里设保守值）
-        self.rate_limiter = RateLimiter(calls_per_minute=50)
+        # 初始化速率限制器（Tushare限制：付费账户150次/分钟，这里设150）
+        self.rate_limiter = RateLimiter(calls_per_minute=150)
         
         # 预取股票名称缓存（从本地数据库或Tushare批量获取）
         self._stock_name_cache = {}
@@ -116,8 +117,11 @@ class DataFetcher:
             except Exception as e:
                 logger.warning(f"本地DB批量获取股票名称失败: {e}")
         
-        elif self.use_tushare and self.ts_pro is not None:
+        elif not self._stock_name_cache and self.use_tushare and self.ts_pro is not None:
             try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
                 df_basic = self.ts_pro.stock_basic(
                     exchange='', list_status='L', fields='ts_code,symbol,name'
                 )
@@ -227,15 +231,121 @@ class DataFetcher:
                     else:
                         raise e
     
-    def get_hs300_components(self) -> pd.DataFrame:
+    def _get_hs300_from_local_db(self, date: str) -> pd.DataFrame:
+        """
+        从本地数据库获取指定日期的HS300成分股
+        
+        Args:
+            date: 交易日期（格式: "20230101"）
+            
+        Returns:
+            包含代码、名称的DataFrame
+        """
+        if not self.local_db_available:
+            return None
+        
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.local_db_path)
+            cursor = conn.cursor()
+            
+            # 1. 找到小于等于目标日期的最大trade_date
+            cursor.execute("""
+                SELECT MAX(trade_date) 
+                FROM index_constituent 
+                WHERE index_code = '000300.SH' AND trade_date <= ?
+            """, (date,))
+            
+            closest_date = cursor.fetchone()[0]
+            
+            if closest_date is None:
+                logger.warning(f"No HS300 data found for date <= {date}")
+                conn.close()
+                return None
+            
+            logger.info(f"Found HS300 constituents for date: {closest_date} (requested: {date})")
+            
+            # 2. 获取该日期的所有成分股
+            cursor.execute("""
+                SELECT ts_code, weight 
+                FROM index_constituent 
+                WHERE index_code = '000300.SH' AND trade_date = ?
+            """, (closest_date,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if not rows:
+                return None
+            
+            # 3. 转换为DataFrame格式
+            import pandas as pd
+            result = pd.DataFrame(rows, columns=['ts_code', 'weight'])
+            
+            # 移除 .SH 或 .SZ 后缀，统一为简单格式
+            result['code'] = result['ts_code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+            
+            # 获取股票名称（从缓存或数据库）
+            result['name'] = result['code'].apply(lambda x: self._stock_name_cache.get(x, ''))
+            
+            logger.info(f"✓ Got {len(result)} HS300 constituents from local DB (date: {closest_date})")
+            return result[['code', 'name']]
+            
+        except Exception as e:
+            logger.error(f"Error fetching HS300 from local DB: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_hs300_components(self, date: str = None) -> pd.DataFrame:
         """
         获取沪深300成分股
         
+        Args:
+            date: 交易日期（格式: "20230101"），如果提供则尝试从本地数据库获取该日期的成分股
+            
         Returns:
             包含代码、名称、行业等信息的DataFrame
         """
-        logger.info("Fetching HS300 components...")
+        logger.info(f"Fetching HS300 components... (date={date})")
         
+        # 1. 优先从本地数据库获取
+        if self.local_db_available:
+            # 如果date=None，自动取本地DB中最新日期
+            query_date = date
+            if query_date is None:
+                try:
+                    conn = sqlite3.connect(self.local_db_path)
+                    row = conn.execute(
+                        "SELECT MAX(trade_date) FROM index_constituent WHERE index_code='000300.SH'"
+                    ).fetchone()
+                    conn.close()
+                    if row and row[0]:
+                        query_date = str(row[0]).replace("-", "")
+                        logger.info(f"date=None, 自动使用最新日期: {query_date}")
+                except Exception as e:
+                    logger.warning(f"查询最新HS300日期失败: {e}")
+            
+            if query_date is not None:
+                try:
+                    result = self._get_hs300_from_local_db(query_date)
+                    if result is not None and len(result) > 0:
+                        logger.info(f"✓ Got {len(result)} HS300 components from local DB (date={query_date})")
+                        return result
+                    else:
+                        logger.warning(f"No HS300 data in local DB for date={query_date}")
+                except Exception as e:
+                    logger.warning(f"Local DB query failed for HS300 date={query_date}: {e}")
+        
+        # 本地DB没有数据或查询失败，检查是否启用备份数据源
+        if not self.tushare_backup_available and not self.akshare_backup_available:
+            # 没有启用任何备份数据源，直接抛出异常
+            logger.error(f"Local DB failed for HS300 date={date}, and no backup sources enabled")
+            raise Exception(f"Failed to fetch HS300 components for date={date} (local DB only)")
+        
+        logger.info(f"Local DB failed for HS300 date={date}, trying backups...")
+        
+        # 嵌套函数定义：AkShare获取
         def _get_hs300_ak():
             """使用AkShare获取沪深300成分股"""
             df = ak.index_stock_cons_csindex(symbol="000300")
@@ -249,6 +359,9 @@ class DataFetcher:
             """使用Tushare获取沪深300成分股"""
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
+            
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
             
             # 使用 index_member API 获取当前成分股
             df = self.ts_pro.index_member(index_code='000300.SH')
@@ -269,6 +382,9 @@ class DataFetcher:
             
             # 如果 index_member 没有数据，尝试使用 index_weight
             try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
                 df_weight = self.ts_pro.index_weight(
                     index_code='000300.SH',
                     start_date='20240101',
@@ -288,43 +404,47 @@ class DataFetcher:
             
             raise Exception("No HS300 components data available from Tushare")
         
-        # 根据配置标志决定使用哪些数据源
-        try:
-            if self.akshare_backup_available and self.tushare_backup_available:
-                # 两个数据源都可用，按优先级尝试
-                if self.primary_source == "akshare":
-                    result = self.fetch_with_fallback(_get_hs300_ak, _get_hs300_ts)
-                else:
-                    result = self.fetch_with_fallback(_get_hs300_ts, _get_hs300_ak)
-            elif self.tushare_backup_available:
-                # 只用 Tushare
-                logger.info("AkShare backup disabled, using Tushare only for HS300")
+        # 按固定优先级获取成分股：Tushare（付费，更靠谱） → AkShare
+        
+        # 1. 优先尝试 Tushare
+        if self.tushare_backup_available:
+            try:
+                logger.debug("Trying Tushare for HS300 components...")
                 result = _get_hs300_ts()
-                if result is None or len(result) == 0:
-                    raise Exception("No HS300 components data from Tushare")
-            elif self.akshare_backup_available:
-                # 只用 AkShare
-                logger.info("Tushare backup disabled, using AkShare only for HS300")
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} HS300 components (Tushare)")
+                    return result
+                else:
+                    logger.warning("Tushare returned empty data for HS300 components")
+            except Exception as e:
+                logger.warning(f"Tushare failed for HS300 components: {e}")
+        
+        # 2. Tushare 失败，尝试 AkShare
+        if self.akshare_backup_available:
+            try:
+                logger.debug("Trying AkShare for HS300 components...")
                 result = _get_hs300_ak()
-                if result is None or len(result) == 0:
-                    raise Exception("No HS300 components data from AkShare")
-            else:
-                # 两个数据源都禁用
-                logger.error("Both AkShare and Tushare backup disabled, cannot fetch HS300 components")
-                raise Exception("No data source available for HS300 components")
-            
-            logger.info(f"✓ Got {len(result)} HS300 components")
-            return result
-        except Exception as e:
-            logger.error(f"Failed to fetch HS300 components: {e}")
-            raise
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} HS300 components (AkShare)")
+                    return result
+                else:
+                    logger.warning("AkShare returned empty data for HS300 components")
+            except Exception as e:
+                logger.warning(f"AkShare failed for HS300 components: {e}")
+        
+        # 3. 所有数据源都失败
+        logger.error("All data sources failed for HS300 components")
+        raise Exception("Failed to fetch HS300 components from all sources")
     
-    def get_zz800_components(self) -> pd.DataFrame:
+    def get_zz800_components(self, date: str = None) -> pd.DataFrame:
         """
         获取中证800成分股（沪深300 + 中证500）
         指数代码：000906.SH
+        
+        Args:
+            date: 交易日期（格式: "20230101"），当前未使用（ZZ800本地数据未准备）
         """
-        logger.info("Fetching CSI 800 (ZZ800) components...")
+        logger.info(f"Fetching CSI 800 (ZZ800) components... (date={date})")
 
         def _get_zz800_ak():
             """使用AkShare获取中证800成分股"""
@@ -338,9 +458,16 @@ class DataFetcher:
             """使用Tushare获取中证800成分股"""
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
-
+            
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
+            
             # 中证800 = 沪深300 + 中证500
             df300 = self.ts_pro.index_member(index_code='000300.SH')
+            
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
+            
             df500 = self.ts_pro.index_member(index_code='000906.SH')
 
             if (df300 is not None and len(df300) > 0 and
@@ -372,36 +499,37 @@ class DataFetcher:
                 return result[['code', 'name']]
             raise Exception("No ZZ800 components data available from Tushare")
         
-        # 根据配置标志决定使用哪些数据源
-        try:
-            if self.akshare_backup_available and self.tushare_backup_available:
-                # 两个数据源都可用，按优先级尝试
-                if self.primary_source == "akshare":
-                    result = self.fetch_with_fallback(_get_zz800_ak, _get_zz800_ts)
-                else:
-                    result = self.fetch_with_fallback(_get_zz800_ts, _get_zz800_ak)
-            elif self.tushare_backup_available:
-                # 只用 Tushare
-                logger.info("AkShare backup disabled, using Tushare only for ZZ800")
+        # 按固定优先级获取成分股：Tushare（付费，更靠谱） → AkShare
+        
+        # 1. 优先尝试 Tushare
+        if self.tushare_backup_available:
+            try:
+                logger.debug("Trying Tushare for ZZ800 components...")
                 result = _get_zz800_ts()
-                if result is None or len(result) == 0:
-                    raise Exception("No ZZ800 components data from Tushare")
-            elif self.akshare_backup_available:
-                # 只用 AkShare
-                logger.info("Tushare backup disabled, using AkShare only for ZZ800")
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} ZZ800 components (Tushare)")
+                    return result
+                else:
+                    logger.warning("Tushare returned empty data for ZZ800 components")
+            except Exception as e:
+                logger.warning(f"Tushare failed for ZZ800 components: {e}")
+        
+        # 2. Tushare 失败，尝试 AkShare
+        if self.akshare_backup_available:
+            try:
+                logger.debug("Trying AkShare for ZZ800 components...")
                 result = _get_zz800_ak()
-                if result is None or len(result) == 0:
-                    raise Exception("No ZZ800 components data from AkShare")
-            else:
-                # 两个数据源都禁用
-                logger.error("Both AkShare and Tushare backup disabled, cannot fetch ZZ800 components")
-                raise Exception("No data source available for ZZ800 components")
-            
-            logger.info(f"✓ Got {len(result)} ZZ800 components")
-            return result
-        except Exception as e:
-            logger.error(f"Failed to fetch ZZ800 components: {e}")
-            raise
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} ZZ800 components (AkShare)")
+                    return result
+                else:
+                    logger.warning("AkShare returned empty data for ZZ800 components")
+            except Exception as e:
+                logger.warning(f"AkShare failed for ZZ800 components: {e}")
+        
+        # 3. 所有数据源都失败
+        logger.error("All data sources failed for ZZ800 components")
+        raise Exception("Failed to fetch ZZ800 components from all sources")
 
     def get_stock_info(self, code: str) -> dict:
         """
@@ -546,6 +674,10 @@ class DataFetcher:
             """使用 Tushare 获取历史行情"""
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
+            
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
+            
             ts_code = self._convert_code_to_ts_format(code)
             df = self.ts_pro.daily(
                 ts_code=ts_code,
@@ -566,33 +698,38 @@ class DataFetcher:
                 })
             return df
 
-        # 否则根据配置决定是否尝试AkShare/Tushare
-        # 根据配置标志决定使用哪些数据源
-        if self.akshare_backup_available and self.tushare_backup_available:
-            # 两个数据源都可用，按优先级尝试
-            if self.primary_source == "akshare":
-                result = self.fetch_with_fallback(_get_history_ak, _get_history_ts)
-            else:
-                result = self.fetch_with_fallback(_get_history_ts, _get_history_ak)
-        elif self.tushare_backup_available:
-            # 只用 Tushare
-            logger.info(f"AkShare backup disabled, using Tushare only for {code} history")
-            result = _get_history_ts()
-        elif self.akshare_backup_available:
-            # 只用 AkShare
-            logger.info(f"Tushare backup disabled, using AkShare only for {code} history")
-            result = _get_history_ak()
-        else:
-            # 两个数据源都禁用
-            logger.debug(f"Both AkShare and Tushare backup disabled, skipping for {code}")
-            return None
+        # 本地数据库失败或不可用，按固定优先级尝试其他数据源
+        # 优先级：Tushare（付费，更靠谱） → AkShare（免费，作为备用）
         
-        if result is None or len(result) == 0:
-            logger.warning(f"No history data for {code}")
-            return None
-            
-        logger.debug(f"✓ Got {len(result)} days of history for {code}")
-        return result
+        # 1. 优先尝试 Tushare
+        if self.tushare_backup_available:
+            try:
+                logger.debug(f"Trying Tushare for {code} history...")
+                result = _get_history_ts()
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} days of history for {code} (Tushare)")
+                    return result
+                else:
+                    logger.warning(f"Tushare returned empty data for {code}")
+            except Exception as e:
+                logger.warning(f"Tushare failed for {code}: {e}")
+        
+        # 2. Tushare 失败，尝试 AkShare
+        if self.akshare_backup_available:
+            try:
+                logger.debug(f"Trying AkShare for {code} history...")
+                result = _get_history_ak()
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} days of history for {code} (AkShare)")
+                    return result
+                else:
+                    logger.warning(f"AkShare returned empty data for {code}")
+            except Exception as e:
+                logger.warning(f"AkShare failed for {code}: {e}")
+        
+        # 3. 所有数据源都失败
+        logger.error(f"All data sources failed for {code} history")
+        return None
     
     def _get_history_from_local_db(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """从本地数据库获取历史行情"""
@@ -768,6 +905,9 @@ class DataFetcher:
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
             
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
+            
             # 转换股票代码格式
             ts_code = self._convert_code_to_ts_format(code)
             
@@ -874,6 +1014,9 @@ class DataFetcher:
             if self.ts_pro is None:
                 raise Exception("Tushare not initialized")
             
+            # 速率限制（Tushare API）
+            self.rate_limiter.wait()
+            
             # 转换股票代码格式
             ts_code = self._convert_code_to_ts_format(code)
             
@@ -883,7 +1026,7 @@ class DataFetcher:
             start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
             
             try:
-                # Tushare fina_indicator 接口（不指定period参数）
+                # Tushare fina_indicator 接口
                 df = self.ts_pro.fina_indicator(
                     ts_code=ts_code,
                     start_date=start_date,

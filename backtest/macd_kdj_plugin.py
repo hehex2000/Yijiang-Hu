@@ -58,7 +58,7 @@ class MACDRSIStrategyPlugin(BaseStrategy):
         self.cash = self.capital
         
         if len(df) == 0:
-            return {"returns": 0.0, "trades": []}
+            return {"returns": 0.0, "trades": [], "daily_values": []}
         
         df = df.sort_values('trade_date').reset_index(drop=True)
         
@@ -69,13 +69,13 @@ class MACDRSIStrategyPlugin(BaseStrategy):
                 data["adj_close"] = data["close"]
             else:
                 logger.error("缺少必要列: close / adj_close")
-                return {"returns": 0.0, "trades": []}
+                return {"returns": 0.0, "trades": [], "daily_values": []}
         if "adj_open" not in data.columns:
             if "open" in data.columns:
                 data["adj_open"] = data["open"]
             else:
                 logger.error("缺少必要列: open / adj_open")
-                return {"returns": 0.0, "trades": []}
+                return {"returns": 0.0, "trades": [], "daily_values": []}
         
         # 计算指标
         dif, dea = self._calculate_macd(data['adj_close'])
@@ -139,4 +139,4 @@ class MACDRSIStrategyPlugin(BaseStrategy):
         
         ret = self.calc_returns()
         logger.info(f"MACDRSIStrategyPlugin finished: returns={ret:.2f}%, trades={len(self.trades)}")
-        return {"returns": ret, "trades": self.trades}
+        return {"returns": ret, "trades": self.trades, "daily_values": self.daily_values}

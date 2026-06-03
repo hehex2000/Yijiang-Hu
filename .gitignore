@@ -4,27 +4,10 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# 虚拟环境
 venv/
+venv_ml/
 env/
 ENV/
-.venv
 
 # IDE
 .vscode/
@@ -33,35 +16,45 @@ ENV/
 *.swo
 *~
 
-# 数据和结果
-data/
-backtest/result/
-backtest/data/
-logs/
-*.log
-*.db
-*.sqlite
-*.sqlite3
-
-# 临时文件
-tmp/
-temp/
-*.tmp
-*.bak
-
-# OS
+# 操作系统
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# 回测结果文本（由程序生成，不需版本管理）
-backtest_result_*.txt
-*_result_*.txt
-*_log.txt
-multi_year_log.txt
-run_log.txt
+# 项目特定
+*.log
+*.txt
+logs/
+outputs/
+data/results/
+data/models/
+data/models_v5/
 
-# 临时/误发文件
-nul
-NUL
+# 数据库文件
+*.db
+*.sqlite
 
+# 临时文件
+*.bak
+*.tmp
+*_old/
+*_backup/
+
+# 测试文件
+test_*.py
+debug_*.py
+check_*.py
+fix_*.py
+diagnose_*.py
+*_test.py
+*_pickle.py
+
+# 过时的脚本
+backtest_2017.py
+backtest_2017_test.py
+backtest_compare.py
+backtest_compare_ml_vs_traditional.py
+download_hs300_history.py
+ml_stock_picker.py
+ml_stock_selector_v3.py
+run_ml_selection.bat
+train_ml_model.py

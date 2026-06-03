@@ -38,7 +38,7 @@ class TurtleStrategyPlugin(BaseStrategy):
         self.position_count = 0
         
         if len(df) == 0:
-            return {"returns": 0.0, "trades": []}
+            return {"returns": 0.0, "trades": [], "daily_values": []}
         
         df = df.sort_values('trade_date').reset_index(drop=True)
         
@@ -49,13 +49,13 @@ class TurtleStrategyPlugin(BaseStrategy):
                 data["adj_close"] = data["close"]
             else:
                 logger.error("缺少必要列: close / adj_close")
-                return {"returns": 0.0, "trades": []}
+                return {"returns": 0.0, "trades": [], "daily_values": []}
         if "adj_open" not in data.columns:
             if "open" in data.columns:
                 data["adj_open"] = data["open"]
             else:
                 logger.error("缺少必要列: open / adj_open")
-                return {"returns": 0.0, "trades": []}
+                return {"returns": 0.0, "trades": [], "daily_values": []}
         
         # 计算海龟通道（不包含当前行，用shift(1)）
         data['upper_channel'] = data['adj_close'].shift(1).rolling(window=self.channel_period).max()
@@ -98,9 +98,10 @@ class TurtleStrategyPlugin(BaseStrategy):
                 self.sell(date, open_price, reason="海龟跌破")
                 self.position_count = 0  # 重置加仓次数
             
-            # 检查止盈止损（每天检查，用当天收盘价）
+            # 检查止盈止损（用前一日收盘价判断，今日开盘执行）
             if self.position > 0:
-                current_return = (close_price - self.avg_cost) / self.avg_cost if self.avg_cost > 0 else 0
+                prev_close_price = float(data.iloc[i - 1]['adj_close']) if i >= 1 else close_price
+                current_return = (prev_close_price - self.avg_cost) / self.avg_cost if self.avg_cost > 0 else 0
                 
                 # 止盈
                 if current_return >= self.take_profit:
@@ -126,4 +127,4 @@ class TurtleStrategyPlugin(BaseStrategy):
         
         ret = self.calc_returns()
         logger.info(f"TurtleStrategyPlugin finished: returns={ret:.2f}%, trades={len(self.trades)}")
-        return {"returns": ret, "trades": self.trades}
+        return {"returns": ret, "trades": self.trades, "daily_values": self.daily_values}
