@@ -404,9 +404,34 @@ class DataFetcher:
             
             raise Exception("No HS300 components data available from Tushare")
         
-        # 按固定优先级获取成分股：Tushare（付费，更靠谱） → AkShare
+        # ── 0. 优先从本地数据库读取（index_constituent 表）───
+        if self.local_db_available:
+            try:
+                logger.debug("Trying local DB for HS300 components...")
+                import sqlite3
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                # 读取沪深300成分股（index_code = '000300.SH'）
+                cursor.execute("""
+                    SELECT ts_code FROM index_constituent
+                    WHERE index_code = '000300.SH'
+                """)
+                rows = cursor.fetchall()
+                conn.close()
+                
+                if rows and len(rows) > 200:
+                    import pandas as pd
+                    codes = [r[0].replace('.SH', '').replace('.SZ', '') for r in rows]
+                    result = pd.DataFrame({'code': codes, 'name': [''] * len(codes)})
+                    logger.info(f"✅ Local DB HS300: 获取 {len(result)} 只成分股")
+                    return result[['code', 'name']]
+                else:
+                    logger.warning(f"Local DB HS300 成分股数量不足: {len(rows) if rows else 0}")
+            except Exception as e:
+                logger.warning(f"Local DB failed for HS300 components: {e}")
         
-        # 1. 优先尝试 Tushare
+        # ─ 1. 尝试 Tushare ─
         if self.tushare_backup_available:
             try:
                 logger.debug("Trying Tushare for HS300 components...")
@@ -499,9 +524,34 @@ class DataFetcher:
                 return result[['code', 'name']]
             raise Exception("No ZZ800 components data available from Tushare")
         
-        # 按固定优先级获取成分股：Tushare（付费，更靠谱） → AkShare
+        # ── 0. 优先从本地数据库读取（index_constituent 表）───
+        if self.local_db_available:
+            try:
+                logger.debug("Trying local DB for ZZ800 components...")
+                import sqlite3
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                # 读取中证800成分股（index_code = '000906.SH'）
+                cursor.execute("""
+                    SELECT ts_code FROM index_constituent
+                    WHERE index_code = '000906.SH'
+                """)
+                rows = cursor.fetchall()
+                conn.close()
+                
+                if rows and len(rows) > 300:
+                    import pandas as pd
+                    codes = [r[0].replace('.SH', '').replace('.SZ', '') for r in rows]
+                    result = pd.DataFrame({'code': codes, 'name': [''] * len(codes)})
+                    logger.info(f"✅ Local DB ZZ800: 获取 {len(result)} 只成分股")
+                    return result[['code', 'name']]
+                else:
+                    logger.warning(f"Local DB ZZ800 成分股数量不足: {len(rows) if rows else 0}")
+            except Exception as e:
+                logger.warning(f"Local DB failed for ZZ800 components: {e}")
         
-        # 1. 优先尝试 Tushare
+        # ─ 1. 尝试 Tushare ─
         if self.tushare_backup_available:
             try:
                 logger.debug("Trying Tushare for ZZ800 components...")
@@ -530,7 +580,123 @@ class DataFetcher:
         # 3. 所有数据源都失败
         logger.error("All data sources failed for ZZ800 components")
         raise Exception("Failed to fetch ZZ800 components from all sources")
-
+    
+    def get_zz500_components(self, date: str = None) -> pd.DataFrame:
+        """
+        获取中证500成分股
+        指数代码：000905.SH
+        
+        Args:
+            date: 交易日期（格式: "20230101"），如果提供则尝试从本地数据库获取该日期的成分股
+            
+        Returns:
+            包含代码、名称、行业等信息的DataFrame
+        """
+        logger.info(f"Fetching CSI 500 (ZZ500) components... (date={date})")
+        
+        # ── 0. 优先从本地数据库读取（index_constituent 表）───
+        if self.local_db_available:
+            try:
+                logger.debug("Trying local DB for ZZ500 components...")
+                import sqlite3
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                # 读取中证500成分股（index_code = '000905.SH'）
+                cursor.execute("""
+                    SELECT ts_code FROM index_constituent
+                    WHERE index_code = '000905.SH'
+                """)
+                rows = cursor.fetchall()
+                conn.close()
+                
+                if rows and len(rows) > 200:
+                    import pandas as pd
+                    codes = [r[0].replace('.SH', '').replace('.SZ', '') for r in rows]
+                    result = pd.DataFrame({'code': codes, 'name': [''] * len(codes)})
+                    logger.info(f"✅ Local DB ZZ500: 获取 {len(result)} 只成分股")
+                    return result[['code', 'name']]
+                else:
+                    logger.warning(f"Local DB ZZ500 成分股数量不足: {len(rows) if rows else 0}")
+            except Exception as e:
+                logger.warning(f"Local DB failed for ZZ500 components: {e}")
+        
+        # ── 1. 尝试 Tushare ─────────────────────────────────
+        if self.tushare_backup_available:
+            try:
+                logger.debug("Trying Tushare for ZZ500 components...")
+                
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
+                # 使用 index_member API 获取当前成分股
+                df = self.ts_pro.index_member(index_code='000905.SH')
+                
+                if df is not None and len(df) > 0:
+                    # 过滤出当前仍在成分股中的股票 (out_date 为 NaN)
+                    import numpy as np
+                    current = df[df['out_date'].isna()] if 'out_date' in df.columns else df
+                    
+                    if len(current) > 0:
+                        # 转换为标准格式（简单格式，不含.SH/.SZ后缀）
+                        result = current[['con_code']].copy()
+                        result.columns = ['code']
+                        # 移除 .SH 或 .SZ 后缀，统一为简单格式
+                        result['code'] = result['code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+                        result['name'] = ''  # Tushare 不提供股票名称
+                        logger.info(f"✓ Got {len(result)} ZZ500 components (Tushare)")
+                        return result[['code', 'name']]
+                
+                # 如果 index_member 没有数据，尝试使用 index_weight
+                try:
+                    # 速率限制（Tushare API）
+                    self.rate_limiter.wait()
+                    
+                    df_weight = self.ts_pro.index_weight(
+                        index_code='000905.SH',
+                        start_date='20240101',
+                        end_date='20241231'
+                    )
+                    if df_weight is not None and len(df_weight) > 0:
+                        latest_date = df_weight['trade_date'].max()
+                        latest = df_weight[df_weight['trade_date'] == latest_date]
+                        result = latest[['con_code']].copy()
+                        result.columns = ['code']
+                        # 移除后缀
+                        result['code'] = result['code'].str.replace(r'\.(SH|SZ)$', '', regex=True)
+                        result['name'] = ''
+                        logger.info(f"✓ Got {len(result)} ZZ500 components (Tushare index_weight)")
+                        return result[['code', 'name']]
+                except:
+                    pass
+                
+                logger.warning("Tushare returned empty data for ZZ500 components")
+            except Exception as e:
+                logger.warning(f"Tushare failed for ZZ500 components: {e}")
+        
+        # ── 2. Tushare 失败，尝试 AkShare ─────────────────
+        if self.akshare_backup_available:
+            try:
+                logger.debug("Trying AkShare for ZZ500 components...")
+                
+                # 使用 AkShare 获取中证500成分股
+                # 指数代码：000905 = 中证500
+                df = ak.index_stock_cons_csindex(symbol="000905")
+                result = df[['成分券代码', '成分券名称']].copy()
+                result.columns = ['code', 'name']
+                
+                if result is not None and len(result) > 0:
+                    logger.debug(f"✓ Got {len(result)} ZZ500 components (AkShare)")
+                    return result[['code', 'name']]
+                else:
+                    logger.warning("AkShare returned empty data for ZZ500 components")
+            except Exception as e:
+                logger.warning(f"AkShare failed for ZZ500 components: {e}")
+        
+        # ── 3. 所有数据源都失败 ───────────────────────────
+        logger.error("All data sources failed for ZZ500 components")
+        raise Exception("Failed to fetch ZZ500 components from all sources")
+    
     def get_stock_info(self, code: str) -> dict:
         """
         获取股票基本信息（名称、市值）
@@ -750,14 +916,32 @@ class DataFetcher:
             conn.close()
             
             if df is not None and len(df) > 0:
-                # 重命名列为AkShare格式
-                df.columns = ['日期', '开盘', '最高', '最低', '收盘', '前收盘', '涨跌额', '涨跌幅', '成交量', '成交额']
+                # 重命名列为AkShare格式（与AkShare返回的格式一致）
+                df = df.rename(columns={
+                    'trade_date': '日期',
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'close': '收盘',
+                    'pre_close': '前收盘',
+                    'change': '涨跌额',
+                    'pct_chg': '涨跌幅',
+                    'vol': '成交量',
+                    'amount': '成交额'
+                })
+                
+                # 添加 adj_close 和 adj_open（回测插件需要）
+                df['adj_close'] = df['收盘']
+                df['adj_open'] = df['开盘']
+                
+                logger.debug(f"✓ Got history for {code} from local DB ({len(df)} rows)")
                 return df
             
+            logger.warning(f"No history data in local DB for {code}")
             return None
         except Exception as e:
-            logger.error(f"Error reading history from local DB: {e}")
-            raise
+            logger.error(f"Error reading history from local DB for {code}: {e}")
+            return None
     
     def _get_financial_from_local_db(self, code: str) -> Optional[pd.DataFrame]:
         """
@@ -1097,6 +1281,10 @@ class DataFetcher:
         """
         logger.debug(f"Fetching industry momentum factor for {code} on {trade_date}")
         
+        # 转换代码格式（添加 .SZ 或 .SH 后缀）
+        ts_code = self._convert_code_to_ts_format(code)
+        logger.debug(f"  Converted code: {code} -> {ts_code}")
+        
         if not self.local_db_available:
             logger.warning(f"Local DB not available, cannot fetch industry momentum for {code}")
             return {"industry_momentum": np.nan, "industry_momentum_z": np.nan}
@@ -1111,7 +1299,7 @@ class DataFetcher:
                 SELECT industry_momentum, industry_momentum_z
                 FROM industry_momentum
                 WHERE ts_code = ? AND trade_date = ?
-            """, (code, trade_date))
+            """, (ts_code, trade_date))
             
             row = cursor.fetchone()
             conn.close()
@@ -1257,3 +1445,675 @@ class DataFetcher:
         
         # 默认返回空字符串
         return ""
+
+    
+    def get_index_returns(self, index_code: str, start_date: str, end_date: str) -> np.ndarray:
+        """
+        获取指数收益率序列（用于计算 Beta）
+        
+        Args:
+            index_code: 指数代码（如 "000300.SH"）
+            start_date: 开始日期（格式: "20230101"）
+            end_date: 结束日期（格式: "20241231"）
+            
+        Returns:
+            指数收益率序列（numpy array），失败返回空数组
+        """
+        if not self.local_db_available:
+            logger.warning("Local DB not available, cannot fetch index returns")
+            return np.array([])
+        
+        try:
+            conn = sqlite3.connect(self.local_db_path)
+            
+            # 查询指数历史数据
+            query = """
+                SELECT trade_date, close
+                FROM index_daily
+                WHERE ts_code = ?
+                  AND trade_date BETWEEN ? AND ?
+                ORDER BY trade_date ASC
+            """
+            
+            df = pd.read_sql_query(query, conn, params=(index_code, start_date, end_date))
+            conn.close()
+            
+            if df is None or len(df) == 0:
+                logger.warning(f"No index data found for {index_code}")
+                return np.array([])
+            
+            # 计算收益率
+            close_prices = df["close"].values
+            returns = np.diff(close_prices) / close_prices[:-1]
+            
+            logger.debug(f"Got {len(returns)} days of index returns for {index_code}")
+            return returns
+            
+        except Exception as e:
+            logger.error(f"Error fetching index returns for {index_code}: {e}")
+            return np.array([])
+    
+    # ===== 价值投资策略 - 财务数据获取方法 =====
+    
+    def get_market_cap_all_a(self, date: str) -> pd.DataFrame:
+        """
+        获取全A股市值数据（用于计算中位数/平均值）
+        
+        Args:
+            date: 交易日期（格式: "YYYYMMDD"）
+            
+        Returns:
+            DataFrame with columns: ['ts_code', 'total_mv']
+            total_mv单位：万元
+        """
+        logger.debug(f"Fetching market cap for all A-shares on {date}...")
+        
+        # 方法1：从本地数据库获取（daily_basic表）
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                query = """
+                    SELECT ts_code, total_mv
+                    FROM daily_basic
+                    WHERE trade_date = ?
+                """
+                
+                df = pd.read_sql_query(query, conn, params=(date,))
+                conn.close()
+                
+                if df is not None and len(df) > 0:
+                    # 删除total_mv为NULL的行
+                    df = df.dropna(subset=['total_mv'])
+                    
+                    if len(df) > 0:
+                        logger.info(f"✓ Got {len(df)} stocks' market cap from local DB (date={date})")
+                        return df
+                    else:
+                        logger.warning(f"All market cap data is NULL for date={date}")
+                else:
+                    logger.warning(f"No market cap data found in local DB for date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch market cap from local DB: {e}")
+        
+        # 方法2：从Tushare API获取（备用）
+        if self.tushare_backup_available and self.ts_pro is not None:
+            try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
+                df = self.ts_pro.daily_basic(
+                    trade_date=date,
+                    fields='ts_code,total_mv'
+                )
+                
+                if df is not None and len(df) > 0:
+                    logger.info(f"✓ Got {len(df)} stocks' market cap from Tushare (date={date})")
+                    return df
+                else:
+                    logger.warning(f"No market cap data found from Tushare for date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch market cap from Tushare: {e}")
+        
+        # 所有数据源都失败
+        logger.error(f"All data sources failed for market cap (date={date})")
+        return pd.DataFrame(columns=['ts_code', 'total_mv'])
+    
+    
+    def get_current_ratio_all_a(self, date: str) -> pd.DataFrame:
+        """
+        获取全A股流动比率数据
+        
+        Args:
+            date: 报告期（格式: "YYYYMMDD"，通常是季度末日期如 "20231231"）
+            
+        Returns:
+            DataFrame with columns: ['ts_code', 'current_ratio']
+        """
+        logger.debug(f"Fetching current ratio for all A-shares (end_date={date})...")
+        
+        # 方法1：从本地数据库获取（fina_indicator表）
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                # 查询指定报告期的数据（使用end_date字段）
+                query = """
+                    SELECT ts_code, current_ratio
+                    FROM fina_indicator
+                    WHERE end_date = ?
+                """
+                
+                df = pd.read_sql_query(query, conn, params=(date,))
+                conn.close()
+                
+                if df is not None and len(df) > 0:
+                    # 删除current_ratio为NULL的行
+                    df = df.dropna(subset=['current_ratio'])
+                    
+                    if len(df) > 0:
+                        logger.info(f"✓ Got {len(df)} stocks' current ratio from local DB (end_date={date})")
+                        return df
+                    else:
+                        logger.warning(f"All current ratio data is NULL for end_date={date}")
+                else:
+                    logger.warning(f"No current ratio data found in local DB for end_date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch current ratio from local DB: {e}")
+        
+        # 方法2：从Tushare API获取（备用）
+        if self.tushare_backup_available and self.ts_pro is not None:
+            try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
+                df = self.ts_pro.fina_indicator(
+                    end_date=date,
+                    fields='ts_code,current_ratio'
+                )
+                
+                if df is not None and len(df) > 0:
+                    logger.info(f"✓ Got {len(df)} stocks' current ratio from Tushare (end_date={date})")
+                    return df
+                else:
+                    logger.warning(f"No current ratio data found from Tushare for end_date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch current ratio from Tushare: {e}")
+        
+        # 所有数据源都失败
+        logger.error(f"All data sources failed for current ratio (end_date={date})")
+        return pd.DataFrame(columns=['ts_code', 'current_ratio'])
+    
+    
+    def get_roe_all_a(self, date: str) -> pd.DataFrame:
+        """
+        获取全A股ROE数据
+        
+        Args:
+            date: 报告期（格式: "YYYYMMDD"，通常是季度末日期如 "20231231"）
+            
+        Returns:
+            DataFrame with columns: ['ts_code', 'roe']
+        """
+        logger.debug(f"Fetching ROE for all A-shares (end_date={date})...")
+        
+        # 方法1：从本地数据库获取（fina_indicator表）
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                # 查询指定报告期的数据（使用end_date字段）
+                query = """
+                    SELECT ts_code, roe
+                    FROM fina_indicator
+                    WHERE end_date = ?
+                """
+                
+                df = pd.read_sql_query(query, conn, params=(date,))
+                conn.close()
+                
+                if df is not None and len(df) > 0:
+                    # 删除roe为NULL的行
+                    df = df.dropna(subset=['roe'])
+                    
+                    if len(df) > 0:
+                        logger.info(f"✓ Got {len(df)} stocks' ROE from local DB (end_date={date})")
+                        return df
+                    else:
+                        logger.warning(f"All ROE data is NULL for end_date={date}")
+                else:
+                    logger.warning(f"No ROE data found in local DB for end_date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch ROE from local DB: {e}")
+        
+        # 方法2：从Tushare API获取（备用）
+        if self.tushare_backup_available and self.ts_pro is not None:
+            try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
+                df = self.ts_pro.fina_indicator(
+                    end_date=date,
+                    fields='ts_code,roe'
+                )
+                
+                if df is not None and len(df) > 0:
+                    logger.info(f"✓ Got {len(df)} stocks' ROE from Tushare (end_date={date})")
+                    return df
+                else:
+                    logger.warning(f"No ROE data found from Tushare for end_date={date}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch ROE from Tushare: {e}")
+        
+        # 所有数据源都失败
+        logger.error(f"All data sources failed for ROE (end_date={date})")
+        return pd.DataFrame(columns=['ts_code', 'roe'])
+    
+    
+    def get_financial_data(self, stock_codes: list, date: str) -> pd.DataFrame:
+        """
+        获取指定股票的财务数据（核心方法）
+        
+        从 daily_basic 和 fina_indicator 表获取所有需要的财务数据
+        
+        Args:
+            stock_codes: 股票代码列表（如 ["000001.SZ", "600000.SH"]）
+            date: 报告期（格式: "YYYYMMDD"）
+                 对于daily_basic表使用trade_date，对于fina_indicator表使用end_date
+            
+        Returns:
+            DataFrame with columns:
+            ['ts_code', 'name', 'total_mv', 'current_ratio', 'roe', 
+             'fcff', 'op_yoy', 'eps']
+        """
+        logger.info(f"🔍 [get_financial_data] 开始获取 {len(stock_codes)} 只股票的财务数据 (date={date})...")
+        logger.info(f"🔍 [get_financial_data] 股票代码示例: {stock_codes[:5]}")
+        
+        # 将股票代码转换为Tushare格式（添加 .SZ 或 .SH 后缀）
+        logger.info(f"🔍 [get_financial_data] 转换股票代码格式...")
+        ts_codes = [self._convert_code_to_ts_format(code) for code in stock_codes]
+        logger.info(f"🔍 [get_financial_data] 转换后示例: {ts_codes[:5]}")
+        
+        # 初始化结果DataFrame（使用转换后的代码）
+        result_df = pd.DataFrame({'ts_code': ts_codes})
+        logger.info(f"🔍 [get_financial_data] 初始化 result_df: {len(result_df)} 行")
+        
+        # ========== 1. 获取股票名称 ==========
+        result_df['name'] = result_df['ts_code'].apply(lambda x: self._get_stock_name(x))
+        
+        # ========== 2. 获取市值数据（daily_basic表）==========
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                # 查询最接近date的交易日的市值数据
+                # 因为daily_basic表使用trade_date（交易日），而不是报告期
+                # 注意：必须选择 trade_date 列，否则后续无法按它排序/去重
+                placeholders = ','.join(['?'] * len(ts_codes))
+                query = f"""
+                    SELECT ts_code, trade_date, total_mv
+                    FROM daily_basic
+                    WHERE ts_code IN ({placeholders})
+                      AND trade_date <= ?
+                    ORDER BY trade_date DESC
+                """
+                
+                # 对每个股票取最近一个交易日的数据
+                df_mv = pd.read_sql_query(
+                    query, conn, 
+                    params=ts_codes + [date]
+                )
+                conn.close()
+                
+                logger.info(f"🔍 [get_financial_data] daily_basic 查询返回: {len(df_mv)} 行")
+                if len(df_mv) > 0:
+                    logger.info(f"🔍 [get_financial_data] df_mv 列: {list(df_mv.columns)}")
+                    logger.info(f"🔍 [get_financial_data] df_mv 前3行:\n{df_mv.head(3).to_string()}")
+                
+                if df_mv is not None and len(df_mv) > 0:
+                    # 对每个股票，取trade_date最大的那条记录
+                    # 方法：按ts_code分组，取trade_date最大的行
+                    df_mv = df_mv.sort_values(['ts_code', 'trade_date'], ascending=[True, False])
+                    df_mv = df_mv.drop_duplicates(subset=['ts_code'], keep='first')
+                    df_mv = df_mv[['ts_code', 'total_mv']]
+                    
+                    # 合并到结果DataFrame
+                    result_df = result_df.merge(df_mv, on='ts_code', how='left')
+                    
+                    logger.info(f"✓ Got market cap for {len(df_mv)} stocks from local DB")
+                else:
+                    logger.warning(f"No market cap data found in local DB for given stocks")
+                    result_df['total_mv'] = np.nan
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch market cap from local DB: {e}")
+                result_df['total_mv'] = np.nan
+        else:
+            result_df['total_mv'] = np.nan
+        
+        # ========== 3. 获取财务指标数据（fina_indicator表）==========
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                # 查询指定报告期的财务数据
+                placeholders = ','.join(['?'] * len(ts_codes))
+                query = f"""
+                    SELECT ts_code, current_ratio, roe, fcff, op_yoy, eps
+                    FROM fina_indicator
+                    WHERE ts_code IN ({placeholders})
+                      AND end_date = ?
+                """
+                
+                df_fin = pd.read_sql_query(
+                    query, conn,
+                    params=ts_codes + [date]
+                )
+                conn.close()
+                
+                logger.info(f"🔍 [get_financial_data] fina_indicator 查询返回: {len(df_fin)} 行")
+                if len(df_fin) > 0:
+                    logger.info(f"🔍 [get_financial_data] df_fin 列: {list(df_fin.columns)}")
+                    logger.info(f"🔍 [get_financial_data] df_fin 前3行:\n{df_fin.head(3).to_string()}")
+                
+                if df_fin is not None and len(df_fin) > 0:
+                    # 合并到结果DataFrame
+                    # 注意：只有部分股票有数据，所以使用 how='left'
+                    result_df = result_df.merge(df_fin, on='ts_code', how='left')
+                    
+                    logger.info(f"✓ Got financial indicators for {len(df_fin)} stocks from local DB")
+                    logger.info(f"  {len(df_fin)}/{len(stock_codes)} stocks have financial data")
+                else:
+                    logger.warning(f"No financial data found in local DB for given stocks")
+                    # 添加空列（全设为NaN）
+                    for col in ['current_ratio', 'roe', 'fcff', 'op_yoy', 'eps']:
+                        result_df[col] = np.nan
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch financial data from local DB: {e}")
+                for col in ['current_ratio', 'roe', 'fcff', 'op_yoy', 'eps']:
+                    result_df[col] = np.nan
+        else:
+            for col in ['current_ratio', 'roe', 'fcff', 'op_yoy', 'eps']:
+                result_df[col] = np.nan
+        
+        # ========== 4. 如果本地DB数据不完整，尝试Tushare API（备用）==========
+        # 检查是否有NaN值
+        nan_count = result_df.isnull().sum().sum()
+        if nan_count > 0 and self.tushare_backup_available and self.ts_pro is not None:
+            logger.info(f"Found {nan_count} NaN values, trying Tushare API backup...")
+            
+            try:
+                # 速率限制（Tushare API）
+                self.rate_limiter.wait()
+                
+                # 高效方法：只调用1次API获取*所有*股票在end_date的数据
+                logger.info(f"  🔍 [get_financial_data] 调用 Tushare API (所有股票, end_date={date})...")
+                
+                df_tushare_all = self.ts_pro.fina_indicator(
+                    end_date=date,
+                    fields='ts_code,current_ratio,roe,fcff,op_yoy,eps'
+                )
+                
+                if df_tushare_all is not None and len(df_tushare_all) > 0:
+                    logger.info(f"  🔍 [get_financial_data] Tushare API 返回: {len(df_tushare_all)} 行 (所有股票)")
+                    
+                    # 本地过滤：只保留我们需要的股票
+                    ts_codes_set = set(result_df['ts_code'].tolist())
+                    df_tushare = df_tushare_all[df_tushare_all['ts_code'].isin(ts_codes_set)]
+                    
+                    logger.info(f"  🔍 [get_financial_data] 本地过滤后: {len(df_tushare)} 行 (我们只需要的股票)")
+                    logger.info(f"  🔍 [get_financial_data] df_tushare 列: {list(df_tushare.columns)}")
+                    logger.info(f"  🔍 [get_financial_data] df_tushare 前3行:\n{df_tushare.head(3).to_string()}")
+                    
+                    # 去重（保留最后一条）
+                    df_tushare = df_tushare.drop_duplicates(subset=['ts_code'], keep='last')
+                    logger.info(f"  🔍 [get_financial_data] 去重后: {len(df_tushare)} 行")
+                    
+                    # 合并到结果DataFrame（只填充NaN值）
+                    for col in ['current_ratio', 'roe', 'fcff', 'op_yoy', 'eps']:
+                        if col in df_tushare.columns:
+                            # 创建映射字典：ts_code -> col值
+                            tushare_dict = df_tushare.set_index('ts_code')[col].to_dict()
+                            logger.info(f"  🔍 [get_financial_data] tushare_dict[{col}] 示例（前5个）: {list(tushare_dict.items())[:5]}")
+                            
+                            # 只填充 NaN 值
+                            mask = result_df[col].isnull()
+                            logger.info(f"  🔍 [get_financial_data] {col} 列有 {mask.sum()} 个 NaN 值需要填充")
+                            
+                            # 使用 map 填充
+                            mapped_values = result_df.loc[mask, 'ts_code'].map(tushare_dict)
+                            logger.info(f"  🔍 [get_financial_data] map() 后的值示例（前5个）: {mapped_values.head(5).tolist()}")
+                            
+                            result_df.loc[mask, col] = mapped_values
+                            logger.info(f"  🔍 [get_financial_data] 填充后 {col} 列仍有 {result_df[col].isnull().sum()} 个 NaN 值")
+                    
+                    logger.info(f"✓ Got financial data from Tushare API backup")
+                else:
+                    logger.warning(f"  🔍 [get_financial_data] Tushare API 返回空数据 (end_date={date})")
+                
+            except Exception as e:
+                logger.warning(f"Failed to fetch financial data from Tushare: {e}")
+                import traceback
+                logger.warning(f"Traceback: {traceback.format_exc()}")
+        
+        # ========== 5. 最终检查 ==========
+        final_nan_count = result_df.isnull().sum().sum()
+        if final_nan_count > 0:
+            logger.warning(f"Final result has {final_nan_count} NaN values")
+            logger.warning(f"🔍 [get_financial_data] result_df 列: {list(result_df.columns)}")
+            logger.warning(f"🔍 [get_financial_data] result_df NaN 统计:\n{result_df.isnull().sum()}")
+            logger.warning(f"🔍 [get_financial_data] result_df 前3行:\n{result_df.head(3).to_string()}")
+        
+        logger.info(f"✓ Financial data fetching complete: {len(result_df)} stocks")
+        return result_df
+    
+    
+    def _get_stock_name(self, ts_code: str) -> str:
+        """
+        获取单个股票的名称（辅助方法）
+        
+        Args:
+            ts_code: Tushare格式的股票代码（如 "000001.SZ"）
+            
+        Returns:
+            股票名称（如 "平安银行"）
+        """
+        # 转换格式：000001.SZ -> 000001
+        simple_code = ts_code.split('.')[0]
+        
+        # 先从缓存查找
+        if hasattr(self, '_stock_name_cache') and simple_code in self._stock_name_cache:
+            return self._stock_name_cache[simple_code]
+        
+        # 从本地数据库查找
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    SELECT name FROM stock_basic WHERE ts_code = ? LIMIT 1
+                """, (ts_code,))
+                
+                row = cursor.fetchone()
+                conn.close()
+                
+                if row is not None:
+                    name = row[0]
+                    # 缓存结果
+                    if not hasattr(self, '_stock_name_cache'):
+                        self._stock_name_cache = {}
+                    self._stock_name_cache[simple_code] = name
+                    return name
+                    
+            except Exception as e:
+                logger.debug(f"Error fetching stock name for {ts_code}: {e}")
+        
+        # 默认返回空字符串
+        return ""
+    
+    
+    # ===== 价值投资策略 - 历史自由现金流检查 =====
+    
+    def get_historical_fcff(self, stock_codes: list, end_date: str, years: int = 5) -> pd.DataFrame:
+        """
+        获取股票过去N年的FCFF数据，并检查是否都为正
+        
+        只使用年报数据（end_date以12-31结尾），因为：
+        1. 年报是经过审计的，数据最权威
+        2. 避免季度数据的季节性波动
+        3. "近N年自由现金流为正"通常指年报
+        
+        Args:
+            stock_codes: 股票代码列表（如 ["000001.SZ", "600000.SH"]）
+            end_date: 结束报告期（格式: "YYYYMMDD"，如 "20231231"）
+            years: 检查过去N年（默认5年）
+            
+        Returns:
+            DataFrame with columns:
+            ['ts_code', 'fcff_years_all_positive', 'fcff_details']
+            
+            fcff_years_all_positive: bool (是否所有年份FCFF都>0)
+            fcff_details: dict (详细的每年FCFF值，如 {2023: 100, 2022: 200, ...})
+        """
+        logger.info(f"Checking historical FCFF for {len(stock_codes)} stocks (past {years} years, end_date={end_date})...")
+        
+        # 计算起始年份
+        end_year = int(end_date[:4])
+        start_year = end_year - years + 1
+        
+        # 构建需要查询的年报报告期列表
+        # 例如：years=5, end_date=20231231 → [20231231, 20221231, ..., 20191231]
+        report_dates = [f"{year}1231" for year in range(start_year, end_year + 1)]
+        
+        logger.debug(f"Will check FCFF for report dates: {report_dates}")
+        
+        # 初始化结果DataFrame
+        result_df = pd.DataFrame({'ts_code': stock_codes})
+        result_df['fcff_years_all_positive'] = False
+        result_df['fcff_details'] = None  # 将存储dict
+        
+        # ========== 从本地数据库获取历史FCFF数据 ==========
+        if self.local_db_available:
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                
+                # 批量查询：获取所有股票在指定报告期的FCFF数据
+                # 使用参数化查询，避免SQL注入
+                query = """
+                    SELECT ts_code, end_date, fcff
+                    FROM fina_indicator
+                    WHERE ts_code IN ({})
+                      AND end_date IN ({})
+                      AND fcff IS NOT NULL
+                    ORDER BY ts_code, end_date
+                """.format(
+                    ','.join(['?'] * len(stock_codes)),
+                    ','.join(['?'] * len(report_dates))
+                )
+                
+                params = stock_codes + report_dates
+                df_fcff = pd.read_sql_query(query, conn, params=params)
+                conn.close()
+                
+                if df_fcff is not None and len(df_fcff) > 0:
+                    logger.info(f"✓ Got {len(df_fcff)} FCFF records from local DB")
+                    
+                    # 对每个股票，检查是否所有年份的FCFF都>0
+                    for ts_code in stock_codes:
+                        stock_data = df_fcff[df_fcff['ts_code'] == ts_code]
+                        
+                        if len(stock_data) == 0:
+                            # 没有数据，标记为False
+                            continue
+                        
+                        # 构建详情dict：{年份: FCFF值}
+                        details = {}
+                        all_positive = True
+                        
+                        for _, row in stock_data.iterrows():
+                            year = int(row['end_date']) // 10000  # 20231231 → 2023
+                            fcff_val = row['fcff']
+                            details[year] = fcff_val
+                            
+                            if fcff_val <= 0:
+                                all_positive = False
+                        
+                        # 检查是否所有需要的年份都有数据
+                        available_years = set(details.keys())
+                        required_years = set(range(start_year, end_year + 1))
+                        
+                        if available_years >= required_years:
+                            # 所有需要的年份都有数据
+                            result_df.loc[result_df['ts_code'] == ts_code, 'fcff_years_all_positive'] = all_positive
+                            result_df.loc[result_df['ts_code'] == ts_code, 'fcff_details'] = [details]
+                        else:
+                            # 数据不完整，标记为False
+                            logger.debug(f"  {ts_code}: FCFF data incomplete (got {sorted(available_years)}, need {sorted(required_years)})")
+                            result_df.loc[result_df['ts_code'] == ts_code, 'fcff_years_all_positive'] = False
+                            result_df.loc[result_df['ts_code'] == ts_code, 'fcff_details'] = [details]
+                    
+                else:
+                    logger.warning(f"No FCFF data found in local DB for given stocks and report dates")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch historical FCFF from local DB: {e}")
+        
+        # ========== 如果本地DB数据不完整，尝试Tushare API（备用）==========
+        # 检查是否有股票需要补充数据（完全没数据 或 数据不完整）
+        needs_backup = []
+        for idx, row in result_df.iterrows():
+            ts_code = row['ts_code']
+            details = row['fcff_details']
+            
+            if details is None:
+                # 完全没数据
+                needs_backup.append(ts_code)
+            elif isinstance(details, dict):
+                # 有数据但不完整
+                available_years = set(details.keys())
+                required_years = set(range(start_year, end_year + 1))
+                if available_years < required_years:
+                    needs_backup.append(ts_code)
+        
+        if len(needs_backup) > 0 and self.tushare_backup_available and self.ts_pro is not None:
+            logger.info(f"Found {len(needs_backup)} stocks needing FCFF data backup, trying Tushare API...")
+            
+            try:
+                # 从Tushare API获取（注意：Tushare有速率限制，需要循环）
+                for ts_code in needs_backup:  # 不再限制10只
+                    self.rate_limiter.wait()
+                    
+                    df_api = self.ts_pro.fina_indicator(
+                        ts_code=ts_code,
+                        start_date=f"{start_year}0101",
+                        end_date=end_date,
+                        fields='ts_code,end_date,fcff'
+                    )
+                    
+                    if df_api is not None and len(df_api) > 0:
+                        # 筛选年报数据
+                        df_annual = df_api[df_api['end_date'].str.endswith('1231')]
+                        
+                        if len(df_annual) > 0:
+                            # 获取已有的details（可能来自本地DB）
+                            existing_details = result_df.loc[result_df['ts_code'] == ts_code, 'fcff_details'].iloc[0]
+                            if existing_details is None:
+                                existing_details = {}
+                            
+                            # 合并数据：用API数据补充/覆盖
+                            for _, row in df_annual.iterrows():
+                                year = int(row['end_date']) // 10000
+                                fcff_val = row['fcff']
+                                if fcff_val is not None:
+                                    existing_details[year] = fcff_val
+                            
+                            # 检查是否所有需要的年份都有数据
+                            available_years = set(existing_details.keys())
+                            required_years = set(range(start_year, end_year + 1))
+                            
+                            if available_years >= required_years:
+                                # 所有需要的年份都有数据，检查是否都>0
+                                all_positive = all(v > 0 for v in existing_details.values() if v is not None)
+                                result_df.loc[result_df['ts_code'] == ts_code, 'fcff_years_all_positive'] = all_positive
+                            
+                            # 更新details（即使不完整也更新）
+                            result_df.loc[result_df['ts_code'] == ts_code, 'fcff_details'] = [existing_details]
+                
+                logger.info(f"✓ Tushare API backup complete for {len(needs_backup)} stocks")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch FCFF from Tushare API: {e}")
+        
+        # ========== 最终统计 ==========
+        positive_count = result_df['fcff_years_all_positive'].sum()
+        logger.info(f"✓ Historical FCFF check complete: {positive_count}/{len(stock_codes)} stocks have all positive FCFF in past {years} years")
+        
+        return result_df[['ts_code', 'fcff_years_all_positive', 'fcff_details']]

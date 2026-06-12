@@ -41,7 +41,7 @@ SELECTION = {
     "date": "20220103",  # ← 2022年初第一个交易日
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "hs300",
+    "stock_pool": "zz500",  # ← 修改为中证500
 
     # 选股数量
     "top_n": 20,
@@ -60,18 +60,20 @@ SELECTION["output_file"] = f"outputs/selection_{SELECTION['date']}.csv"
 # ============================================================
 
 FACTOR_CALCULATOR = {
-
+    
     "enable_quality": True,       # 质量因子
-
+    
     "enable_momentum": True,      # 动量因子
-
+    
     "enable_technical": True,     # 技术因子（TA-Lib）
-
+    
     "enable_volatility": True,     # 低波动因子
-
+    
     "enable_money_flow": False,    # 资金流因子（历史回测建议关）
-
+    
     "enable_industry_momentum": True,   # 行业动量因子（需先填充 industry_momentum 表）
+    
+    "enable_risk": True,         # 风险因子（夏普比率、贝塔等）
 }
 
 
@@ -90,13 +92,15 @@ FACTOR_PROCESSOR = {
 
     # 各大类因子权重（总和自动归一化，无需凑整）
     "weights": {
-        "value_score": 0.25,
-        "growth_score": 0.15,
+        "value_score": 0.20,
+        "growth_score": 0.10,
         "quality_score": 0.10,
-        "momentum_score": 0.20,
+        "momentum_score": 0.15,
         "technical_score": 0.10,
         "volatility_score": 0.15,
-        "money_flow_score": 0.05,
+        "money_flow_score": 0.0,
+        "industry_momentum_score": 0.10,
+        "risk_score": 0.10,       # 风险因子（夏普比率、贝塔等）
     },
 }
 
@@ -106,16 +110,16 @@ FACTOR_PROCESSOR = {
 # ============================================================
 
 BACKTEST = {
-
+    
     # 回测时间范围
     "start_date": "20220102",
-    "end_date": "20221230",
+    "end_date": "20220331",
 
     # 每只股票初始资金（元）
     "initial_capital": 100000,
 
     # 基准指数（用于对比）
-    "benchmark": "000300.SH",
+    "benchmark": "000906.SH",  # ← 中证800指数
 
     # ═══════════════════════════════════════════════════════
     # 股票来源（可被命令行参数覆盖）
@@ -169,16 +173,16 @@ STRATEGIES = {
         "name": "MACD/KDJ策略",
         "fast": 12, "slow": 26, "signal": 9,
         "kdj_period": 9,
-        "take_profit": 0.50,
-        "stop_loss": 0.15,
+        "take_profit": 0.20,
+        "stop_loss": 0.10,
     },
     "bollinger": {
-        "enabled": False,
+        "enabled": True,  # ← 启用布林带策略
         "name": "布林带策略",
         "period": 20,
         "std": 2,
-        "take_profit": 0.50,
-        "stop_loss": 0.15,
+        "take_profit": 0.20,
+        "stop_loss": 0.10,
     },
     "turtle": {
         "enabled": False,  # ← 禁用简化版，使用完整版
@@ -241,13 +245,62 @@ STRATEGIES = {
         "system_weight": [0.5, 0.5],  # 短期/长期系统资金分配权重
     },
     "rsi_trend": {
-        "enabled": True,
+        "enabled": False,  # ← 禁用RSI趋势策略
         "name": "RSI趋势策略",
         "rsi_period": 14,        # RSI计算周期
         "rsi_center": 50,        # RSI中轴线（上穿买入，下穿卖出）
         "take_profit": 0.50,     # 止盈 +50%
         "stop_loss": 0.15,       # 止损 -15%
         "position_mode": "half",   # 半仓操作（50%资金）
+    },
+    # ── 定投策略 ──
+    "dca": {
+        "enabled": True,
+        "name": "月定投策略",
+        "amount_per_month": 5000,  # 每月定投金额（元）
+        "take_profit": 0.30,      # 止盈 +30%
+        "stop_loss": 0.20,        # 止损 -20%
+        "enable_tp_sl": True,      # 是否启用止盈止损
+    },
+    "weekly_dca": {
+        "enabled": True,
+        "name": "周定投策略",
+        "shares_per_week": 100,   # 每周买入股数
+        "take_profit": 0.30,      # 止盈 +30%
+        "stop_loss": 0.10,        # 止损 -10%
+        "enable_tp_sl": True,      # 是否启用止盈止损
+    },
+    # ── 均线策略 ──
+    "dual_ma": {
+        "enabled": True,
+        "name": "双均线策略（MA10/MA30）",
+        "ma_short": 10,           # 短期均线周期（从20改为10）
+        "ma_long": 30,            # 长期均线周期（从60改为30）
+        "position_pct": 0.5,      # 单次买入仓位比例（50%）
+        "take_profit": 0.30,      # 止盈 +30%
+        "stop_loss": 0.10,        # 止损 -10%
+    },
+    # ── 能量指标策略 ──
+    "energy": {
+        "enabled": True,
+        "name": "能量指标策略（AR/BR/CR/VR）",
+        "indicator_period": 26,     # 指标计算周期
+        "buy_threshold": 100,      # 买入阈值（低于此值视为超卖）
+        "sell_threshold": 150,     # 卖出阈值（高于此值视为过热）
+        "position_pct": 0.5,       # 单次买入仓位比例（50%）
+        "take_profit": 0.25,      # 止盈 +25%
+        "stop_loss": 0.10,        # 止损 -10%
+    },
+    # ── 动态网格策略（VR 驱动）──
+    "energy_grid": {
+        "enabled": True,
+        "name": "动态网格策略（VR驱动）",
+        "grid_levels": 10,          # 网格层数
+        "base_grid_pct": 0.05,    # 基础网格间距（5%）
+        "low_vr_grid_pct": 0.03,  # VR<80时网格间距（3%）
+        "high_vr_grid_pct": 0.08,  # VR>120时网格间距（8%）
+        "vr_period": 26,           # VR计算周期
+        "position_per_grid": 0.1,  # 每层网格仓位比例（10%）
     },
 }
 
@@ -267,8 +320,58 @@ INDUSTRY_MOMENTUM = {
 # ============================================================
 
 OUTPUT = {
-    # ══ 输出目录（CSV文件存放位置，如 ml-*.csv / multi-*.csv）
+    # ══ 输出根目录
     "dir": "data/results",
+
+    # ══ 选股结果子目录（多因子 / ML 选股结果）
+    "selection_dir": "data/results/selection",
+
+    # ══ 回测结果子目录（回测收益汇总等）
+    "backtest_dir": "data/results/backtest",
+
     "save_csv": True,        # ← 选股时保存CSV
     "print_top_n": 20,
+}
+
+
+# ============================================================
+# 九、价值投资策略配置
+# ============================================================
+
+VALUE_STRATEGY = {
+    # 选股日期（格式: "YYYYMMDD"，必须是交易日）
+    "date": "20260102",  # 2026年第一个交易日
+
+    # 财务数据报告期（格式: "YYYYMMDD"，如 "20260331" 表示2026年一季报）
+    "report_date": "20260331",  # 最新报告期（数据库已更新到2026-03-31）
+
+    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    "stock_pool": "zz800",
+
+    # 市值阈值（分位数，0.5 = 中位数）
+    "market_cap_quantile": 0.5,
+
+    # 流动比率阈值（分位数）
+    "current_ratio_quantile": 0.5,
+
+    # ROE阈值（分位数）
+    "roe_quantile": 0.5,
+
+    # 自由现金流要求（连续为正年数，0 = 不检查）
+    "free_cash_flow_years": 5,
+
+    # 营收增长率区间（max=0 表示无上限）
+    "revenue_growth_min": 0.06,
+    "revenue_growth_max": 0,
+
+    # EPS区间（max=0 表示无上限）
+    "eps_min": 0.08,
+    "eps_max": 0,
+
+    # 选股数量（0 = 不限制，按条件筛选）
+    "top_n": 0,
+
+    # 输出配置
+    "output_dir": "data/results/value_strategy",
+    "output_file": "value_selection_{date}.csv",
 }

@@ -9,15 +9,15 @@
 import sys, os, sqlite3, glob, argparse
 sys.path.insert(0, os.path.dirname(__file__))
 
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 from datetime import datetime
 from loguru import logger
 
-# 简化日志格式（只显示消息，不显示时间/文件/行号）
-# 级别=ERROR：屏蔽所有 INFO/WARNING，只显示严重错误
+# 完全静音 loguru 终端输出（回测平台的主输出使用 print()，不需要 loguru）
 logger.remove()
-logger.add(sys.stderr, format="{message}", level="ERROR")
+logger.add(lambda _: None, level="CRITICAL")  # 空 sink，只吞不吐
 
 
 # ════════════════════════════════════════════════════════
@@ -100,6 +100,7 @@ def ts_code(c):
 def load_stock_prices(code, start, end, conn, lookback_days=250):
     """
     从本地数据库加载日线行情数据（使用外部传入的连接）
+    并返回前复权价格（adj_open, adj_high, adj_low, adj_close）
     参数：
         lookback_days: 回溯天数（用于计算MA200等指标）
     """
@@ -107,18 +108,39 @@ def load_stock_prices(code, start, end, conn, lookback_days=250):
     start_dt = pd.Timestamp(start)
     lookback_start = (start_dt - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
     
-    df = pd.read_sql_query(
-        "SELECT trade_date, open, high, low, close, vol FROM daily WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
-        conn, params=(ts_code(code), lookback_start, end))
+    # 加载行情数据 + 复权因子（通过 JOIN）
+    query = """
+        SELECT d.trade_date, d.open, d.high, d.low, d.close, d.vol,
+               af.adj_factor
+        FROM daily d
+        JOIN adj_factor af ON d.ts_code = af.ts_code 
+                            AND d.trade_date = af.trade_date
+        WHERE d.ts_code = ? AND d.trade_date BETWEEN ? AND ?
+        ORDER BY d.trade_date
+    """
+    df = pd.read_sql_query(query, conn, params=(ts_code(code), lookback_start, end))
     if df.empty:
         return None
+    
     # 确保数值列为 float
-    for col in ['open', 'high', 'low', 'close', 'vol']:
+    for col in ['open', 'high', 'low', 'close', 'vol', 'adj_factor']:
         if col in df.columns:
             df[col] = df[col].astype(float)
+    
+    # 计算前复权价格（以最新价格为基准）
+    latest_adj = df['adj_factor'].iloc[-1]
+    df['adj_open'] = df['open'] * (df['adj_factor'] / latest_adj)
+    df['adj_high'] = df['high'] * (df['adj_factor'] / latest_adj)
+    df['adj_low'] = df['low'] * (df['adj_factor'] / latest_adj)
+    df['adj_close'] = df['close'] * (df['adj_factor'] / latest_adj)
+    
     # 统一列名：vol → volume（兼容策略代码）
     if 'vol' in df.columns and 'volume' not in df.columns:
         df = df.rename(columns={'vol': 'volume'})
+    
+    # 丢弃辅助列，保持 DataFrame 干净
+    df = df.drop(columns=['adj_factor'])
+    
     return df
 
 
@@ -697,6 +719,43 @@ def backtest_rsi_trend(df, capital, cfg, start_idx=0):
 
     return ret, len(trades), max_dd
 
+
+def _get_all_stocks_from_db():
+    """
+    从本地数据库 stock_basic 表获取所有 A 股股票列表
+
+    Returns:
+        DataFrame with columns: ts_code, name, industry
+    """
+    import sqlite3
+    conn = sqlite3.connect(DATA["local_db_path"])
+    try:
+        df = pd.read_sql_query(
+            "SELECT ts_code, name, COALESCE(industry, '未知') AS industry "
+            "FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' ORDER BY ts_code",
+            conn,
+        )
+        # 添加 code 列（6位数字代码，与 get_hs300_components 返回格式一致）
+        df['code'] = df['ts_code'].str.extract(r'(\d{6})', expand=False)
+        print(f"  ✓ 从 stock_basic 获取 {len(df)} 只 A 股")
+        return df
+    except Exception as e:
+        print(f"  [ERR] 获取全市场股票失败: {e}，降级使用中证800+中证500并集")
+        df = pd.read_sql_query(
+            "SELECT DISTINCT d.ts_code, COALESCE(sb.name, d.ts_code) AS name, '未知' AS industry "
+            "FROM index_constituent d LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code "
+            "WHERE d.index_code IN ('000300.SH','000905.SH') "
+            "AND d.trade_date = (SELECT MAX(trade_date) FROM index_constituent)",
+            conn,
+        )
+        # 添加 code 列（6位数字代码）
+        df['code'] = df['ts_code'].str.extract(r'(\d{6})', expand=False)
+        print(f"  ✓ 降级获取 {len(df)} 只股票（沪深300+中证500）")
+        return df
+    finally:
+        conn.close()
+
+
 def run_selection():
     """执行多因子选股，返回 TOP N 股票列表"""
     from src.data_fetcher import DataFetcher
@@ -707,6 +766,10 @@ def run_selection():
     print(f"\n{'='*60}")
     print(f"  选股阶段 — {SELECTION['date']} | 池:{SELECTION['stock_pool']} | TOP {SELECTION['top_n']}")
     print(f"{'='*60}")
+
+    # 本地数据库已有完整的 fina_indicator（25万+行）和 daily_basic 数据，
+    # 关闭 Tushare 备份，避免全市场选股时 Tushare API 卡死
+    DATA["use_tushare_backup"] = False
 
     df_config = {
         "primary_source": DATA["primary_source"],
@@ -731,7 +794,7 @@ def run_selection():
         "hs300": fetcher.get_hs300_components,
         "zz500": lambda: fetcher.get_zz500_components() if hasattr(fetcher, 'get_zz500_components') else fetcher.get_hs300_components(),
         "zz800": fetcher.get_zz800_components,
-        "all":   lambda: fetcher.get_all_stocks(),
+        "all":   lambda: _get_all_stocks_from_db(),
     }
     get_pool = pool_map.get(SELECTION["stock_pool"], fetcher.get_hs300_components)
     
@@ -740,6 +803,76 @@ def run_selection():
     print(f"  [DEBUG] 调用函数: {get_pool.__name__ if hasattr(get_pool, '__name__') else get_pool}")
     
     pool = get_pool()
+    
+    # ── 新增：过滤掉回测起始日还没上市的股票 ────────────────
+    print(f"\n  [过滤] 检查股票上市日期...")
+    original_len = len(pool)  # 保存过滤前的股票数量
+    
+    try:
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        
+        # 获取选股基准日期（格式: YYYYMMDD，如 20220103）
+        selection_date = SELECTION['date']
+        
+        # 确保 selection_date 是 YYYYMMDD 格式（无横杠）
+        if len(selection_date) == 10 and '-' in selection_date:
+            # 如果是 YYYY-MM-DD 格式，去掉横杠
+            selection_date_fmt = selection_date.replace('-', '')
+        else:
+            selection_date_fmt = selection_date
+        
+        print(f"    选股日期: {selection_date} => 比较用: {selection_date_fmt}")
+        
+        # 过滤：只保留 list_date <= selection_date 的股票
+        filtered_pool = []
+        skip_count = 0
+        for _, row in pool.iterrows():
+            code = row['code']
+            ts_code_str = ts_code(code)  # 转换为 Tushare 格式（避免覆盖函数名）
+            
+            try:
+                result = conn.execute(
+                    "SELECT list_date FROM stock_basic WHERE ts_code = ?", 
+                    (ts_code_str,)
+                ).fetchone()
+                
+                if result is None:
+                    # 找不到上市日期，跳过这只股票
+                    skip_count += 1
+                    continue
+                
+                list_date = result[0]
+                
+                # 确保 list_date 是 YYYYMMDD 格式（无横杠）
+                if len(list_date) == 10 and '-' in list_date:
+                    list_date_fmt = list_date.replace('-', '')
+                else:
+                    list_date_fmt = list_date
+                
+                # 比较日期：如果 list_date <= selection_date，则保留
+                if list_date_fmt <= selection_date_fmt:
+                    filtered_pool.append(row)
+                    
+            except Exception as e:
+                # 出错则跳过
+                skip_count += 1
+                continue
+        
+        conn.close()
+        
+        # 更新 pool
+        pool = pd.DataFrame(filtered_pool).reset_index(drop=True)
+        
+        print(f"    过滤前: {original_len} 只")
+        print(f"    过滤后: {len(pool)} 只")
+        print(f"    过滤掉: {original_len - len(pool)} 只（上市晚于 {selection_date}）")
+        if skip_count > 0:
+            print(f"    [DEBUG] 跳过（无上市日期）: {skip_count} 只")
+        
+    except Exception as e:
+        print(f"  [WARN] 过滤上市日期失败: {e}")
+        print(f"  [WARN] 将继续使用全部股票池（可能包含未上市股票）")
     
     # 验证股票池数量
     expected_max = {"hs300": 300, "zz500": 500, "zz800": 800}.get(SELECTION["stock_pool"], 10000)
@@ -760,26 +893,52 @@ def run_selection():
     processed = processor.process(factors)
     selected = selector.select(processed, top_n=SELECTION["top_n"])
 
-    # 补全股票名称（容错）
+    # 补全股票名称（直接从 stock_basic 表读取，不依赖 ts_code 函数）
+    import sqlite3
+    DB = DB_PATH
     names = {}
     try:
-        conn = sqlite3.connect(DB_PATH)
-        for code in selected["code"].tolist():
-            r = conn.execute("SELECT name FROM stock_basic WHERE ts_code=?", (ts_code(code),)).fetchone()
-            names[code] = r[0] if r else ""
+        conn = sqlite3.connect(DB)
+        codes_to_query = selected["code"].tolist()
+        print(f"  [DEBUG] 尝试补全 {len(codes_to_query)} 只股票的名称...")
+        
+        for code in codes_to_query:
+            # 直接拼 Tushare 格式：6开头.SH，0/3开头.SZ
+            tsc = code + (".SH" if code.startswith("6") else ".SZ")
+            
+            r = conn.execute("SELECT name FROM stock_basic WHERE ts_code=?", (tsc,)).fetchone()
+            if r and r[0]:
+                names[code] = r[0]
+            else:
+                # 调试：打印找不到名称的股票
+                if len(names) < 5:  # 只打印前5个，避免刷屏
+                    print(f"    [DEBUG] 未找到名称: code={code}, tsc={tsc}")
+        
         conn.close()
-    except Exception:
-        pass
+        print(f"  [DEBUG] 成功补全 {len(names)}/{len(codes_to_query)} 只股票的名称")
+        
+    except Exception as e:
+        print(f"  [WARN] 补全股票名称失败: {e}")
+    
+    # 填充 name 列
     selected["name"] = selected["code"].map(names).fillna("")
+    # 检查是否有名称仍为空的
+    empty_names = (selected["name"] == "").sum()
+    if empty_names > 0:
+        print(f"  [WARN] 仍有 {empty_names} 只股票名称为空")
+        # 打印前3只名称为空的股票代码
+        empty_codes = selected[selected["name"] == ""]["code"].head(3).tolist()
+        print(f"  [WARN] 示例: {empty_codes}")
 
     selector.print_top_stocks(selected, n=min(20, len(selected)))
 
-    # 保存选股结果 CSV（命名规则: multi-YYYYMM-selection.csv）
+    # 保存选股结果 CSV（命名规则: selection/multi_YYYYMM_selection.csv）
     if OUTPUT.get("save_csv"):
-        os.makedirs(OUTPUT["dir"], exist_ok=True)
+        sel_dir = OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection"))
+        os.makedirs(sel_dir, exist_ok=True)
         from datetime import datetime
         ym = SELECTION["date"][:6]  # "20220103" -> "202201"
-        csv_path = os.path.join(OUTPUT["dir"], f"multi-{ym}-selection.csv")
+        csv_path = os.path.join(sel_dir, f"multi_{ym}_selection.csv")
         selected[["code", "name"]].to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"  选股结果已保存 → {csv_path}")
 
@@ -968,9 +1127,10 @@ def run_backtest(stocks):
         rows.append({"策略": "买入持有(等权)", "均值收益%": round(bh_mean, 2)})
         rows.append({"策略": f"{benchmark}基准", "均值收益%": round(idx_ret, 2)})
         pd.DataFrame(rows).to_csv(
-            os.path.join(OUTPUT["dir"], f"backtest_summary_{BACKTEST['start_date'][:4]}.csv"),
+            os.path.join(OUTPUT.get("backtest_dir", os.path.join(OUTPUT["dir"], "backtest")),
+                        f"backtest_{BACKTEST['start_date'][:4]}.csv"),
             index=False, encoding="utf-8-sig")
-        print(f"  报告已保存 → {OUTPUT['dir']}/backtest_summary_{BACKTEST['start_date'][:4]}.csv")
+        print(f"  报告已保存 → {OUTPUT.get('backtest_dir', os.path.join(OUTPUT['dir'], 'backtest'))}/backtest_{BACKTEST['start_date'][:4]}.csv")
 
 
 # ════════════════════════════════════════════════════════
@@ -980,16 +1140,17 @@ if __name__ == "__main__":
     # ── 命令行参数解析 ──────────────────────────────────────────────────
     # 用法:
     #   python run_backtest.py                # 使用 config.py 默认配置
-    #   python run_backtest.py --source multi # 使用最新 multi-*.csv
-    #   python run_backtest.py --source ml    # 使用最新 ml-*.csv
+    #   python run_backtest.py --source multi # 使用最新 multi_*.csv
+    #   python run_backtest.py --source ml    # 使用最新 ml_*.csv
     # ─────────────────────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
         description="多因子选股 + 回测系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   python run_backtest.py                # 使用 config.py 默认配置
-  python run_backtest.py --source multi # 使用最新 multi-*.csv 进行回测
-  python run_backtest.py --source ml    # 使用最新 ml-*.csv 进行回测
+  python run_backtest.py --source multi # 使用最新 multi_*.csv 进行回测
+  python run_backtest.py --source ml    # 使用最新 ml_*.csv 进行回测(默认v4模型)
+  python run_backtest.py --source ml --model v5  # 使用 v5 模型选股并回测
   python run_backtest.py --list         # 列出所有可用的 CSV 文件
 """
     )
@@ -1001,6 +1162,13 @@ if __name__ == "__main__":
         help="选股策略来源: multi(多因子) / ml(机器学习) / csv(指定文件) / manual(手动列表)"
     )
     parser.add_argument(
+        "--model", "-m",
+        type=str,
+        choices=["v4", "v5"],
+        default="v4",
+        help="ML模型版本: v4(默认) / v5(优化版-超参数调优+多模型对比)"
+    )
+    parser.add_argument(
         "--file", "-f",
         type=str,
         default=None,
@@ -1009,15 +1177,49 @@ if __name__ == "__main__":
     parser.add_argument(
         "--list", "-l",
         action="store_true",
-        help="列出 data/results/ 下所有可用的 CSV 文件"
+        help="列出 data/results/selection/ 下所有可用的 CSV 文件"
+    )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help="自动匹配最新的 CSV 文件（--source csv 时可用）"
+    )
+    parser.add_argument(
+        "--select-only", action="store_true",
+        help="只选股，不回测"
+    )
+    parser.add_argument(
+        "--ma-short", type=int, default=None,
+        help="双均线短期周期（覆盖 config.py 的 ma_short）"
+    )
+    parser.add_argument(
+        "--ma-long", type=int, default=None,
+        help="双均线长期周期（覆盖 config.py 的 ma_long）"
+    )
+    parser.add_argument(
+        "--stock-pool", type=str, default=None,
+        help="股票池: hs300 | zz500 | zz800 | all"
+    )
+    parser.add_argument(
+        "--benchmark", type=str, default=None,
+        help="基准指数代码（如 000300.SH 或 000906.SH）"
     )
     args = parser.parse_args()
 
+    # ── 用命令行参数覆盖 config（不修改 config.py 文件）──
+    if args.ma_short is not None:
+        STRATEGIES["dual_ma"]["ma_short"] = args.ma_short
+    if args.ma_long is not None:
+        STRATEGIES["dual_ma"]["ma_long"] = args.ma_long
+    if args.stock_pool is not None:
+        SELECTION["stock_pool"] = args.stock_pool
+    if args.benchmark is not None:
+        BACKTEST["benchmark"] = args.benchmark
+
     # 列出可用 CSV 文件
     if args.list:
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
         csv_files = sorted(glob.glob(os.path.join(results_dir, "*.csv")))
-        print("\n  可用 CSV 文件 (data/results/):")
+        print(f"\n  可用 CSV 文件 ({results_dir}):")
         print("  " + "-" * 50)
         for f in csv_files:
             mtime = os.path.getmtime(f)
@@ -1026,11 +1228,11 @@ if __name__ == "__main__":
             fname = os.path.basename(f)
             # 标记类型
             tag = ""
-            if fname.startswith("ml-"):
+            if fname.startswith("ml_"):
                 tag = "  [ML机器学习]"
-            elif fname.startswith("multi-"):
+            elif fname.startswith("multi_"):
                 tag = "  [多因子选股]"
-            elif fname.startswith("backtest_comparison"):
+            elif "backtest_" in fname:
                 tag = "  [回测结果]"
             print(f"  {fname:<35} {mtime_str}  {size_kb:.1f}KB{tag}")
         print("  " + "-" * 50 + "\n")
@@ -1043,42 +1245,109 @@ if __name__ == "__main__":
 
     # 根据命令行参数决定股票池来源
     if args.source == "multi":
-        # 自动匹配最新的 multi-*.csv
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
-        multi_files = sorted(glob.glob(os.path.join(results_dir, "multi-*.csv")), key=os.path.getmtime, reverse=True)
-        if not multi_files:
-            print(f"\n  [ERROR] 未找到 multi-*.csv 文件在 {results_dir}")
-            print(f"  请先运行多因子选股 (src/stock_selector.py)\n")
-            sys.exit(1)
-        csv_path = multi_files[0]
-        stocks = pd.read_csv(csv_path, dtype={"code": str})
-        stocks["name"] = stocks.get("name", "")
-        print(f"\n  使用多因子选股结果: {os.path.basename(csv_path)} ({len(stocks)} 只)")
-        run_backtest(stocks)
-        sys.exit(0)
+        if args.select_only:
+            # 只选股，不回测
+            print(f"\n  只选股模式 (多因子)...")
+            run_selection()
+            print(f"\n{'='*60}")
+            sel_dir = OUTPUT.get('selection_dir', os.path.join(OUTPUT['dir'], 'selection'))
+            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        else:
+            # 自动匹配最新的 multi_*.csv（只匹配 selection/ 子目录）
+            results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
+            os.makedirs(results_dir, exist_ok=True)
+            multi_files = sorted(glob.glob(os.path.join(results_dir, "multi_*.csv")), key=os.path.getmtime, reverse=True)
+            if not multi_files:
+                print(f"\n  [ERROR] 未找到 multi_*.csv 文件在 {results_dir}")
+                print(f"  请先运行多因子选股 (src/stock_selector.py)\n")
+                sys.exit(1)
+            csv_path = multi_files[0]
+            stocks = pd.read_csv(csv_path, dtype={"code": str})
+            stocks["name"] = stocks.get("name", "")
+            print(f"\n  使用多因子选股结果: {os.path.basename(csv_path)} ({len(stocks)} 只)")
+            run_backtest(stocks)
+            sys.exit(0)
 
     elif args.source == "ml":
-        # 自动匹配最新的 ml-*.csv
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT["dir"])
-        ml_files = sorted(glob.glob(os.path.join(results_dir, "ml-*.csv")), key=os.path.getmtime, reverse=True)
+        if args.model == "v5":
+            # 检查模型是否已经训练好
+            model_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "data", "models_v5_threshold_70"
+            )
+            
+            cmd = [sys.executable, "ml_stock_selector_v5.py"]
+            
+            if os.path.exists(model_dir):
+                # 模型已存在，只选股（不重新训练）
+                cmd.append("--predict-only")
+                print(f"\n  使用 ML 模型 v5 (加载已训练模型)...")
+                print(f"  模型目录: {model_dir}\n")
+            else:
+                # 模型不存在，需要训练
+                print(f"\n  使用 ML 模型 v5 (超参数调优 + 多模型对比)...")
+                print(f"  ⚠️  训练可能需要 20-30 分钟，请耐心等待...\n")
+            
+            try:
+                import subprocess
+                result = subprocess.run(
+                    cmd,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                    # 不捕获输出，让日志实时显示
+                )
+                if result.returncode != 0:
+                    print(f"\n  [ERROR] ML 模型 v5 运行失败 (返回码: {result.returncode})")
+                    sys.exit(1)
+                print(f"\n  ✓ ML 模型 v5 完成！")
+            except Exception as e:
+                print(f"\n  [ERROR] 无法运行 ML 模型 v5: {e}")
+                sys.exit(1)
+        
+        if args.select_only:
+            # 只选股，不回测
+            print(f"\n{'='*60}")
+            sel_dir = OUTPUT.get('selection_dir', os.path.join(OUTPUT['dir'], 'selection'))
+            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        
+        # 自动匹配最新的 ml_*.csv（只匹配 selection/ 子目录）
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
+        os.makedirs(results_dir, exist_ok=True)
+        ml_files = sorted(glob.glob(os.path.join(results_dir, "ml_*.csv")), key=os.path.getmtime, reverse=True)
         if not ml_files:
-            print(f"\n  [ERROR] 未找到 ml-*.csv 文件在 {results_dir}")
-            print(f"  请先运行机器学习选股 (ml_stock_selector_v4.py)\n")
+            print(f"\n  [ERROR] 未找到 ml_*.csv 文件在 {results_dir}")
+            print(f"  请先运行机器学习选股 (ml_stock_selector_v{args.model[-1]}.py)\n")
             sys.exit(1)
         csv_path = ml_files[0]
         stocks = pd.read_csv(csv_path, dtype={"code": str})
         stocks["name"] = stocks.get("name", "")
-        print(f"\n  使用机器学习选股结果: {os.path.basename(csv_path)} ({len(stocks)} 只)")
+        print(f"\n  使用机器学习选股结果 (v{args.model[-1]}): {os.path.basename(csv_path)} ({len(stocks)} 只)")
         run_backtest(stocks)
         sys.exit(0)
 
     elif args.source == "csv":
-        # 使用手动指定的 CSV 文件
-        csv_path = args.file if args.file else BACKTEST.get("stocks_file", "")
-        if not csv_path or not os.path.exists(csv_path):
+        # 自动匹配最新的选股 CSV 文件（只匹配 selection/ 子目录）
+        if args.auto or not args.file:
+            results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
+            os.makedirs(results_dir, exist_ok=True)
+            csv_files = sorted(glob.glob(os.path.join(results_dir, "*.csv")), key=os.path.getmtime, reverse=True)
+            if not csv_files:
+                print(f"\n  [ERROR] 未找到 CSV 文件在 {results_dir}")
+                print(f"  请先运行选股\n")
+                sys.exit(1)
+            csv_path = csv_files[0]
+            print(f"\n  自动匹配最新 CSV: {os.path.basename(csv_path)}")
+        else:
+            csv_path = args.file
+        
+        if not os.path.exists(csv_path):
             print(f"\n  [ERROR] CSV 文件不存在: {csv_path}")
             print(f"  请使用 --file 指定有效路径\n")
             sys.exit(1)
+        
         stocks = pd.read_csv(csv_path, dtype={"code": str})
         stocks["name"] = stocks.get("name", "")
         print(f"\n  从 CSV 加载股票池: {os.path.basename(csv_path)} ({len(stocks)} 只)")
@@ -1122,7 +1391,15 @@ if __name__ == "__main__":
         else:
             manual = BACKTEST.get("stocks_manual", [])
             stocks = pd.DataFrame(manual, columns=["code", "name"])
-
+        
+        if args.select_only:
+            # 只选股，不回测
+            sel_dir = OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection"))
+            print(f"\n{'='*60}")
+            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        
         run_backtest(stocks)
 
     print(f"\n{'='*60}")

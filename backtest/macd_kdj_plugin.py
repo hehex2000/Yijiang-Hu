@@ -5,9 +5,12 @@ MACD/RSI 组合策略插件（继承 BaseStrategy）
 - 前一日MACD金叉+RSI<70 → 今日开盘买入
 - 前一日MACD死叉或RSI>70 → 今日开盘卖出
 - 止盈止损基于前一日收盘价判断
+
+优化：使用 TA-Lib 计算 MACD 和 RSI（性能提升 10-100 倍）
 """
 import pandas as pd
 import numpy as np
+import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
 from loguru import logger
 
@@ -29,22 +32,20 @@ class MACDRSIStrategyPlugin(BaseStrategy):
         logger.info(f"MACDRSIStrategyPlugin initialized: macd=({self.macd_fast},{self.macd_slow},{self.macd_signal})")
     
     def _calculate_macd(self, close: pd.Series):
-        """计算MACD指标"""
-        ema_fast = close.ewm(span=self.macd_fast, adjust=False).mean()
-        ema_slow = close.ewm(span=self.macd_slow, adjust=False).mean()
-        dif = ema_fast - ema_slow
-        dea = dif.ewm(span=self.macd_signal, adjust=False).mean()
-        return dif, dea
+        """计算MACD指标（使用 TA-Lib 优化）"""
+        # TA-Lib MACD 返回 (macd, macdsignal, macdhist) - 都是 numpy ndarray
+        macd, macdsignal, macdhist = ta.MACD(
+            close.values,
+            fastperiod=self.macd_fast,
+            slowperiod=self.macd_slow,
+            signalperiod=self.macd_signal
+        )
+        # 转成 pandas Series（保留 index，以便使用 .shift() 等方法）
+        return pd.Series(macd, index=close.index), pd.Series(macdsignal, index=close.index)
     
     def _calculate_rsi(self, close: pd.Series, period: int = 14) -> pd.Series:
-        """计算RSI指标"""
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0)
-        loss = (-delta).where(delta < 0, 0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+        """计算RSI指标（使用 TA-Lib 优化）"""
+        return pd.Series(ta.RSI(close.values, timeperiod=period), index=close.index)
     
     def run(self, df: pd.DataFrame, start_idx: int = 0) -> dict:
         """

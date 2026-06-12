@@ -18,6 +18,7 @@
 
 import pandas as pd
 import numpy as np
+import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
 from loguru import logger
 
@@ -85,17 +86,9 @@ class TurtleFullStrategyPlugin(BaseStrategy):
         )
     
     def calc_atr(self, high, low, close, period=14):
-        """计算 ATR（Average True Range）"""
-        high = pd.Series(high)
-        low = pd.Series(low)
-        close = pd.Series(close)
-        
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = abs(high - prev_close)
-        tr3 = abs(low - prev_close)
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(period).mean().values
+        """计算 ATR（使用 TA-Lib 优化）"""
+        # TA-Lib ATR 返回 numpy ndarray，前 (period-1) 个值为 NaN
+        atr = ta.ATR(high, low, close, timeperiod=period)
         return atr
     
     def run(self, df: pd.DataFrame, start_idx: int = 0) -> dict:

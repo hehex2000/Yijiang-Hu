@@ -65,6 +65,10 @@ class FactorProcessor:
             "LVF3_downside_vol": "negative",
             "LVF4_idiosyncratic_vol": "negative",
             "LVF5_VAR": "negative",
+            "LVF6_sharpe": "positive",          # 夏普比率（正向：越高越好）
+            "LVF7_sortino": "positive",        # 索提诺比率（正向：越高越好）
+            "LVF8_ulcer": "negative",         # 溃疡指数（反向：越小越好）
+            "LVF9_max_drawdown": "negative",   # 最大回撤（反向：越接近0越好）
             
             # 资金流因子（机构和主力资金流为正向，散户为反向）
             "MWF1_ultra_large_inflow": "positive",     # 超大单流入=机构看好
@@ -183,16 +187,32 @@ class FactorProcessor:
         # 2. 缺失值处理
         missing_value_method = self.config.get("missing_value_method", "fill_median")
         
+        cols_to_drop = []
         for column in factor_cols:
             if missing_value_method == "fill_median":
                 median_value = df[column].median()
-                df[column] = df[column].fillna(median_value)
+                if pd.isna(median_value):
+                    # 整列都是 NaN，无法用 median 填充，标记删除
+                    logger.warning(f"  因子列 {column} 全部为NaN，将删除该列")
+                    cols_to_drop.append(column)
+                else:
+                    df[column] = df[column].fillna(median_value)
             elif missing_value_method == "fill_mean":
                 mean_value = df[column].mean()
-                df[column] = df[column].fillna(mean_value)
+                if pd.isna(mean_value):
+                    logger.warning(f"  因子列 {column} 全部为NaN，将删除该列")
+                    cols_to_drop.append(column)
+                else:
+                    df[column] = df[column].fillna(mean_value)
             elif missing_value_method == "drop":
                 # 删除包含缺失值的行
                 df = df.dropna(subset=[column])
+        
+        if len(cols_to_drop) > 0:
+            logger.warning(f"  删除全NaN因子列: {cols_to_drop}")
+            df = df.drop(columns=cols_to_drop)
+            # 同步更新 factor_directions 和 factor_groups（通过重新检测因子列）
+            factor_cols = self._get_factor_columns(df)
         
         return df
     
@@ -328,14 +348,23 @@ class FactorProcessor:
             "momentum_score": ["MF1_return_1m", "MF2_return_3m", "MF3_return_6m", "MF4_return_12m", "MF5_relative_strength"],
             "technical_score": ["TF1_ma_bullish", "TF2_MACD", "TF3_RSI", "TF4_volume_ratio", "TF5_bollinger_position"],
             "volatility_score": ["LVF1_hist_vol", "LVF2_beta", "LVF3_downside_vol", "LVF4_idiosyncratic_vol", "LVF5_VAR"],
+            "risk_score": ["LVF6_sharpe", "LVF7_sortino", "LVF8_ulcer", "LVF9_max_drawdown"],
             "money_flow_score": ["MWF1_ultra_large_inflow", "MWF2_large_inflow", "MWF3_medium_inflow", "MWF4_small_inflow", "MWF5_main_inflow", "MWF6_inflow_intensity"],
         }
         
         # 计算每个大类因子的平均分（子因子内部等权重）
+        score_cols_to_check = []
         for group_name, factor_list in factor_groups.items():
             available_factors = [f for f in factor_list if f in df.columns]
             if len(available_factors) > 0:
-                df[group_name] = df[available_factors].mean(axis=1)
+                # 只使用非全NaN的子因子
+                valid_factors = [f for f in available_factors if not df[f].isnull().all()]
+                if len(valid_factors) > 0:
+                    df[group_name] = df[valid_factors].mean(axis=1)
+                    score_cols_to_check.append(group_name)
+                else:
+                    df[group_name] = np.nan
+                    logger.debug(f"  大类 {group_name} 所有子因子均为NaN，得分设为NaN")
             else:
                 df[group_name] = np.nan
         

@@ -10,6 +10,7 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 import talib  # 新增：导入 TA-Lib
+import quantstats as qs  # 新增：导入 quantstats（风险指标计算）
 from typing import Dict, Optional, List
 from loguru import logger
 
@@ -22,7 +23,8 @@ class FactorCalculator:
                  enable_technical: bool = False,
                  enable_volatility: bool = False,
                  enable_money_flow: bool = True,
-                 enable_industry_momentum: bool = False):
+                 enable_industry_momentum: bool = False,
+                 enable_risk: bool = False):
         """
         初始化因子计算器
         
@@ -33,6 +35,7 @@ class FactorCalculator:
             enable_volatility: 是否启用低波动因子（默认关闭）
             enable_money_flow: 是否启用资金流因子（默认开启）
             enable_industry_momentum: 是否启用行业动量因子（默认关闭）
+            enable_risk: 是否启用风险因子（夏普比率、贝塔等，默认关闭）
         """
         self.enable_quality = enable_quality
         self.enable_momentum = enable_momentum
@@ -40,6 +43,7 @@ class FactorCalculator:
         self.enable_volatility = enable_volatility
         self.enable_money_flow = enable_money_flow
         self.enable_industry_momentum = enable_industry_momentum
+        self.enable_risk = enable_risk
         
         enabled = ["价值", "成长"]
         if enable_quality: enabled.append("质量")
@@ -48,6 +52,7 @@ class FactorCalculator:
         if enable_volatility: enabled.append("低波动")
         if enable_money_flow: enabled.append("资金流")
         if enable_industry_momentum: enabled.append("行业动量")
+        if enable_risk: enabled.append("风险")
         
         logger.info(f"FactorCalculator initialized (启用因子: {', '.join(enabled)})")
     
@@ -169,7 +174,10 @@ class FactorCalculator:
         factors["current_price"] = self._extract_current_price(hist_data)
         
         # 获取财务数据
-        financial_data = data_fetcher.get_financial_data(code)
+        # 使用 end_date 作为报告期（如果 end_date 是 YYYYMMDD 格式）
+        # 否则使用默认值
+        report_date = end_date if end_date else "20211231"
+        financial_data = data_fetcher.get_financial_data(code, report_date)
         
         # 获取估值数据
         valuation_data = data_fetcher.get_valuation_data(code)
@@ -206,7 +214,22 @@ class FactorCalculator:
         
         # 计算低波动因子（可选）
         if self.enable_volatility:
-            factors.update(self._calc_volatility_factors(hist_data))
+            # 获取市场收益率（用于计算 Beta）
+            market_returns = np.array([])
+            try:
+                if hasattr(data_fetcher, 'get_index_returns'):
+                    # 默认使用沪深300指数作为市场基准
+                    market_returns = data_fetcher.get_index_returns(
+                        index_code="000300.SH",
+                        start_date=start_date,
+                        end_date=end_date
+                    )
+                    if len(market_returns) > 0:
+                        logger.debug(f"Got market returns: {len(market_returns)} days")
+            except Exception as e:
+                logger.warning(f"Failed to fetch market returns: {e}")
+            
+            factors.update(self._calc_volatility_factors(hist_data, market_returns))
         
         # 计算资金流因子（可选）
         if self.enable_money_flow:
@@ -226,6 +249,7 @@ class FactorCalculator:
                 logger.error(f"Error fetching industry momentum for {code}: {e}")
                 factors["industry_momentum"] = np.nan
                 factors["industry_momentum_z"] = np.nan
+        
         
         return factors
     
@@ -286,9 +310,14 @@ class FactorCalculator:
             if valuation_data is not None and len(valuation_data) > 0:
                 # AkShare 返回的估值数据格式
                 # 注意：实际列名需要根据 AkShare 返回结果调整
-                if "市盈率-动态" in valuation_data.columns:
-                    pe = valuation_data["市盈率-动态"].values[0]
-                    factors["VF1_PE"] = float(pe) if not pd.isna(pe) else np.nan
+                # 支持多种可能的列名（AkShare/Tushare/本地DB 格式不同）
+                pe_val = None
+                for col in ["市盈率-动态", "市盈率", "PE_TTM", "pe_ttm"]:
+                    if col in valuation_data.columns:
+                        pe_val = valuation_data[col].values[0]
+                        break
+                if pe_val is not None:
+                    factors["VF1_PE"] = float(pe_val) if not pd.isna(pe_val) else np.nan
                 
                 if "市净率" in valuation_data.columns:
                     pb = valuation_data["市净率"].values[0]
@@ -303,15 +332,16 @@ class FactorCalculator:
                     factors["VF6_dividend_yield"] = float(div_yield) if not pd.isna(div_yield) else np.nan
                 
                 # VF5_EV_EBITDA: 企业价值/EBITDA
-                # 简化计算：EV/EBITDA ≈ PB（对于资本密集型行业可作为粗估代理）
-                # 完整实现需从资产负债表获取总负债、现金，从利润表获取折旧摊销
-                # 若无法获取，保持 NaN 并在标准化时被中位数填充
-                if "市净率" in valuation_data.columns:
-                    pb_val = factors["VF2_PB"]
-                    if not pd.isna(pb_val) and pb_val > 0:
-                        factors["VF5_EV_EBITDA"] = float(pb_val)
-                    else:
-                        factors["VF5_EV_EBITDA"] = np.nan
+                # 尝试从估值数据中读取，若无可选则设为 NaN
+                ev_ebitda_val = None
+                for col in ["EV_EBITDA", "ev_ebitda", "企业价值倍率"]:
+                    if col in valuation_data.columns:
+                        ev_ebitda_val = valuation_data[col].values[0]
+                        break
+                if ev_ebitda_val is not None and not pd.isna(ev_ebitda_val):
+                    factors["VF5_EV_EBITDA"] = float(ev_ebitda_val)
+                else:
+                    factors["VF5_EV_EBITDA"] = np.nan
             
             # 从财务数据中获取 PEG (需要自己计算: PE / 净利润增长率)
             if financial_data is not None and len(financial_data) > 0:
@@ -359,9 +389,14 @@ class FactorCalculator:
                 # AkShare 返回的财务指标数据格式
                 # 注意：实际列名需要根据 AkShare 返回结果调整
                 
-                if "营业总收入同比增长率" in financial_data.columns:
-                    rev_growth = financial_data["营业总收入同比增长率"].values[0]
-                    factors["GF1_revenue_growth"] = float(rev_growth) if not pd.isna(rev_growth) else np.nan
+                # 支持多种可能的列名
+                rev_growth_val = None
+                for col in ["营业总收入同比增长率", "营业收入同比增长率", "营业总收入增长率", "营收增长率"]:
+                    if col in financial_data.columns:
+                        rev_growth_val = financial_data[col].values[0]
+                        break
+                if rev_growth_val is not None:
+                    factors["GF1_revenue_growth"] = float(rev_growth_val) if not pd.isna(rev_growth_val) else np.nan
                 
                 if "净利润同比增长率" in financial_data.columns:
                     profit_growth = financial_data["净利润同比增长率"].values[0]
@@ -371,20 +406,26 @@ class FactorCalculator:
                     roe = financial_data["净资产收益率"].values[0]
                     factors["GF3_ROE"] = float(roe) if not pd.isna(roe) else np.nan
                 
-                if "总资产净利率" in financial_data.columns:
-                    roa = financial_data["总资产净利率"].values[0]
+                if "总资产净利率" in financial_data.columns or "总资产报酬率" in financial_data.columns:
+                    col = "总资产净利率" if "总资产净利率" in financial_data.columns else "总资产报酬率"
+                    roa = financial_data[col].values[0]
                     factors["GF4_ROA"] = float(roa) if not pd.isna(roa) else np.nan
                 
                 # 毛利率增长率（百分比变化，而非绝对差值）
-                if "销售毛利率" in financial_data.columns:
-                    gross_margin = financial_data["销售毛利率"].values
-                    if len(gross_margin) >= 2 and gross_margin[1] != 0:
-                        # 百分比变化: (本期-上期) / |上期| * 100
-                        pct_change = (float(gross_margin[0]) - float(gross_margin[1])) / abs(float(gross_margin[1])) * 100
-                        factors["GF5_gross_margin_growth"] = pct_change
-                    elif len(gross_margin) >= 2:
-                        # 上期为0时，无法计算百分比，设为0
-                        factors["GF5_gross_margin_growth"] = 0.0
+                # 支持多种可能的列名
+                gross_margin_val = None
+                for col in ["销售毛利率", "毛利率", "gross_profit_margin"]:
+                    if col in financial_data.columns:
+                        gross_margin_val = financial_data[col].values
+                        break
+                
+                if gross_margin_val is not None and len(gross_margin_val) >= 2 and gross_margin_val[1] != 0:
+                    # 百分比变化: (本期-上期) / |上期| * 100
+                    pct_change = (float(gross_margin_val[0]) - float(gross_margin_val[1])) / abs(float(gross_margin_val[1])) * 100
+                    factors["GF5_gross_margin_growth"] = pct_change
+                elif gross_margin_val is not None and len(gross_margin_val) >= 2:
+                    # 上期为0时，无法计算百分比，设为0
+                    factors["GF5_gross_margin_growth"] = 0.0
             
             logger.debug(f"Growth factors calculated: ROE={factors['GF3_ROE']}")
             
@@ -639,16 +680,19 @@ class FactorCalculator:
         
         return factors
     
-    def _calc_volatility_factors(self, hist_data: Optional[pd.DataFrame]) -> Dict[str, float]:
+    def _calc_volatility_factors(self, hist_data: Optional[pd.DataFrame], 
+                                   market_returns: np.ndarray = np.array([])) -> Dict[str, float]:
         """
-        计算低波动因子（使用 TA-Lib STDDEV 提高性能）
+        计算低波动因子（使用 TA-Lib STDDEV/BETA 提高性能）
         
         因子列表:
         - LVF1_hist_vol: 历史波动率（反向，越低越好）
-        - LVF2_beta: 贝塔系数（反向）
+        - LVF2_beta: 贝塔系数（反向，使用 TA-Lib BETA 函数）
         - LVF3_downside_vol: 下行波动率（反向）
         - LVF4_idiosyncratic_vol: 特质波动率（反向）
         - LVF5_VAR: 风险价值VaR（反向，越小越好）
+        - LVF6_sharpe: 夏普比率（正向，越高越好）
+        - LVF7_sortino: 索提诺比率（正向，越高越好）
         """
         factors = {}
         
@@ -659,10 +703,23 @@ class FactorCalculator:
         factors["LVF4_idiosyncratic_vol"] = np.nan
         factors["LVF5_VAR"] = np.nan
         
+        # 初始化 returns 变量（防止在未定义时访问）
+        returns = np.array([])
+        
         try:
             if hist_data is not None and len(hist_data) > 0:
-                # 获取收盘价
-                close_prices = hist_data["收盘"].values
+                # 获取收盘价（健壮的列名检测）
+                close_col = None
+                for col in ['收盘', 'close', 'Close', '收盘价']:
+                    if col in hist_data.columns:
+                        close_col = col
+                        break
+                
+                if close_col is None:
+                    logger.warning(f"No close price column found in hist_data. Columns: {list(hist_data.columns)}")
+                    return factors
+                
+                close_prices = hist_data[close_col].values
                 
                 # 计算日收益率
                 returns = np.diff(close_prices) / close_prices[:-1]
@@ -702,14 +759,36 @@ class FactorCalculator:
                     var_95 = np.percentile(returns, 5)  # 95% VaR
                     factors["LVF5_VAR"] = abs(var_95)  # 取绝对值，方便比较
                 
-                # 4. 贝塔系数
-                # 完整计算：beta = cov(个股收益, 市场收益) / var(市场收益)
-                # 当前简化版本：用个股波动率与市场波动率比值近似，并限制在合理范围
-                if not pd.isna(factors["LVF1_hist_vol"]):
-                    market_vol = 0.20  # 沪深300年化波动率通常在 18%-25% 之间
-                    raw_beta = factors["LVF1_hist_vol"] / market_vol
-                    # 限制 beta 在 [0, 3] 之间，避免极端值
-                    factors["LVF2_beta"] = max(0.0, min(raw_beta, 3.0))
+                # 4. 贝塔系数（使用 TA-Lib BETA 函数）
+                # Beta = Cov(资产收益, 市场收益) / Var(市场收益)
+                if len(market_returns) > 0 and len(returns) >= 20:
+                    try:
+                        # 确保两个收益率序列长度一致
+                        min_len = min(len(returns), len(market_returns))
+                        asset_ret = returns[-min_len:]  # 取最近的 min_len 个收益率
+                        mkt_ret = market_returns[-min_len:]
+                        
+                        # 使用 TA-Lib BETA 函数计算 Beta
+                        # BETA(real0, real1, timeperiod=5)
+                        # real0: 资产收益率序列
+                        # real1: 市场收益率序列
+                        beta_array = talib.BETA(
+                            np.array(asset_ret, dtype=float),
+                            np.array(mkt_ret, dtype=float),
+                            timeperiod=min(20, min_len)
+                        )
+                        
+                        # 取最后一个值（最新的 Beta）
+                        if not np.isnan(beta_array[-1]):
+                            factors["LVF2_beta"] = float(beta_array[-1])
+                            logger.debug(f"Beta calculated using TA-Lib: {factors['LVF2_beta']:.4f}")
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate Beta using TA-Lib: {e}")
+                        # 备用：使用简化版本
+                        if not pd.isna(factors["LVF1_hist_vol"]):
+                            market_vol = 0.20
+                            raw_beta = factors["LVF1_hist_vol"] / market_vol
+                            factors["LVF2_beta"] = max(0.0, min(raw_beta, 3.0))
                 
                 # 5. 特质波动率（总波动率² - 系统性波动率²，取非负）
                 if not np.isnan(factors["LVF1_hist_vol"]) and not np.isnan(factors["LVF2_beta"]):
@@ -719,13 +798,180 @@ class FactorCalculator:
                     vol_squared_diff = np.maximum(0, factors["LVF1_hist_vol"]**2 - systematic_vol**2)
                     idiosyncratic_vol = np.sqrt(vol_squared_diff)
                     factors["LVF4_idiosyncratic_vol"] = idiosyncratic_vol
+                
+                # 6. 夏普比率（Sharpe Ratio）- 使用 quantstats 计算
+                if len(returns) >= 20:
+                    try:
+                        # 将 returns 转换为 pandas Series（quantstats 需要）
+                        returns_series = pd.Series(returns)
+                        
+                        # 使用 quantstats 计算夏普比率（年化）
+                        # rf: 无风险利率（简化为 0）
+                        # periods: 252（交易日数）
+                        # annualize: 是否年化（True）
+                        sharpe = qs.stats.sharpe(returns_series, rf=0.0, periods=252, annualize=True)
+                        
+                        if not np.isnan(sharpe):
+                            factors["LVF6_sharpe"] = float(sharpe)
+                            logger.debug(f"Sharpe Ratio calculated using quantstats: {sharpe:.4f}")
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate Sharpe using quantstats: {e}")
+                        # 备用：使用手动计算
+                        avg_return = np.mean(returns) * 252
+                        annualized_vol = factors.get("LVF1_hist_vol", np.nan)
+                        if not np.isnan(annualized_vol) and annualized_vol > 0:
+                            sharpe = avg_return / annualized_vol
+                            factors["LVF6_sharpe"] = float(sharpe)
+                
+                # 7. 索提诺比率（Sortino Ratio）- 使用 quantstats 计算
+                if len(returns) >= 20:
+                    try:
+                        # 将 returns 转换为 pandas Series（quantstats 需要）
+                        returns_series = pd.Series(returns)
+                        
+                        # 使用 quantstats 计算索提诺比率（年化）
+                        # rf: 无风险利率（简化为 0）
+                        # periods: 252（交易日数）
+                        # annualize: 是否年化（True）
+                        sortino = qs.stats.sortino(returns_series, rf=0.0, periods=252, annualize=True)
+                        
+                        if not np.isnan(sortino):
+                            factors["LVF7_sortino"] = float(sortino)
+                            logger.debug(f"Sortino Ratio calculated using quantstats: {sortino:.4f}")
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate Sortino using quantstats: {e}")
+                        # 备用：使用手动计算
+                        downside_vol = factors.get("LVF3_downside_vol", np.nan)
+                        if not np.isnan(downside_vol) and downside_vol > 0:
+                            avg_return = np.mean(returns) * 252
+                            sortino = avg_return / downside_vol
+                            factors["LVF7_sortino"] = float(sortino)
             
-            logger.debug(f"Volatility factors calculated: HistVol={factors['LVF1_hist_vol']:.4f}")
+            logger.debug(f"Volatility factors calculated: HistVol={factors['LVF1_hist_vol']:.4f}, Sharpe={factors.get('LVF6_sharpe', np.nan):.4f}")
+            
+            # 8. 溃疡指数（Ulcer Index）- 使用 quantstats 计算
+            # 溃疡指数是更好的风险控制指标，衡量回撤深度和持续时间
+            ulcer_index = self._calc_ulcer_index(returns)
+            if not np.isnan(ulcer_index):
+                factors["LVF8_ulcer"] = ulcer_index
+                logger.debug(f"Ulcer Index calculated: {ulcer_index:.4f}")
+            
+            # 9. 最大回撤（Max Drawdown）- 使用 quantstats 计算
+            max_dd = self._calc_max_drawdown(returns)
+            if not np.isnan(max_dd):
+                factors["LVF9_max_drawdown"] = max_dd
+                logger.debug(f"Max Drawdown calculated: {max_dd:.4f}")
             
         except Exception as e:
             logger.error(f"Error calculating volatility factors: {e}")
         
         return factors
+    
+    def _calc_ulcer_index(self, returns: np.ndarray) -> float:
+        """
+        计算溃疡指数（Ulcer Index）- 使用 quantstats
+        
+        溃疡指数衡量回撤的深度和持续时间，是更好的风险控制指标
+        公式：UI = sqrt(avg((Drawdown_i)^2))
+        
+        Args:
+            returns: 收益率序列
+            
+        Returns:
+            溃疡指数（越小越好）
+        """
+        if len(returns) < 20:
+            return np.nan
+        
+        try:
+            # 将 returns 转换为 pandas Series（quantstats 需要）
+            # 注意：quantstats 需要日期索引，否则会报错
+            # 创建一个假的日期索引（用 pd.date_range()）
+            dates = pd.date_range(start='2020-01-01', periods=len(returns), freq='D')
+            returns_series = pd.Series(returns, index=dates)
+            
+            # 使用 quantstats 计算溃疡指数
+            ulcer = qs.stats.ulcer_index(returns_series)
+            
+            if not np.isnan(ulcer):
+                logger.debug(f"Ulcer Index calculated using quantstats: {ulcer:.4f}")
+                return float(ulcer)
+            else:
+                return np.nan
+                
+        except Exception as e:
+            logger.warning(f"Failed to calculate Ulcer Index using quantstats: {e}")
+            # 备用：手动计算溃疡指数
+            try:
+                # 计算累计净值
+                cumulative = np.cumprod(1 + returns)
+                
+                # 计算历史最高净值
+                running_max = np.maximum.accumulate(cumulative)
+                
+                # 计算回撤百分比
+                drawdown = (cumulative - running_max) / running_max
+                
+                # 计算溃疡指数：回撤平方和的平均值，然后开根号
+                ulcer_sq = np.mean(drawdown ** 2)
+                ulcer = np.sqrt(ulcer_sq)
+                
+                return float(ulcer)
+            except Exception as e2:
+                logger.warning(f"Failed to calculate Ulcer Index manually: {e2}")
+                return np.nan
+    
+    def _calc_max_drawdown(self, returns: np.ndarray) -> float:
+        """
+        计算最大回撤（Max Drawdown）- 使用 quantstats
+        
+        最大回撤衡量投资组合在特定时期内从峰值到谷值的最大损失
+        
+        Args:
+            returns: 收益率序列
+            
+        Returns:
+            最大回撤（负数，如 -0.15 表示 -15%）
+        """
+        if len(returns) < 20:
+            return np.nan
+        
+        try:
+            # 将 returns 转换为 pandas Series（quantstats 需要）
+            # 注意：quantstats 需要日期索引，否则会报错
+            dates = pd.date_range(start='2020-01-01', periods=len(returns), freq='D')
+            returns_series = pd.Series(returns, index=dates)
+            
+            # 使用 quantstats 计算最大回撤
+            # 注意：qs.stats.max_drawdown() 返回的是负数（如 -0.15 表示 -15%）
+            max_dd = qs.stats.max_drawdown(returns_series)
+            
+            if not np.isnan(max_dd):
+                logger.debug(f"Max Drawdown calculated using quantstats: {max_dd:.4f}")
+                return float(max_dd)
+            else:
+                return np.nan
+                
+        except Exception as e:
+            logger.warning(f"Failed to calculate Max Drawdown using quantstats: {e}")
+            # 备用：手动计算最大回撤
+            try:
+                # 计算累计净值
+                cumulative = np.cumprod(1 + returns)
+                
+                # 计算历史最高净值
+                running_max = np.maximum.accumulate(cumulative)
+                
+                # 计算回撤百分比
+                drawdown = (cumulative - running_max) / running_max
+                
+                # 最大回撤（负数）
+                max_dd = np.min(drawdown)
+                
+                return float(max_dd)
+            except Exception as e2:
+                logger.warning(f"Failed to calculate Max Drawdown manually: {e2}")
+                return np.nan
     
 
     def _calc_money_flow_factors(self, money_flow_data: Optional[pd.DataFrame]) -> Dict[str, float]:

@@ -57,7 +57,7 @@ class BaseStrategy:
     def buy(self, date, price, shares, reason=""):
         """买入操作（子类可调用）"""
         cost = shares * price
-        fee = cost * 0.0002      # 买入手续费
+        fee = max(cost * 0.0002, 5.0)      # ← 万分之二，最低5元
         total_cost = cost + fee
         if total_cost > self.cash:
             return False  # 资金不足
@@ -97,7 +97,7 @@ class BaseStrategy:
             return False
 
         revenue = shares * price
-        fee = revenue * 0.0002   # 卖出手续费
+        fee = max(revenue * 0.0002, 5.0)   # ← 万分之二，最低5元
         tax = revenue * 0.001    # 印花税（A股卖出收）
         net_revenue = revenue - fee - tax
 

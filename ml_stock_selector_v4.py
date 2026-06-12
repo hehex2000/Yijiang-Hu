@@ -605,8 +605,8 @@ class MLStockSelector:
             if stock_pool == "hs300":
                 stocks_df = self.data_fetcher.get_hs300_components(date=date)
             elif stock_pool == "zz500":
-                logger.warning("中证500成分股获取方法未实现，使用中证800代替")
-                stocks_df = self.data_fetcher.get_zz800_components(date=date)
+                # 修正：使用中证500成分股（不是中证800）
+                stocks_df = self.data_fetcher.get_zz500_components(date=date)
             elif stock_pool == "zz800":
                 stocks_df = self.data_fetcher.get_zz800_components(date=date)
             else:
@@ -861,7 +861,7 @@ if __name__ == "__main__":
     parser.add_argument("--pred-date", type=str, default="20220103", help="预测日期（选股日期）")
     parser.add_argument("--top-n", type=int, default=20, help="选择TOP N股票")
     parser.add_argument("--model-type", type=str, default="both", choices=["random_forest", "xgboost", "both"], help="模型类型")
-    parser.add_argument("--stock-pool", type=str, default="hs300", help="股票池（hs300/zz800）")
+    parser.add_argument("--stock-pool", type=str, default="zz500", help="股票池（hs300/zz500/zz800）")
     parser.add_argument("--train-start", type=str, default="20100101", help="训练数据起始日期")
     parser.add_argument("--train-end", type=str, default="20191231", help="训练数据截止日期")
     parser.add_argument("--periods", type=int, default=20, help="训练时间点数量")

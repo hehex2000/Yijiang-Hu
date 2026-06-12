@@ -8,9 +8,12 @@
 价格触及下轨 → 买入（超卖）
 价格触及上轨 → 卖出（超买）
 止盈50%，止损15%
+
+优化：使用 TA-Lib 计算布林带和 RSI（性能提升 10-100 倍）
 """
 import pandas as pd
 import numpy as np
+import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
 from loguru import logger
 
@@ -28,21 +31,23 @@ class BollingerStrategyPlugin(BaseStrategy):
         logger.info(f"BollingerStrategyPlugin initialized: period={self.bb_period}, std={self.bb_std}")
     
     def _calculate_bollinger(self, close: pd.Series) -> pd.DataFrame:
-        """计算布林带指标"""
-        middle = close.rolling(window=self.bb_period).mean()
-        std = close.rolling(window=self.bb_period).std()
+        """计算布林带指标（使用 TA-Lib 优化）"""
+        # TA-Lib BBANDS 返回 (upper, middle, lower)
+        upper, middle, lower = ta.BBANDS(
+            close.values,
+            timeperiod=self.bb_period,
+            nbdevup=self.bb_std,
+            nbdevdn=self.bb_std,
+            matype=0  # 0 = SMA（简单移动平均）
+        )
         return pd.DataFrame({
-            'middle': middle, 'upper': middle + std * self.bb_std,
-            'lower': middle - std * self.bb_std
+            'middle': middle, 'upper': upper, 'lower': lower
         })
     
     def _calculate_rsi(self, close: pd.Series, period: int = 14) -> pd.Series:
-        """计算RSI指标"""
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-        loss = (-delta).where(delta < 0, 0).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        """计算RSI指标（使用 TA-Lib 优化）"""
+        # TA-Lib RSI：前 (period-1) 个值为 NaN
+        return pd.Series(ta.RSI(close.values, timeperiod=period), index=close.index)
     
     def run(self, df: pd.DataFrame, start_idx: int = 0) -> dict:
         """

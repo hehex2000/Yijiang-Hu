@@ -2,6 +2,14 @@
 pandas>=1.5.0
 numpy>=1.21.0
 
+# 技术指标计算（TA-Lib C 语言实现，性能提升 10-100 倍）
+# 安装说明：
+#   Windows: 先下载 https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
+#           安装对应 Python 版本的 .whl 文件
+#   Linux:   sudo apt-get install ta-lib && pip install TA-Lib
+#   Mac:     brew install ta-lib && pip install TA-Lib
+talib>=0.6.0
+
 # 数据源
 akshare>=1.18.0
 tushare>=1.2.0
