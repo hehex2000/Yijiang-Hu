@@ -15,6 +15,7 @@ import pandas as pd
 import numpy as np
 import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
+from backtest.atr_stop_loss import ATRStopLoss
 from loguru import logger
 
 
@@ -28,6 +29,13 @@ class BollingerStrategyPlugin(BaseStrategy):
         self.take_profit = cfg.get("take_profit", 0.50)
         self.stop_loss = cfg.get("stop_loss", 0.15)
         self.position_mode = cfg.get("position_mode", "half")
+        # ── ATR 动态止损 ──
+        self.use_atr_sl = cfg.get("atr_stop_loss", False)
+        self.atr_sl = ATRStopLoss(
+            atr_period=cfg.get("atr_period", 14),
+            atr_mult=cfg.get("atr_mult", 3.0),
+            trail_mult=cfg.get("trail_mult", 3.0),
+        )
         logger.info(f"BollingerStrategyPlugin initialized: period={self.bb_period}, std={self.bb_std}")
     
     def _calculate_bollinger(self, close: pd.Series) -> pd.DataFrame:
@@ -94,6 +102,14 @@ class BollingerStrategyPlugin(BaseStrategy):
         data['buy_signal'] = (prev_close <= prev_lower * 1.02) & (prev_rsi < 40)
         data['sell_signal_bb'] = prev_close >= prev_upper
         
+        # ── ATR 计算 ──
+        if self.use_atr_sl:
+            high_col = 'high' if 'high' in data.columns else 'adj_close'
+            low_col = 'low' if 'low' in data.columns else 'adj_close'
+            atr_arr = self.atr_sl.calc_atr(data[high_col].values, data[low_col].values, data['adj_close'].values)
+        else:
+            atr_arr = np.zeros(len(data))
+        
         for i in range(len(data)):
             row = data.iloc[i]
             date = row['trade_date']
@@ -114,10 +130,24 @@ class BollingerStrategyPlugin(BaseStrategy):
                 buy_amount = self.cash * (0.95 if self.position_mode == 'full' else 0.50)
                 shares = int(buy_amount / open_price / 100) * 100
                 if shares > 0:
-                    self.buy(date, open_price, shares, reason="布林带下轨+RSI超卖")
+                    success = self.buy(date, open_price, shares, reason="布林带下轨+RSI超卖")
+                    # ATR初始化（仅当买入成功时）
+                    if success and self.use_atr_sl:
+                        self.atr_sl.on_entry(entry_price=open_price, atr_val=atr_arr[i])
             
             # 卖出逻辑
             elif self.position > 0:
+                # ── ATR 追踪止损 ──
+                if self.use_atr_sl:
+                    high_val = float(row.get('high', close_price))
+                    self.atr_sl.update(high_price=high_val, atr_val=atr_arr[i])
+                    should_stop, stop_price, atr_reason = self.atr_sl.check_stop(close_price=close_price)
+                    if should_stop:
+                        self.sell(date, open_price, reason=atr_reason)
+                        v = self.cash + self.position * close_price if self.position > 0 else self.cash
+                        self.daily_values.append({'date': date, 'portfolio_value': v})
+                        continue
+
                 sell_signal = False
                 sell_reason = ""
                 
@@ -132,7 +162,7 @@ class BollingerStrategyPlugin(BaseStrategy):
                     if profit_pct >= self.take_profit:
                         sell_signal = True
                         sell_reason = f"止盈({profit_pct:.1%})"
-                    elif profit_pct <= -self.stop_loss:
+                    elif not self.use_atr_sl and profit_pct <= -self.stop_loss:
                         sell_signal = True
                         sell_reason = f"止损({profit_pct:.1%})"
                 

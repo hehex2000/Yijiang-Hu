@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
+from backtest.atr_stop_loss import ATRStopLoss
 from loguru import logger
 
 
@@ -25,6 +26,13 @@ class DualMAStrategyPlugin(BaseStrategy):
         self.position_pct = cfg.get("position_pct", 0.5)  # 单次买入仓位比例
         self.take_profit = cfg.get("take_profit", 0.30)
         self.stop_loss = cfg.get("stop_loss", 0.10)
+        # ── ATR 动态止损 ──
+        self.use_atr_sl = cfg.get("atr_stop_loss", False)
+        self.atr_sl = ATRStopLoss(
+            atr_period=cfg.get("atr_period", 14),
+            atr_mult=cfg.get("atr_mult", 3.0),
+            trail_mult=cfg.get("trail_mult", 3.0),
+        )
         
         logger.info(
             f"DualMAStrategyPlugin initialized: "
@@ -103,6 +111,14 @@ class DualMAStrategyPlugin(BaseStrategy):
         
         logger.info(f"Signal computation complete: {golden_cross.sum()} golden crosses, {death_cross.sum()} death crosses")
         
+        # ── ATR 计算 ──
+        if self.use_atr_sl:
+            high_col = 'high' if 'high' in df.columns else close_col
+            low_col = 'low' if 'low' in df.columns else close_col
+            atr_arr = self.atr_sl.calc_atr(df[high_col].values, df[low_col].values, df[close_col].values)
+        else:
+            atr_arr = np.zeros(len(df))
+        
         # 记录前一天的信号（用于T+1执行）
         prev_signal = 0
         
@@ -121,12 +137,27 @@ class DualMAStrategyPlugin(BaseStrategy):
             
             # T+1执行：如果前一天有金叉/死叉信号，今天开盘交易
             if prev_signal == 1 and self.cash > 0:  # 金叉买入
+                position_before = self.position
                 self._buy_golden_cross(row)
+                # 金叉买入后设置ATR初始止损（仅当实际买入成功时）
+                if self.use_atr_sl and self.position > position_before:
+                    self.atr_sl.on_entry(entry_price=self.avg_cost, atr_val=atr_arr[idx])
             elif prev_signal == -1 and self.position > 0:  # 死叉卖出
+                # 死叉卖出前重置ATR状态
+                if self.use_atr_sl:
+                    self.atr_sl.reset()
                 self._sell_death_cross(row)
             
             # 检查止盈止损（每天检查，用收盘价）
             if self.position > 0:
+                # ── ATR 追踪止损（优先于固定止损）──
+                if self.use_atr_sl:
+                    high_val = float(row.get('high', price))
+                    self.atr_sl.update(high_price=high_val, atr_val=atr_arr[idx])
+                    should_stop, stop_price, atr_reason = self.atr_sl.check_stop(close_price=price)
+                    if should_stop:
+                        self.sell(current_date, price, self.position, reason=atr_reason)
+                        continue
                 self._check_take_profit_stop_loss(row)
             
             # 更新前一天的信号
@@ -152,7 +183,7 @@ class DualMAStrategyPlugin(BaseStrategy):
     
     def _get_price(self, row: pd.Series) -> float:
         """获取复权收盘价（兼容不同列名）"""
-        for col in ['adj_close', 'adj_close', 'close', '收盘价']:
+        for col in ['adj_close', 'close', '收盘价']:
             if col in row and pd.notna(row[col]):
                 return float(row[col])
         return 0.0
@@ -176,7 +207,7 @@ class DualMAStrategyPlugin(BaseStrategy):
         if idx == 0:
             return 0
         
-        prev_row = row.to_frame().T.iloc[0] if False else None
+            # 前一天数据通过 signal_change 列获取，无需单独变量
         # 更简单的方法：直接比较当前和前一天的均线差值
         # 金叉：昨天 short_ma < long_ma，今天 short_ma > long_ma
         # 死叉：昨天 short_ma > long_ma，今天 short_ma < long_ma
@@ -244,8 +275,8 @@ class DualMAStrategyPlugin(BaseStrategy):
             if success:
                 logger.debug(f"Dual MA take profit: {current_date}, profit={profit_pct:.2%}")
         
-        # 止损
-        elif profit_pct <= -self.stop_loss:
+        # 止损（仅当非ATR模式时使用固定止损）
+        elif not self.use_atr_sl and profit_pct <= -self.stop_loss:
             reason = "止损"
             success = self.sell(current_date, current_price, self.position, reason)
             if success:

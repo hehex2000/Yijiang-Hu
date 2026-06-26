@@ -13,6 +13,7 @@ import talib as ta
 from loguru import logger
 
 from backtest.base_strategy import BaseStrategy
+from backtest.atr_stop_loss import ATRStopLoss
 
 
 class RSITrendPlugin(BaseStrategy):
@@ -43,6 +44,14 @@ class RSITrendPlugin(BaseStrategy):
         self.take_profit = float(cfg.get("take_profit", 0.50))
         self.stop_loss = float(cfg.get("stop_loss", 0.15))
         self.position_mode = cfg.get("position_mode", "half")  # half | full
+
+        # ── ATR 动态止损 ──
+        self.use_atr_sl = cfg.get("atr_stop_loss", False)
+        self.atr_sl = ATRStopLoss(
+            atr_period=cfg.get("atr_period", 14),
+            atr_mult=cfg.get("atr_mult", 3.0),
+            trail_mult=cfg.get("trail_mult", 3.0),
+        )
 
         # ── 内部状态 ─────────────────────────────
         self.position = 0
@@ -120,6 +129,14 @@ class RSITrendPlugin(BaseStrategy):
         data["buy_signal"] = (rsi_y > self.rsi_center) & (rsi_yy <= self.rsi_center)
         data["sell_signal"] = (rsi_y < self.rsi_center) & (rsi_yy >= self.rsi_center)
 
+        # ── ATR 计算 ──
+        if self.use_atr_sl:
+            high_col = 'high' if 'high' in data.columns else 'adj_close'
+            low_col = 'low' if 'low' in data.columns else 'adj_close'
+            atr_arr = self.atr_sl.calc_atr(data[high_col].values, data[low_col].values, data['adj_close'].values)
+        else:
+            atr_arr = np.zeros(len(data))
+
         # ── 主循环 ──────────────────────────────────
         n = len(data)
         loop_start = max(start_idx, self.rsi_period + 2)
@@ -143,8 +160,17 @@ class RSITrendPlugin(BaseStrategy):
             close_price = row["adj_close"]
             prev_close = data["adj_close"].iloc[i - 1] if i > 0 else close_price
 
-            # ── 止损止盈检查（以前一日收盘价判断）─────
+            # ── 止损止盈 + ATR追踪止损 ──
             if self.position > 0:
+                # ── ATR 追踪止损 ──
+                if self.use_atr_sl:
+                    high_val = float(row.get('high', close_price))
+                    self.atr_sl.update(high_price=high_val, atr_val=atr_arr[i])
+                    should_stop, stop_price, atr_reason = self.atr_sl.check_stop(close_price=close_price)
+                    if should_stop:
+                        self._sell(date, open_price, reason=atr_reason)
+                        continue
+
                 pnl_pct = (prev_close / self.avg_cost) - 1
 
                 # 止盈
@@ -152,14 +178,17 @@ class RSITrendPlugin(BaseStrategy):
                     self._sell(date, open_price, reason=f"止盈 {pnl_pct:.1%}")
                     continue
 
-                # 止损
-                if pnl_pct <= -self.stop_loss:
+                # 止损（仅非ATR模式）
+                if not self.use_atr_sl and pnl_pct <= -self.stop_loss:
                     self._sell(date, open_price, reason=f"止损 {pnl_pct:.1%}")
                     continue
 
             # ── 买入信号 ─────────────────────────────
             if self.position == 0 and row["buy_signal"]:
                 self._buy(date, open_price)
+                # ATR初始化（仅当买入成功时）
+                if self.use_atr_sl and self.position > 0:
+                    self.atr_sl.on_entry(entry_price=self.avg_cost, atr_val=atr_arr[i])
                 continue
 
             # ── 卖出信号 ─────────────────────────────

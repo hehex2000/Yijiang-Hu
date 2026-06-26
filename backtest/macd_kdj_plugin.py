@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
+from backtest.atr_stop_loss import ATRStopLoss
 from loguru import logger
 
 
@@ -29,6 +30,13 @@ class MACDRSIStrategyPlugin(BaseStrategy):
         self.take_profit = cfg.get("take_profit", 0.25)
         self.stop_loss = cfg.get("stop_loss", 0.10)
         self.position_mode = cfg.get("position_mode", "half")
+        # ── ATR 动态止损 ──
+        self.use_atr_sl = cfg.get("atr_stop_loss", False)
+        self.atr_sl = ATRStopLoss(
+            atr_period=cfg.get("atr_period", 14),
+            atr_mult=cfg.get("atr_mult", 3.0),
+            trail_mult=cfg.get("trail_mult", 3.0),
+        )
         logger.info(f"MACDRSIStrategyPlugin initialized: macd=({self.macd_fast},{self.macd_slow},{self.macd_signal})")
     
     def _calculate_macd(self, close: pd.Series):
@@ -87,6 +95,14 @@ class MACDRSIStrategyPlugin(BaseStrategy):
         prev_death = (dif.shift(1) < dea.shift(1)) & (dif.shift(2) >= dea.shift(2))
         prev_rsi = rsi.shift(1)
         
+        # ── ATR 计算 ──
+        if self.use_atr_sl:
+            high_col = 'high' if 'high' in data.columns else 'adj_close'
+            low_col = 'low' if 'low' in data.columns else 'adj_close'
+            atr_arr = self.atr_sl.calc_atr(data[high_col].values, data[low_col].values, data['adj_close'].values)
+        else:
+            atr_arr = np.zeros(len(data))
+        
         for i in range(len(data)):
             row = data.iloc[i]
             date = row['trade_date']
@@ -96,19 +112,29 @@ class MACDRSIStrategyPlugin(BaseStrategy):
             # 跳过早期数据
             if i < 2 or pd.isna(close_price):
                 v = self.cash + self.position * close_price if self.position > 0 else self.cash
+                v = self.cash + self.position * close_price if self.position > 0 else self.cash
                 self.daily_values.append({'date': date, 'portfolio_value': v})
                 continue
             
             prev_close = float(data.iloc[i - 1]['adj_close'])
             
-            # 止盈止损（前一日收盘价判断）
+            # 止盈止损 + ATR追踪止损
             if self.position > 0:
+                # ── ATR 追踪止损 ──
+                if self.use_atr_sl:
+                    high_val = float(row.get('high', close_price))
+                    self.atr_sl.update(high_price=high_val, atr_val=atr_arr[i])
+                    should_stop, stop_price, atr_reason = self.atr_sl.check_stop(close_price=close_price)
+                    if should_stop:
+                        self.sell(date, open_price, reason=atr_reason)
+                        continue
+
                 current_return = (prev_close - self.avg_cost) / self.avg_cost if self.avg_cost > 0 else 0
                 if current_return >= self.take_profit:
                     # 卖出
                     self.sell(date, open_price, reason=f"止盈({current_return:.1%})")
                     continue
-                elif current_return <= -self.stop_loss:
+                elif not self.use_atr_sl and current_return <= -self.stop_loss:
                     # 卖出
                     self.sell(date, open_price, reason=f"止损({current_return:.1%})")
                     continue
@@ -121,7 +147,10 @@ class MACDRSIStrategyPlugin(BaseStrategy):
                     buy_amount = self.cash * (0.95 if self.position_mode == 'full' else 0.50)
                     shares = int(buy_amount / open_price / 100) * 100
                     if shares > 0:
-                        self.buy(date, open_price, shares, reason="MACD金叉+RSI未超买")
+                        success = self.buy(date, open_price, shares, reason="MACD金叉+RSI未超买")
+                        # ATR初始化（仅当买入成功时）
+                        if success and self.use_atr_sl:
+                            self.atr_sl.on_entry(entry_price=open_price, atr_val=atr_arr[i])
             
             # 卖出信号（前一日MACD死叉 或 RSI超买）
             elif self.position > 0:

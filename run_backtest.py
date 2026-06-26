@@ -26,6 +26,7 @@ logger.add(lambda _: None, level="CRITICAL")  # 空 sink，只吞不吐
 from config import (
     DATA, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR,
     BACKTEST, STRATEGIES, OUTPUT, INDUSTRY_MOMENTUM,
+    VALUE_STRATEGY, DIVIDEND_LOW_VOL,
 )
 
 DB_PATH = DATA["local_db_path"]
@@ -94,6 +95,11 @@ def load_strategy_plugins():
 
 def ts_code(c):
     """简单代码 → Tushare格式"""
+    c = str(c).strip()
+    """智能处理已有后缀"""
+    if '.' in c:
+        c = c.split('.')[0]
+    c = c.zfill(6)
     return c + (".SH" if c.startswith("6") else ".SZ")
 
 
@@ -113,14 +119,21 @@ def load_stock_prices(code, start, end, conn, lookback_days=250):
         SELECT d.trade_date, d.open, d.high, d.low, d.close, d.vol,
                af.adj_factor
         FROM daily d
-        JOIN adj_factor af ON d.ts_code = af.ts_code 
-                            AND d.trade_date = af.trade_date
+        LEFT JOIN adj_factor af ON d.ts_code = af.ts_code 
+                             AND d.trade_date = af.trade_date
         WHERE d.ts_code = ? AND d.trade_date BETWEEN ? AND ?
         ORDER BY d.trade_date
     """
     df = pd.read_sql_query(query, conn, params=(ts_code(code), lookback_start, end))
     if df.empty:
         return None
+    
+    # 处理缺失的 adj_factor（LEFT JOIN 可能导致 NaN）
+    if df['adj_factor'].isna().any():
+        na_count = df['adj_factor'].isna().sum()
+        print(f"    [WARN] {code} 的 adj_factor 缺失 {na_count} 条，正在填充...")
+        # 前向填充 + 后向填充 + 用1.0填充剩余的
+        df['adj_factor'] = df['adj_factor'].ffill().bfill().fillna(1.0)
     
     # 确保数值列为 float
     for col in ['open', 'high', 'low', 'close', 'vol', 'adj_factor']:
@@ -184,9 +197,24 @@ def calculate_max_drawdown(portfolio_values):
     return max_dd
 
 
-def backtest_buy_hold(df, capital, start_idx=0):
-    """买入持有"""
-    close = df["close"].values
+def backtest_buy_hold(df, capital, cfg, start_idx=0):
+    """
+    买入持有（模拟普通股民操作：买入后一直持有，可启用ATR动态止损）
+    
+    使用复权价格计算收益，确保与插件策略的价格基准一致。
+    
+    ATR动态止损（可选）：
+    - 启用后，当收盘价跌破ATR止损价时触发止损
+    - 止损后不再重新买入（保持"买入持有"语义）
+    """
+    # 使用复权价格（与插件策略一致）
+    close_col = "adj_close" if "adj_close" in df.columns else "close"
+    high_col = "adj_high" if "adj_high" in df.columns else "high"
+    low_col = "adj_low" if "adj_low" in df.columns else "low"
+    
+    close = df[close_col].values
+    high = df[high_col].values
+    low = df[low_col].values
     n = len(close)
     
     # 买入持有：全部资金在 start_idx 买入，一直持有
@@ -195,26 +223,79 @@ def backtest_buy_hold(df, capital, start_idx=0):
     if shares == 0:
         return 0.0, 0, 0.0
     
-    cash = capital - shares * p0 * 1.0002  # 买入成本
+    cash = capital - shares * p0 * 1.0002  # 买入成本（含手续费）
     
-    portfolio_values = []
-    for i in range(n):
-        if i < start_idx:
-            portfolio_values.append(capital)  # 未买入前，保持现金
-        else:
-            portfolio_values.append(cash + shares * close[i])
+    # 检查是否启用ATR止损
+    use_atr_stop = cfg.get("use_atr_stop", False)
     
-    final = portfolio_values[-1]
-    ret = (final / capital - 1) * 100
-    max_dd = calculate_max_drawdown(portfolio_values)
-
-    # 调试打印 → 写到文件（避免 stderr 被忽略）
-    with open("debug_buy_hold.log", "a", encoding="utf-8") as f:
-        f.write(f"pv[0]={portfolio_values[0]:.2f}, pv[-1]={portfolio_values[-1]:.2f}, "
-                 f"min={min(portfolio_values):.2f}, max={max(portfolio_values):.2f}, "
-                 f"max_dd={max_dd:.2f}%\n")
+    if use_atr_stop:
+        # 导入ATR止损模块
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backtest.atr_stop_loss import ATRStopLoss
+        
+        # 初始化ATR止损
+        atr_period = cfg.get("atr_period", 14)
+        atr_mult = cfg.get("atr_mult", 3.0)
+        trail_mult = cfg.get("trail_mult", 3.0)
+        
+        sl = ATRStopLoss(atr_period=atr_period, atr_mult=atr_mult, trail_mult=trail_mult)
+        atr_values = sl.calc_atr(high, low, close)
+        
+        # 建仓
+        entry_atr = atr_values[start_idx] if start_idx < len(atr_values) else 0.0
+        if entry_atr > 0:
+            sl.on_entry(entry_price=p0, atr_val=entry_atr)
+        
+        # 追踪止损
+        portfolio_values = []
+        exit_idx = n - 1  # 默认持有到最后
+        
+        for i in range(n):
+            if i < start_idx:
+                portfolio_values.append(capital)  # 未买入前，保持现金
+            else:
+                # 检查是否触发止损（从 start_idx+1 开始）
+                if i > start_idx and entry_atr > 0:
+                    curr_atr = atr_values[i] if i < len(atr_values) else entry_atr
+                    sl.update(high_price=high[i], atr_val=curr_atr)
+                    
+                    should_stop, stop_price, reason = sl.check_stop(close_price=close[i])
+                    if should_stop:
+                        exit_idx = i
+                        break
+                
+                portfolio_values.append(cash + shares * close[i])
+        
+        # 如果止损触发，后续日期保持现金（卖出后）
+        if exit_idx < n - 1:
+            sell_price = close[exit_idx]
+            cash_after_sell = cash + shares * sell_price * 0.99955  # 扣除手续费
+            for i in range(exit_idx + 1, n):
+                portfolio_values.append(cash_after_sell)
+        
+        # 计算最终收益
+        final_value = portfolio_values[-1]
+        ret = (final_value / capital - 1) * 100
+        max_dd = calculate_max_drawdown(portfolio_values)
+        
+        return ret, 1, max_dd
     
-    return ret, 0, max_dd
+    else:
+        # 原始逻辑：一直持有
+        portfolio_values = []
+        for i in range(n):
+            if i < start_idx:
+                portfolio_values.append(capital)  # 未买入前，保持现金
+            else:
+                portfolio_values.append(cash + shares * close[i])
+        
+        final = portfolio_values[-1]
+        ret = (final / capital - 1) * 100
+        max_dd = calculate_max_drawdown(portfolio_values)
+        
+        return ret, 0, max_dd
 
 
 def backtest_rsi(df, capital, cfg, start_idx=0):
@@ -756,8 +837,128 @@ def _get_all_stocks_from_db():
         conn.close()
 
 
+def _get_prev_trading_day(date_str):
+    """
+    从数据库查询指定日期之前的最近一个交易日
+    
+    Args:
+        date_str: YYYYMMDD 格式的日期
+    
+    Returns:
+        str: YYYYMMDD 格式的交易日，如查询失败返回 date_str 本身
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.execute(
+            "SELECT MAX(trade_date) FROM daily WHERE trade_date < ?",
+            (date_str,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return str(row[0])
+        print(f"  [WARN] 未找到 {date_str} 前的交易日，使用原日期")
+        return date_str
+    except Exception as e:
+        print(f"  [WARN] 查询前交易日失败: {e}，使用原日期")
+        return date_str
+
+
+def _get_index_constituents_from_db(index_code: str) -> pd.DataFrame:
+    """
+    直接从本地DB查询指数成分股（自动使用最新日期）
+    返回: DataFrame with columns ['code', 'name']
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        
+        # 先找该指数最新日期
+        cur = conn.execute(
+            "SELECT MAX(trade_date) FROM index_constituent WHERE index_code=?",
+            (index_code,)
+        )
+        row = cur.fetchone()
+        
+        if not row or not row[0]:
+            conn.close()
+            logger.warning(f"未找到指数 {index_code} 的任何数据")
+            return pd.DataFrame(columns=['code', 'name'])
+        
+        query_date = str(row[0])  # 保持数据库原格式（YYYY-MM-DD 或 YYYYMMDD）
+        
+        # 查询成分股（用 REPLACE 兼容两种日期格式）
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent WHERE index_code=? AND REPLACE(trade_date, '-', '')=?",
+            conn,
+            params=(index_code, query_date.replace("-", ""))
+        )
+        
+        if len(df) == 0:
+            # 尝试不使用trade_date过滤
+            df = pd.read_sql_query(
+                "SELECT ts_code FROM index_constituent WHERE index_code=?",
+                conn,
+                params=(index_code,)
+            )
+        
+        if len(df) > 0:
+            # 提取6位数字代码（去掉交易所后缀）
+            df['code'] = df['ts_code'].str.extract(r'(\d{6})', expand=False)
+            
+            # 暂时不获取股票名称（避免错误）
+            df['name'] = ''
+            
+            conn.close()
+            
+            result = df[['code', 'name']].reset_index(drop=True)
+            logger.info(f"从本地DB获取 {index_code} 成分股: {len(result)} 只 (日期:{query_date})")
+            return result
+        else:
+            logger.warning(f"查询指数 {index_code} 返回0行")
+        
+        conn.close()
+    except Exception as e:
+        logger.warning(f"查询指数成分股失败 ({index_code}): {e}")
+    
+    # 查询失败，返回空DataFrame
+    return pd.DataFrame(columns=['code', 'name'])
+
+
+def _get_hs300_from_db() -> pd.DataFrame:
+    """直接从本地DB查询沪深300成分股"""
+    return _get_index_constituents_from_db('000300.SH')
+
+
+def _get_zz500_from_db() -> pd.DataFrame:
+    """直接从本地DB查询中证500成分股"""
+    return _get_index_constituents_from_db('000905.SH')
+
+
+def _get_zz800_from_db() -> pd.DataFrame:
+    """直接从本地DB查询中证800成分股（沪深300+中证500）"""
+    hs300 = _get_index_constituents_from_db('000300.SH')
+    zz500 = _get_index_constituents_from_db('000905.SH')
+    # 合并去重
+    combined = pd.concat([hs300, zz500], ignore_index=True)
+    combined = combined.drop_duplicates(subset=['code']).reset_index(drop=True)
+    logger.info(f"中证800成分股: 沪深300({len(hs300)}) + 中证500({len(zz500)}) = {len(combined)}")
+    return combined
+
+
+def _get_zz1000_from_db() -> pd.DataFrame:
+    """直接从本地DB查询中证1000成分股"""
+    return _get_index_constituents_from_db('000852.SH')
+
+
 def run_selection():
     """执行多因子选股，返回 TOP N 股票列表"""
+    
+    # ── 动态计算选股日：回测开始日 T 的前一个交易日 T-1 ──
+    backtest_start = BACKTEST["start_date"]
+    prev_day = _get_prev_trading_day(backtest_start)
+    SELECTION["date"] = prev_day
+    print(f"  选股日自动计算: 回测开始 {backtest_start} → 前交易日 {prev_day}")
+    
     from src.data_fetcher import DataFetcher
     from src.factor_calculator import FactorCalculator
     from src.factor_processor import FactorProcessor
@@ -787,20 +988,19 @@ def run_selection():
 
     calculator = FactorCalculator(**FACTOR_CALCULATOR)
     processor = FactorProcessor(config=FACTOR_PROCESSOR)
-    selector = StockSelector(config={"top_n": SELECTION["top_n"]})
+    # 多选一倍候选，供回测时递补（如 top_n=5 则选10只）
+    _candidate_n = max(SELECTION["top_n"] * 2, SELECTION["top_n"] + 10)
+    selector = StockSelector(config={"top_n": _candidate_n})
 
     # 根据 stock_pool 配置动态选择股票池
     pool_map = {
-        "hs300": fetcher.get_hs300_components,
-        "zz500": lambda: fetcher.get_zz500_components() if hasattr(fetcher, 'get_zz500_components') else fetcher.get_hs300_components(),
-        "zz800": fetcher.get_zz800_components,
+        "hs300": _get_hs300_from_db,
+        "zz500": _get_zz500_from_db,
+        "zz800": _get_zz800_from_db,
+        "zz1000": _get_zz1000_from_db,
         "all":   lambda: _get_all_stocks_from_db(),
     }
     get_pool = pool_map.get(SELECTION["stock_pool"], fetcher.get_hs300_components)
-    
-    # 详细调试信息
-    print(f"  [DEBUG] stock_pool配置: {SELECTION['stock_pool']}")
-    print(f"  [DEBUG] 调用函数: {get_pool.__name__ if hasattr(get_pool, '__name__') else get_pool}")
     
     pool = get_pool()
     
@@ -868,19 +1068,24 @@ def run_selection():
         print(f"    过滤后: {len(pool)} 只")
         print(f"    过滤掉: {original_len - len(pool)} 只（上市晚于 {selection_date}）")
         if skip_count > 0:
-            print(f"    [DEBUG] 跳过（无上市日期）: {skip_count} 只")
+            print(f"    [注] 跳过（无上市日期）: {skip_count} 只")
         
     except Exception as e:
         print(f"  [WARN] 过滤上市日期失败: {e}")
         print(f"  [WARN] 将继续使用全部股票池（可能包含未上市股票）")
     
     # 验证股票池数量
-    expected_max = {"hs300": 300, "zz500": 500, "zz800": 800}.get(SELECTION["stock_pool"], 10000)
-    print(f"  [DEBUG] 实际获取数量: {len(pool)} 只")
+    expected_max = {"hs300": 300, "zz500": 500, "zz800": 800, "zz1000": 1000}.get(SELECTION["stock_pool"], 10000)
     if len(pool) > expected_max * 1.5:  # 允许50%误差（如有重复）
         print(f"  [WARN] 警告: 股票池数量异常！配置={SELECTION['stock_pool']}, 预期≤{expected_max}, 实际={len(pool)}")
         print(f"  [WARN] 可能误用了全市场数据，请检查 get_zz800_components 实现")
     print(f"  股票池 [{SELECTION['stock_pool']}]: {len(pool)} 只")
+
+    # 防御：确保 pool 有 code 列
+    if pool.empty or "code" not in pool.columns:
+        print(f"  [ERROR] 股票池为空或列名错误！请检查 _get_{SELECTION['stock_pool']}_from_db 实现")
+        print(f"  [DEBUG] pool.empty={pool.empty}, columns={list(pool.columns)}")
+        return pd.DataFrame()
 
     factors = calculator.calculate_all_factors(
         pool["code"].tolist(), fetcher,
@@ -891,7 +1096,7 @@ def run_selection():
     print(f"  因子计算: {len(factors)} 只 × {len([c for c in factors.columns if c.startswith(('VF','GF','QF','MF','TF','LVF','MWF'))])} 因子")
 
     processed = processor.process(factors)
-    selected = selector.select(processed, top_n=SELECTION["top_n"])
+    selected = selector.select(processed, top_n=_candidate_n)
 
     # 补全股票名称（直接从 stock_basic 表读取，不依赖 ts_code 函数）
     import sqlite3
@@ -900,7 +1105,6 @@ def run_selection():
     try:
         conn = sqlite3.connect(DB)
         codes_to_query = selected["code"].tolist()
-        print(f"  [DEBUG] 尝试补全 {len(codes_to_query)} 只股票的名称...")
         
         for code in codes_to_query:
             # 直接拼 Tushare 格式：6开头.SH，0/3开头.SZ
@@ -910,12 +1114,10 @@ def run_selection():
             if r and r[0]:
                 names[code] = r[0]
             else:
-                # 调试：打印找不到名称的股票
-                if len(names) < 5:  # 只打印前5个，避免刷屏
-                    print(f"    [DEBUG] 未找到名称: code={code}, tsc={tsc}")
+                # 调试：打印找不到名称的股票（已禁用）
+                pass
         
         conn.close()
-        print(f"  [DEBUG] 成功补全 {len(names)}/{len(codes_to_query)} 只股票的名称")
         
     except Exception as e:
         print(f"  [WARN] 补全股票名称失败: {e}")
@@ -943,13 +1145,208 @@ def run_selection():
         print(f"  选股结果已保存 → {csv_path}")
 
     return selected
+    
+    
+# ══════════════════════════════════════════════════════
+# 价值投资选股
+# ══════════════════════════════════════════════════════
+
+def run_value_selection():
+    """
+    执行价值投资选股，返回选股结果DataFrame
+    选股失败时自动后移交易日重试，直到选出股票或达到最大尝试次数
+    """
+    from src.value_stock_selector import ValueStockSelector
+    from src.data_fetcher import DataFetcher
+
+    backtest_start = BACKTEST["start_date"]
+    VALUE_STRATEGY["top_n"] = SELECTION["top_n"]
+    VALUE_STRATEGY["stock_pool"] = SELECTION["stock_pool"]
+
+    # 获取交易日列表（用于后移）
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    trade_dates = pd.read_sql_query(
+        "SELECT DISTINCT trade_date FROM daily ORDER BY trade_date",
+        conn
+    )["trade_date"].tolist()
+    conn.close()
+
+    # 找到回测开始日前一个交易日的索引
+    prev_day = _get_prev_trading_day(backtest_start)
+    if prev_day not in trade_dates:
+        print(f"  [ERROR] 选股日 {prev_day} 不在交易日列表中！")
+        return pd.DataFrame()
+    date_idx = trade_dates.index(prev_day)
+
+    MAX_ATTEMPTS = 20  # 最多尝试20个交易日
+
+    for attempt in range(MAX_ATTEMPTS):
+        current_date = trade_dates[date_idx]
+        VALUE_STRATEGY["date"] = current_date
+
+        if attempt == 0:
+            print(f"  价值投资选股日: 回测开始 {backtest_start} → 前交易日 {current_date}")
+        else:
+            print(f"  [重试] 选股日后移 {attempt} 天 → {current_date}")
+
+        # 配置数据源
+        df_config = {
+            "primary_source": DATA["primary_source"],
+            "tushare_token": DATA.get("tushare_token", ""),
+            "local_db_path": DATA["local_db_path"],
+            "use_akshare_backup": DATA["use_akshare_backup"],
+            "use_tushare_backup": False,
+        }
+
+        fetcher = DataFetcher(**df_config)
+        _orig_top_n = VALUE_STRATEGY["top_n"]
+        VALUE_STRATEGY["top_n"] = max(_orig_top_n * 2, _orig_top_n + 10)
+        selector = ValueStockSelector(VALUE_STRATEGY, fetcher)
+        VALUE_STRATEGY["top_n"] = _orig_top_n
+
+        print(f"\n{'='*60}")
+        print(f"  价值投资选股 — {current_date} | 池:{VALUE_STRATEGY['stock_pool']}")
+        print(f"{'='*60}")
+
+        selected = selector.select_stocks(date=current_date)
+
+        if selected is not None and len(selected) > 0:
+            # 选股成功，保存结果
+            output_dir = VALUE_STRATEGY.get("output_dir", "data/results/value_strategy")
+            output_file = VALUE_STRATEGY.get("output_file", "value_selection_{date}.csv")
+            filepath = selector.export_to_csv(selected, filename=output_file, output_dir=output_dir)
+
+            print(f"\n{'='*60}")
+            print(f"  价值投资选股完成！共找到 {len(selected)} 只股票（选股日: {current_date}）")
+            print(f"  结果已保存 → {filepath}")
+            print(f"{'='*60}\n")
+
+            return selected[["code", "name"]] if "name" in selected.columns else selected[["code"]]
+
+        # 选股失败，后移一天
+        print(f"  [WARN] 选股失败，后移到下一交易日重试...")
+        date_idx += 1
+        if date_idx >= len(trade_dates):
+            print(f"\n  [ERROR] 已尝试 {attempt+1} 个交易日，仍无法选出股票！")
+            break
+
+    return pd.DataFrame()
+    
+
+# ══════════════════════════════════════════════════════
+# 回测函数
+# ══════════════════════════════════════════════════════
+
+def run_dividend_low_vol_selection() -> pd.DataFrame:
+    """
+    执行红利低波选股，返回选股结果DataFrame
+    选股失败时自动后移交易日重试，直到选出股票或达到最大尝试次数
+    """
+    from src.dividend_low_vol_selector import DividendLowVolSelector
+    from src.data_fetcher import DataFetcher
+
+    backtest_start = BACKTEST["start_date"]
+    DIVIDEND_LOW_VOL["top_n"] = SELECTION["top_n"]
+    DIVIDEND_LOW_VOL["stock_pool"] = SELECTION["stock_pool"]
+
+    # 获取交易日列表（用于后移）
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    trade_dates = pd.read_sql_query(
+        "SELECT DISTINCT trade_date FROM daily ORDER BY trade_date",
+        conn
+    )["trade_date"].tolist()
+    conn.close()
+
+    # 找到回测开始日前一个交易日的索引
+    prev_day = _get_prev_trading_day(backtest_start)
+    if prev_day not in trade_dates:
+        print(f"  [ERROR] 选股日 {prev_day} 不在交易日列表中！")
+        return pd.DataFrame()
+    date_idx = trade_dates.index(prev_day)
+
+    MAX_ATTEMPTS = 20  # 最多尝试20个交易日
+
+    for attempt in range(MAX_ATTEMPTS):
+        current_date = trade_dates[date_idx]
+        DIVIDEND_LOW_VOL["date"] = current_date
+
+        if attempt == 0:
+            print(f"  红利低波选股日: 回测开始 {backtest_start} → 前交易日 {current_date}")
+        else:
+            print(f"  [重试] 选股日后移 {attempt} 天 → {current_date}")
+
+        # 多选一倍候选，供回测时递补
+        DIVIDEND_LOW_VOL["_orig_top_n"] = DIVIDEND_LOW_VOL["top_n"]
+        DIVIDEND_LOW_VOL["top_n"] = max(DIVIDEND_LOW_VOL["top_n"] * 2, DIVIDEND_LOW_VOL["top_n"] + 10)
+
+        df_config = {
+            "primary_source": DATA["primary_source"],
+            "tushare_token": DATA.get("tushare_token", ""),
+            "local_db_path": DATA["local_db_path"],
+            "use_akshare_backup": DATA["use_akshare_backup"],
+            "use_tushare_backup": False,
+        }
+        fetcher = DataFetcher(**df_config)
+        selector = DividendLowVolSelector(DIVIDEND_LOW_VOL, fetcher)
+        DIVIDEND_LOW_VOL["top_n"] = DIVIDEND_LOW_VOL["_orig_top_n"]
+        del DIVIDEND_LOW_VOL["_orig_top_n"]
+
+        print(f"\n{'='*60}")
+        print(f"  红利低波选股 — {current_date} | 池:{DIVIDEND_LOW_VOL['stock_pool']}")
+        print(f"{'='*60}")
+
+        selected = selector.select_stocks(date=current_date)
+
+        if selected is not None and len(selected) > 0:
+            # 选股成功，保存结果
+            output_dir = DIVIDEND_LOW_VOL.get("output_dir", "data/results/dividend_low_vol")
+            output_file = DIVIDEND_LOW_VOL.get("output_file", "dividend_low_vol_{date}.csv")
+            filepath = selector.export_to_csv(selected, filename=output_file, output_dir=output_dir)
+
+            print(f"\n{'='*60}")
+            print(f"  红利低波选股完成！共找到 {len(selected)} 只股票（选股日: {current_date}）")
+            print(f"  结果已保存 → {filepath}")
+            print(f"{'='*60}\n")
+
+            return selected[["code", "name"]] if "name" in selected.columns else selected[["code"]]
+
+        # 选股失败，后移一天
+        print(f"  [WARN] 选股失败，后移到下一交易日重试...")
+        date_idx += 1
+        if date_idx >= len(trade_dates):
+            print(f"\n  [ERROR] 已尝试 {attempt+1} 个交易日，仍无法选出股票！")
+            break
+
+    return pd.DataFrame()
 
 
 def run_backtest(stocks):
     """对股票列表执行所有已启用的策略"""
     capital = BACKTEST["initial_capital"]
     start, end = BACKTEST["start_date"], BACKTEST["end_date"]
+
+    # 自动根据股票池设置基准指数
+    stock_pool_to_benchmark = {
+        "hs300": "000300.SH",   # 沪深300
+        "zz500": "000905.SH",   # 中证500
+        "zz800": "000906.SH",   # 中证800
+        "zz1000": "000852.SH",   # 中证1000
+        "all":   "000300.SH",   # 全A股用沪深300作为基准
+    }
+    if SELECTION["stock_pool"] in stock_pool_to_benchmark:
+        BACKTEST["benchmark"] = stock_pool_to_benchmark[SELECTION["stock_pool"]]
+
     benchmark = BACKTEST["benchmark"]
+    # 指数代码 → 中文显示名称
+    _BENCHMARK_NAME = {
+        "000300.SH": "沪深300",
+        "000905.SH": "中证500",
+        "000906.SH": "中证800",
+        "000852.SH": "中证1000",
+    }
+    benchmark_name = _BENCHMARK_NAME.get(benchmark, benchmark)
 
     # ── 补全股票名称（CSV 中可能没有 name 列，强制从数据库补全）───
     try:
@@ -975,25 +1372,46 @@ def run_backtest(stocks):
     idx_ret = (idx["close"].iloc[-1] / idx["close"].iloc[0] - 1) * 100 if idx is not None else 0
 
     # 预加载所有股票数据（含250天回溯，用于计算MA200）
-    print(f"\n  加载股票数据 ({start} → {end})...")
+    # 递补逻辑：候选股票可能数据不足，遍历候选列表直到凑满 top_n 只有效股票
+    target_n = SELECTION["top_n"]
+    print(f"\n  加载股票数据 ({start} → {end})...  [目标: {target_n}只，候选: {len(stocks)}只]")
     stock_data = {}
     bh_results = {}
-    # 找到回测起始日在 df 中的索引（用于 bh 计算和策略起始位置）
+    skipped = []
+    valid_count = 0
+
     for _, row in stocks.iterrows():
+        if valid_count >= target_n:
+            break  # 已凑满，停止
         code, name = row["code"], row.get("name", "")
         df = load_stock_prices(code, start, end, conn, lookback_days=250)
         if df is not None and len(df) >= 30:
             # 找到第一个 >= start 的交易日索引
             start_idx = df[df["trade_date"] >= start].index.min()
             if pd.isna(start_idx):
+                skipped.append(f"{code}({name}): 回测起始日不在数据范围内")
                 continue
             start_idx = int(start_idx)
             stock_data[code] = (name, df, start_idx)
-            # BH 收益 = 回测起始日买入 → 结束日卖出
-            bh_ret = (df["close"].iloc[-1] / df["close"].iloc[start_idx] - 1) * 100
+            # BH 收益 = 回测起始日买入 → 结束日卖出（使用复权价格，与策略一致）
+            bh_close_col = "adj_close" if "adj_close" in df.columns else "close"
+            bh_ret = (df[bh_close_col].iloc[-1] / df[bh_close_col].iloc[start_idx] - 1) * 100
             bh_results[code] = bh_ret
+            valid_count += 1
+        else:
+            reason = "价格数据为空" if df is None else f"数据不足({len(df)}天, 需≥30天)"
+            skipped.append(f"{code}({name}): {reason}")
+
     conn.close()
-    print(f"  有效股票: {len(stock_data)}/{len(stocks)}")
+    if skipped:
+        print(f"  [递补] {valid_count}/{target_n} 只有效，以下候选股票数据不足，已从排名中递补:")
+        for s in skipped[:5]:  # 只显示前5条
+            print(f"    - {s}")
+        if len(skipped) > 5:
+            print(f"    ... 还有 {len(skipped) - 5} 只")
+    if valid_count < target_n:
+        print(f"  [WARN] 警告: 有效股票只有 {valid_count}/{target_n} 只，候选已用尽！")
+    print(f"  有效股票: {valid_count}/{target_n}  [递补完成]")
 
     # ═══ 加载策略插件（自动发现 backtest/*.py）═══
     print(f"\n  正在加载策略插件...")
@@ -1046,10 +1464,7 @@ def run_backtest(stocks):
                 # ═─ 回退到硬编码函数（兼容旧策略）══─
                 elif skey in strategy_funcs:
                     func = strategy_funcs[skey][0]
-                    if skey == "buy_hold":
-                        ret, trades, max_dd = func(df, capital, start_idx)
-                    else:
-                        ret, trades, max_dd = func(df, capital, scfg, start_idx)
+                    ret, trades, max_dd = func(df, capital, scfg, start_idx)
                 else:
                     print(f"  [ERR] 未找到策略: {skey}")
                     continue
@@ -1106,7 +1521,7 @@ def run_backtest(stocks):
     bh_mean = np.mean(list(bh_results.values()))
     print(f"  {'─'*90}")
     print(f"  {'买入持有(等权)':<16} {bh_mean:>+7.2f}%")
-    print(f"  {benchmark + '基准':<16} {idx_ret:>+7.2f}%")
+    print(f"  {benchmark_name + '基准':<16} {idx_ret:>+7.2f}%")
     print(f"{'='*100}\n")
 
     # ── 保存结果 ──
@@ -1125,7 +1540,7 @@ def run_backtest(stocks):
                     "最佳%": round(s["best"], 2), "最差%": round(s["worst"], 2),
                 })
         rows.append({"策略": "买入持有(等权)", "均值收益%": round(bh_mean, 2)})
-        rows.append({"策略": f"{benchmark}基准", "均值收益%": round(idx_ret, 2)})
+        rows.append({"策略": f"{benchmark_name}基准", "均值收益%": round(idx_ret, 2)})
         pd.DataFrame(rows).to_csv(
             os.path.join(OUTPUT.get("backtest_dir", os.path.join(OUTPUT["dir"], "backtest")),
                         f"backtest_{BACKTEST['start_date'][:4]}.csv"),
@@ -1157,16 +1572,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", "-s",
         type=str,
-        choices=["multi", "ml", "csv", "manual"],
+        choices=["multi", "value", "div_low_vol", "csv", "manual", "monthly_rebalance"],
         default=None,
-        help="选股策略来源: multi(多因子) / ml(机器学习) / csv(指定文件) / manual(手动列表)"
+        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓)"
     )
     parser.add_argument(
-        "--model", "-m",
-        type=str,
-        choices=["v4", "v5"],
-        default="v4",
-        help="ML模型版本: v4(默认) / v5(优化版-超参数调优+多模型对比)"
+        "--start-date", type=str, default=None,
+        help="回测开始日期 (YYYYMMDD)，覆盖 config.py 的 BACKTEST['start_date']"
+    )
+    parser.add_argument(
+        "--end-date", type=str, default=None,
+        help="回测结束日期 (YYYYMMDD)，覆盖 config.py 的 BACKTEST['end_date']"
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=None,
+        help="选股数量，覆盖 config.py 的 SELECTION['top_n']"
     )
     parser.add_argument(
         "--file", "-f",
@@ -1203,6 +1623,11 @@ if __name__ == "__main__":
         "--benchmark", type=str, default=None,
         help="基准指数代码（如 000300.SH 或 000906.SH）"
     )
+    parser.add_argument(
+        "--selection-method", type=str, default="value",
+        choices=["value", "div_low_vol"],
+        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波)"
+    )
     args = parser.parse_args()
 
     # ── 用命令行参数覆盖 config（不修改 config.py 文件）──
@@ -1214,6 +1639,18 @@ if __name__ == "__main__":
         SELECTION["stock_pool"] = args.stock_pool
     if args.benchmark is not None:
         BACKTEST["benchmark"] = args.benchmark
+    
+    # 新增：覆盖回测区间和选股数量
+    if args.start_date is not None:
+        BACKTEST["start_date"] = args.start_date
+        print(f"  [参数] 回测开始日期: {args.start_date}")
+    if args.end_date is not None:
+        BACKTEST["end_date"] = args.end_date
+        print(f"  [参数] 回测结束日期: {args.end_date}")
+    if args.top_n is not None:
+        SELECTION["top_n"] = args.top_n
+        print(f"  [参数] 选股数量: {args.top_n}")
+
 
     # 列出可用 CSV 文件
     if args.list:
@@ -1248,14 +1685,23 @@ if __name__ == "__main__":
         if args.select_only:
             # 只选股，不回测
             print(f"\n  只选股模式 (多因子)...")
-            run_selection()
+            stocks = run_selection()
+            print(f"\n{'='*60}")
+            print(f"  选股结果（共 {len(stocks)} 只）:")
+            for i, (_, row) in enumerate(stocks.iterrows(), 1):
+                print(f"    {i}. {row['code']}  {row.get('name', '')}")
             print(f"\n{'='*60}")
             sel_dir = OUTPUT.get('selection_dir', os.path.join(OUTPUT['dir'], 'selection'))
-            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"  结果已保存到 {sel_dir}/")
             print(f"{'='*60}\n")
             sys.exit(0)
         else:
-            # 自动匹配最新的 multi_*.csv（只匹配 selection/ 子目录）
+            # 如果传入了 --top-n，先重新选股（覆盖已有 CSV）
+            if args.top_n is not None:
+                print(f"\n  [参数] --top-n 已设置({args.top_n})，先重新选股...")
+                run_selection()
+            
+            # 自动匹配最新的 multi_*.csv
             results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
             os.makedirs(results_dir, exist_ok=True)
             multi_files = sorted(glob.glob(os.path.join(results_dir, "multi_*.csv")), key=os.path.getmtime, reverse=True)
@@ -1270,64 +1716,70 @@ if __name__ == "__main__":
             run_backtest(stocks)
             sys.exit(0)
 
-    elif args.source == "ml":
-        if args.model == "v5":
-            # 检查模型是否已经训练好
-            model_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "data", "models_v5_threshold_70"
-            )
-            
-            cmd = [sys.executable, "ml_stock_selector_v5.py"]
-            
-            if os.path.exists(model_dir):
-                # 模型已存在，只选股（不重新训练）
-                cmd.append("--predict-only")
-                print(f"\n  使用 ML 模型 v5 (加载已训练模型)...")
-                print(f"  模型目录: {model_dir}\n")
-            else:
-                # 模型不存在，需要训练
-                print(f"\n  使用 ML 模型 v5 (超参数调优 + 多模型对比)...")
-                print(f"  ⚠️  训练可能需要 20-30 分钟，请耐心等待...\n")
-            
-            try:
-                import subprocess
-                result = subprocess.run(
-                    cmd,
-                    cwd=os.path.dirname(os.path.abspath(__file__))
-                    # 不捕获输出，让日志实时显示
-                )
-                if result.returncode != 0:
-                    print(f"\n  [ERROR] ML 模型 v5 运行失败 (返回码: {result.returncode})")
-                    sys.exit(1)
-                print(f"\n  ✓ ML 模型 v5 完成！")
-            except Exception as e:
-                print(f"\n  [ERROR] 无法运行 ML 模型 v5: {e}")
-                sys.exit(1)
+    elif args.source == "value":
+        # 价值投资选股
+        print(f"\n  价值投资选股模式...")
+        stocks = run_value_selection()
+        if stocks is None or len(stocks) == 0:
+            print(f"\n  [ERROR] 价值投资选股失败！")
+            sys.exit(1)
         
         if args.select_only:
             # 只选股，不回测
             print(f"\n{'='*60}")
-            sel_dir = OUTPUT.get('selection_dir', os.path.join(OUTPUT['dir'], 'selection'))
-            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"  选股结果（共 {len(stocks)} 只）:")
+            for i, (_, row) in enumerate(stocks.iterrows(), 1):
+                print(f"    {i}. {row['code']}  {row.get('name', '')}")
+            print(f"\n{'='*60}")
+            print(f"  结果已保存到 data/results/value_strategy/")
             print(f"{'='*60}\n")
             sys.exit(0)
         
-        # 自动匹配最新的 ml_*.csv（只匹配 selection/ 子目录）
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection")))
-        os.makedirs(results_dir, exist_ok=True)
-        ml_files = sorted(glob.glob(os.path.join(results_dir, "ml_*.csv")), key=os.path.getmtime, reverse=True)
-        if not ml_files:
-            print(f"\n  [ERROR] 未找到 ml_*.csv 文件在 {results_dir}")
-            print(f"  请先运行机器学习选股 (ml_stock_selector_v{args.model[-1]}.py)\n")
-            sys.exit(1)
-        csv_path = ml_files[0]
-        stocks = pd.read_csv(csv_path, dtype={"code": str})
-        stocks["name"] = stocks.get("name", "")
-        print(f"\n  使用机器学习选股结果 (v{args.model[-1]}): {os.path.basename(csv_path)} ({len(stocks)} 只)")
         run_backtest(stocks)
         sys.exit(0)
-
+        
+    elif args.source == "div_low_vol":
+        # 红利低波选股
+        print(f"\n  红利低波选股模式...")
+        stocks = run_dividend_low_vol_selection()
+        if stocks is None or len(stocks) == 0:
+            print(f"\n  [ERROR] 红利低波选股失败！")
+            sys.exit(1)
+        
+        if args.select_only:
+            # 只选股，不回测
+            print(f"\n{'='*60}")
+            print(f"  选股结果（共 {len(stocks)} 只）:")
+            for i, (_, row) in enumerate(stocks.iterrows(), 1):
+                print(f"    {i}. {row['code']}  {row.get('name', '')}")
+            print(f"\n{'='*60}")
+            output_dir = DIVIDEND_LOW_VOL.get("output_dir", "data/results/dividend_low_vol")
+            print(f"  结果已保存到 {output_dir}/")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        
+        run_backtest(stocks)
+        sys.exit(0)
+        
+    elif args.source == "monthly_rebalance":
+        # 月度调仓回测（直接导入调用，避免子进程输出混乱）
+        sel_method = args.selection_method or "value"
+        method_names = {"value": "价值选股", "div_low_vol": "红利低波选股"}
+        print(f"\n  月度调仓回测模式...")
+        print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
+        print(f"  选股策略: {method_names.get(sel_method, sel_method)}")
+        print(f"  选股数量: {SELECTION.get('top_n', 5)}")
+        
+        from run_monthly_rebalance import run_backtest as run_monthly_rebalance_bt
+        print(f"  {'='*60}")
+        run_monthly_rebalance_bt(
+            start_date=BACKTEST["start_date"],
+            end_date=BACKTEST["end_date"],
+            top_n=SELECTION.get("top_n", 5),
+            selection_method=sel_method,
+        )
+        sys.exit(0)
+        
     elif args.source == "csv":
         # 自动匹配最新的选股 CSV 文件（只匹配 selection/ 子目录）
         if args.auto or not args.file:
@@ -1394,9 +1846,13 @@ if __name__ == "__main__":
         
         if args.select_only:
             # 只选股，不回测
-            sel_dir = OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection"))
             print(f"\n{'='*60}")
-            print(f"  选股完成！结果已保存到 {sel_dir}/")
+            print(f"  选股结果（共 {len(stocks)} 只）：")
+            for i, (_, row) in enumerate(stocks.iterrows(), 1):
+                print(f"    {i}. {row['code']}  {row.get('name', '')}")
+            print(f"\n{'='*60}")
+            sel_dir = OUTPUT.get("selection_dir", os.path.join(OUTPUT["dir"], "selection"))
+            print(f"  结果已保存到 {sel_dir}/")
             print(f"{'='*60}\n")
             sys.exit(0)
         

@@ -7,7 +7,26 @@
 """
 
 # ============================================================
-# 一、数据源配置
+# 一、全局配置（所有策略共享）
+# ============================================================
+
+GLOBAL = {
+    # 回测时间范围
+    "backtest_start": "20251231",
+    "backtest_end": "20260625",
+
+    # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
+    "selection_date": "20260102",
+
+    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    "stock_pool": "zz800",
+
+    # 选股数量
+    "top_n": 5,
+}
+
+# ============================================================
+# 二、数据源配置
 # ============================================================
 
 DATA = {
@@ -37,14 +56,16 @@ SELECTION = {
     #   False = 使用下面 stocks_manual 中的股票直接回测
     "enabled": True,
 
-    # 选股基准日期（YYYYMMDD，必须是交易日）
-    "date": "20220103",  # ← 2022年初第一个交易日
+    # 选股基准日期（YYYYMMDD，自动使用回测开始日的前一交易日）
+    # 【已自动计算】无需手动修改！由 run_backtest.py 在执行 run_selection() 时自动
+    # 从数据库查询 BACKTEST["start_date"] 前最近交易日并覆盖此值。
+    "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "zz500",  # ← 修改为中证500
+    "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 选股数量
-    "top_n": 20,
+    "top_n": GLOBAL["top_n"],  # ← 从GLOBAL读取
 
     # 排除ST / 停牌
     "exclude_st": True,
@@ -111,9 +132,9 @@ FACTOR_PROCESSOR = {
 
 BACKTEST = {
     
-    # 回测时间范围
-    "start_date": "20220102",
-    "end_date": "20220331",
+    # 回测时间范围（从 GLOBAL 读取）
+    "start_date": GLOBAL["backtest_start"],  # ← 从GLOBAL读取
+    "end_date": GLOBAL["backtest_end"],      # ← 从GLOBAL读取
 
     # 每只股票初始资金（元）
     "initial_capital": 100000,
@@ -158,6 +179,11 @@ STRATEGIES = {
     "buy_hold": {
         "enabled": True,
         "name": "买入持有",
+        # ATR动态止损（默认禁用，买入持有策略不建议启用止损）
+        "use_atr_stop": False,       # ← 禁用ATR动态止损（恢复纯买入持有）
+        "atr_period": 14,            # ATR计算周期
+        "atr_mult": 3.0,            # 初始止损倍数
+        "trail_mult": 3.0,           # 追踪止损倍数
     },
     "rsi": {
         "enabled": True,
@@ -166,7 +192,12 @@ STRATEGIES = {
         "oversold": 40,            # RSI < 40 超卖买入（增加交易次数）
         "overbought": 60,          # RSI > 60 超买卖出（增加交易次数）
         "take_profit": 0.50,       # 止盈 +50%
-        "stop_loss": 0.15,         # 止损 -15%
+        "stop_loss": 0.15,         # 止损 -15%（ATR启用时失效）
+        # ── ATR 动态止损（可选，默认关闭）──
+        "atr_stop_loss": True,     # True=启用ATR止损，False=使用固定stop_loss
+        "atr_period": 14,          # ATR 计算周期
+        "atr_mult": 3.0,           # 初始止损倍数
+        "trail_mult": 3.0,         # 追踪止损倍数
     },
     "macd_kdj": {
         "enabled": True,
@@ -175,14 +206,30 @@ STRATEGIES = {
         "kdj_period": 9,
         "take_profit": 0.20,
         "stop_loss": 0.10,
+        # ── ATR 动态止损（可选，默认关闭）──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
     },
-    "bollinger": {
-        "enabled": True,  # ← 启用布林带策略
-        "name": "布林带策略",
-        "period": 20,
-        "std": 2,
-        "take_profit": 0.20,
-        "stop_loss": 0.10,
+    # ── bollinger 布林带策略 ──
+    "mean_reversion": {
+        "enabled": True,
+        "name": "均值回归策略（视频版）",
+        "bb_period": 20,           # 布林带周期
+        "bb_std": 2.0,            # 布林带标准差倍数
+        "rsi_period": 14,          # RSI计算周期
+        "rsi_oversold": 30,        # RSI超卖阈值（入场）
+        "rsi_overbought": 70,      # RSI超买阈值（出场）
+        "zscore_threshold": 2.0,   # Z-Score阈值
+        "band_width_ma": 20,        # 布林带宽度MA周期（检测喇叭口）
+        "stop_loss": 0.03,         # 3%硬止损（防止均值永久下移）
+        # ── ATR 动态止损（可选，默认关闭）──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
+        "position_mode": "half",     # "half"=半仓,"full"=全仓
     },
     "turtle": {
         "enabled": False,  # ← 禁用简化版，使用完整版
@@ -251,24 +298,29 @@ STRATEGIES = {
         "rsi_center": 50,        # RSI中轴线（上穿买入，下穿卖出）
         "take_profit": 0.50,     # 止盈 +50%
         "stop_loss": 0.15,       # 止损 -15%
+        # ── ATR 动态止损（可选，默认关闭）──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
         "position_mode": "half",   # 半仓操作（50%资金）
     },
-    # ── 定投策略 ──
+    # ── 定投策略（已禁用）──
     "dca": {
-        "enabled": True,
+        "enabled": False,  # ← 已禁用（2026-06-23）
         "name": "月定投策略",
-        "amount_per_month": 5000,  # 每月定投金额（元）
-        "take_profit": 0.30,      # 止盈 +30%
-        "stop_loss": 0.20,        # 止损 -20%
-        "enable_tp_sl": True,      # 是否启用止盈止损
+        "amount_per_month": 5000,
+        "take_profit": 0.30,
+        "stop_loss": 0.20,
+        "enable_tp_sl": True,
     },
     "weekly_dca": {
-        "enabled": True,
+        "enabled": False,  # ← 已禁用（2026-06-23）
         "name": "周定投策略",
-        "shares_per_week": 100,   # 每周买入股数
-        "take_profit": 0.30,      # 止盈 +30%
-        "stop_loss": 0.10,        # 止损 -10%
-        "enable_tp_sl": True,      # 是否启用止盈止损
+        "shares_per_week": 100,
+        "take_profit": 0.30,
+        "stop_loss": 0.10,
+        "enable_tp_sl": True,
     },
     # ── 均线策略 ──
     "dual_ma": {
@@ -279,10 +331,15 @@ STRATEGIES = {
         "position_pct": 0.5,      # 单次买入仓位比例（50%）
         "take_profit": 0.30,      # 止盈 +30%
         "stop_loss": 0.10,        # 止损 -10%
+        # ── ATR 动态止损（可选，默认关闭）──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
     },
     # ── 能量指标策略 ──
     "energy": {
-        "enabled": True,
+        "enabled": False,
         "name": "能量指标策略（AR/BR/CR/VR）",
         "indicator_period": 26,     # 指标计算周期
         "buy_threshold": 100,      # 买入阈值（低于此值视为超卖）
@@ -293,7 +350,7 @@ STRATEGIES = {
     },
     # ── 动态网格策略（VR 驱动）──
     "energy_grid": {
-        "enabled": True,
+        "enabled": False,
         "name": "动态网格策略（VR驱动）",
         "grid_levels": 10,          # 网格层数
         "base_grid_pct": 0.05,    # 基础网格间距（5%）
@@ -340,13 +397,13 @@ OUTPUT = {
 
 VALUE_STRATEGY = {
     # 选股日期（格式: "YYYYMMDD"，必须是交易日）
-    "date": "20260102",  # 2026年第一个交易日
+    "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
 
     # 财务数据报告期（格式: "YYYYMMDD"，如 "20260331" 表示2026年一季报）
     "report_date": "20260331",  # 最新报告期（数据库已更新到2026-03-31）
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "zz800",
+    "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 市值阈值（分位数，0.5 = 中位数）
     "market_cap_quantile": 0.5,
@@ -369,9 +426,42 @@ VALUE_STRATEGY = {
     "eps_max": 0,
 
     # 选股数量（0 = 不限制，按条件筛选）
-    "top_n": 0,
+    "top_n": GLOBAL["top_n"],  # ← 从GLOBAL读取
 
     # 输出配置
     "output_dir": "data/results/value_strategy",
     "output_file": "value_selection_{date}.csv",
+}
+
+# ============================================================
+# 十、红利低波策略配置
+# ============================================================
+
+DIVIDEND_LOW_VOL = {
+    # 选股日期（格式: "YYYYMMDD"，必须是交易日）
+    # 【自动计算】由 run_backtest.py 在执行时自动设为回测开始日前一交易日
+    "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
+
+    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
+
+    # 选股数量（0 = 按条件筛选，不限制数量）
+    "top_n": GLOBAL["top_n"],  # ← 从GLOBAL读取
+
+    # ── 因子阈值 ──
+    "dividend_yield_min": 0.0,  # 股息率下限（dv_ttm，0=不限制）
+    "pe_min": 0,                   # PE_TTM 下限
+    "pe_max": 50,                  # PE_TTM 上限
+    "pb_min": 0,                   # PB 下限
+    "pb_max": 10,                  # PB 上限
+
+    # ── 波动率计算 ──
+    "volatility_window": 120,       # 波动率计算窗口（交易日）
+
+    # ── MACD 过滤 ──
+    "macd_filter": True,            # 是否启用个GU MACD金叉过滤
+
+    # ── 输出配置 ──
+    "output_dir": "data/results/dividend_low_vol",
+    "output_file": "dividend_low_vol_{date}.csv",
 }

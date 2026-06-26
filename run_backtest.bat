@@ -1,96 +1,281 @@
 @echo off
-chcp 65001 >nul
 cd /d C:\Users\99395\WorkBuddy\multi_factor_selection
 
-REM â”€â”€ æœ‰å‘½ä»¤è¡Œå‚æ•° â†’ ç›´æŽ¥é€ä¼  â”€â”€
-if not "%*"=="" (
-    "venv_ml\Scripts\python.exe" run_backtest.py %*
-    goto :eof
+REM ================================
+REM  ¼ÓÔØ³Ö¾Ã»¯ÅäÖÃ£¨user_config.bat£©
+REM ================================
+if exist user_config.bat (
+    call user_config.bat
 )
+
+REM Èç¹û³Ö¾Ã»¯ÅäÖÃÎ´¶¨Òå£¬Ê¹ÓÃÄ¬ÈÏÖµ
+if not defined P_BACKTEST_START set P_BACKTEST_START=20200102
+if not defined P_BACKTEST_END set P_BACKTEST_END=20211231
+if not defined P_TOP_N set P_TOP_N=5
+if not defined P_SELECTION_METHOD set P_SELECTION_METHOD=multi
+if not defined P_STOCK_POOL set P_STOCK_POOL=all
+
+REM Ó¦ÓÃµ½»á»°±äÁ¿
+set BACKTEST_START=%P_BACKTEST_START%
+set BACKTEST_END=%P_BACKTEST_END%
+set TOP_N=%P_TOP_N%
+set SELECTION_METHOD=%P_SELECTION_METHOD%
+
+REM ================================
+REM  ±£´æ³Ö¾Ã»¯ÅäÖÃµ½ user_config.bat
+REM  £¨×Ó³ÌÐò£¬ÓÃ call :save_config µ÷ÓÃ£©
+REM ================================
+goto :menu_start
+
+:save_config
+(
+echo set P_BACKTEST_START=%BACKTEST_START%
+echo set P_BACKTEST_END=%BACKTEST_END%
+echo set P_TOP_N=%TOP_N%
+echo set P_SELECTION_METHOD=%SELECTION_METHOD%
+) > user_config.bat
+goto :eof
+
+REM ================================
+REM  ¶àÒò×ÓÑ¡¹É + »Ø²âÏµÍ³ - ½»»¥Ê½²Ëµ¥
+REM ================================
+:menu_start
 
 :menu
 cls
 echo.
-echo ============================================
-echo   Multi-Factor Stock Selection + Backtest
-echo ============================================
+echo ================
+echo   ¶àÒò×ÓÑ¡¹É + »Ø²âÏµÍ³
+echo ================
 echo.
-echo   Select mode:
+echo   µ±Ç°ÅäÖÃ:
+echo   ----------------
+echo   »Ø²âÇø¼ä: %BACKTEST_START% ~ %BACKTEST_END%
+echo   Ñ¡¹ÉÊýÁ¿: %TOP_N% Ö»
+echo   Ñ¡¹É²ßÂÔ: %SELECTION_METHOD%
+echo   ¹ÉÆ±³Ø: %STOCK_POOL%
 echo.
-echo   [1] Multi-factor selection + backtest (--source multi)
-echo   [2] ML selection + backtest (--source ml)
-echo   [3] List all CSV files
-echo   [4] Use config.py default
-echo   [5] Backtest only (use latest selection result)
-echo   [6] Select only (no backtest)
-echo   [7] Quit
+echo   ================
+echo   Ö÷²Ëµ¥:
+echo   ================
 echo.
-set /p CHOICE=Select (1-7): 
+echo   [1] ÔËÐÐÑ¡¹É + »Ø²â£¨Ê¹ÓÃµ±Ç°ÅäÖÃ£©
+echo   [2] ÉèÖÃ»Ø²âÇø¼ä
+echo   [3] ÉèÖÃÑ¡¹ÉÊýÁ¿
+echo   [4] Ñ¡ÔñÑ¡¹É²ßÂÔ
+echo   [5] ÉèÖÃ¹ÉÆ±³Ø
+echo   [6] ½öÑ¡¹É£¨²»»Ø²â£©
+echo   [7] ½ö»Ø²â£¨Ê¹ÓÃ×îÐÂÑ¡¹É½á¹û£©
+echo   [8] ÔÂ¶Èµ÷²Ö»Ø²â
+echo   [9] ÍË³ö
+echo.
+set /p CHOICE=ÇëÑ¡Ôñ (1-9):
 echo.
 
-if "%CHOICE%"=="1" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --source multi
-    echo.
+if "%CHOICE%"=="1" goto :run_all
+if "%CHOICE%"=="2" goto :set_date
+if "%CHOICE%"=="3" goto :set_top_n
+if "%CHOICE%"=="4" goto :set_method
+if "%CHOICE%"=="5" goto :set_stock_pool
+if "%CHOICE%"=="6" goto :select_only
+if "%CHOICE%"=="7" goto :backtest_only
+if "%CHOICE%"=="8" goto :monthly_rebalance
+if "%CHOICE%"=="9" goto :eof
+goto :menu
+
+:set_date
+cls
+echo.
+echo ================
+echo   ÉèÖÃ»Ø²âÇø¼ä
+echo ================
+echo.
+echo   µ±Ç°: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+set /p BACKTEST_START=  »Ø²â¿ªÊ¼ÈÕÆÚ (YYYYMMDD, Èç 20260102):
+set /p BACKTEST_END=  »Ø²â½áÊøÈÕÆÚ (YYYYMMDD, Èç 20260618):
+echo.
+echo   [OK] ÒÑ¸üÐÂ: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+REM Í¬²½Ð´Èë config.py GLOBAL ÅäÖÃ
+venv_ml\Scripts\python.exe update_dates.py %BACKTEST_START% %BACKTEST_END%
+if errorlevel 1 (
+    echo   [´íÎó] ¸üÐÂ config.py Ê§°Ü£¡
     pause
-    goto :menu
-) else if "%CHOICE%"=="2" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --source ml
-    echo.
+)
+call :save_config
+goto :menu
+
+:set_top_n
+cls
+echo.
+echo ================
+echo   ÉèÖÃÑ¡¹ÉÊýÁ¿
+echo ================
+echo.
+echo   µ±Ç°: %TOP_N% Ö»
+echo.
+set /p TOP_N=  Ñ¡¹ÉÊýÁ¿ (Èç 5, 10, 20):
+echo.
+echo   [OK] ÒÑ¸üÐÂ: %TOP_N% Ö»
+echo.
+REM Í¬²½Ð´Èë config.py£¨Ê¹ÓÃ×¨ÓÃ½Å±¾£¬È·±£ÕýÈ·ÐÔ£©
+venv_ml\Scripts\python.exe update_top_n.py %TOP_N%
+if errorlevel 1 (
+    echo   [´íÎó] ¸üÐÂ config.py Ê§°Ü£¡
     pause
-    goto :menu
-) else if "%CHOICE%"=="3" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --list
-    echo.
-    pause
-    goto :menu
-) else if "%CHOICE%"=="4" (
-    "venv_ml\Scripts\python.exe" run_backtest.py
-    echo.
-    pause
-    goto :menu
-) else if "%CHOICE%"=="5" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --source csv --auto
-    echo.
-    pause
-    goto :menu
-) else if "%CHOICE%"=="6" (
-    goto :select_only
-) else if "%CHOICE%"=="7" (
-    goto :eof
-) else (
-    echo Invalid choice, please select 1-7.
-    pause
+)
+call :save_config
+goto :menu
+
+:set_method
+cls
+echo.
+echo ================
+echo   Ñ¡ÔñÑ¡¹É²ßÂÔ
+echo ================
+echo.
+echo   [1] ¶àÒò×ÓÑ¡¹É£¨¼¼Êõ+»ù±¾ÃæÒò×Ó£©
+echo   [2] ¼ÛÖµÍ¶×ÊÑ¡¹É£¨¼ÛÖµÍ¶×ÊÁ¿»¯²ßÂÔ£©
+echo   [3] ºìÀûµÍ²¨Ñ¡¹É£¨¸ß¹ÉÏ¢ÂÊ+µÍ²¨¶¯ÂÊ£©
+echo.
+set /p METHOD_CHOICE=ÇëÑ¡Ôñ (1-3):
+echo.
+
+if "%METHOD_CHOICE%"=="1" (
+    set SELECTION_METHOD=multi
+    echo   [OK] ÒÑÑ¡Ôñ: ¶àÒò×ÓÑ¡¹É
+    call :save_config
     goto :menu
 )
+if "%METHOD_CHOICE%"=="2" (
+    set SELECTION_METHOD=value
+    echo   [OK] ÒÑÑ¡Ôñ: ¼ÛÖµÍ¶×ÊÑ¡¹É
+    call :save_config
+    goto :menu
+)
+if "%METHOD_CHOICE%"=="3" (
+    set SELECTION_METHOD=div_low_vol
+    echo   [OK] ÒÑÑ¡Ôñ: ºìÀûµÍ²¨Ñ¡¹É
+    call :save_config
+    goto :menu
+)
+goto :set_method
+
+:run_all
+cls
+echo.
+echo ================
+echo   ÔËÐÐÑ¡¹É + »Ø²â
+echo ================
+echo.
+echo   ÅäÖÃ:
+echo     »Ø²âÇø¼ä: %BACKTEST_START% ~ %BACKTEST_END%
+echo     Ñ¡¹ÉÊýÁ¿: %TOP_N% Ö»
+echo     Ñ¡¹É²ßÂÔ: %SELECTION_METHOD%
+echo.
+"venv_ml\Scripts\python.exe" run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N%
+echo.
+pause
+goto :menu
 
 :select_only
 cls
 echo.
-echo   Select only mode - choose method:
+echo ================
+echo   ½öÑ¡¹É£¨²»»Ø²â£©
+echo ================
 echo.
-echo   [1] Multi-factor selection
-echo   [2] Machine Learning selection
-echo   [3] Back to main menu
+echo   ÅäÖÃ:
+echo     Ñ¡¹É²ßÂÔ: %SELECTION_METHOD%
+echo     Ñ¡¹ÉÊýÁ¿: %TOP_N% Ö»
+echo     ¹ÉÆ±³Ø: %STOCK_POOL%
 echo.
-set /p SUBCHOICE=Select (1-3): 
+"venv_ml\Scripts\python.exe" run_backtest.py --source %SELECTION_METHOD% --select-only --top-n %TOP_N% --stock-pool %STOCK_POOL%
 echo.
+pause
+goto :menu
 
-if "%SUBCHOICE%"=="1" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --source multi --select-only
+:backtest_only
+cls
+echo.
+echo ================
+echo   ½ö»Ø²â£¨Ê¹ÓÃ×îÐÂÑ¡¹É½á¹û£©
+echo ================
+echo.
+echo   ÅäÖÃ:
+echo     »Ø²âÇø¼ä: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+"venv_ml\Scripts\python.exe" run_backtest.py --source csv --auto --start-date %BACKTEST_START% --end-date %BACKTEST_END%
+echo.
+pause
+goto :menu
+
+:monthly_rebalance
+cls
+echo.
+echo ================
+echo   ÔÂ¶Èµ÷²Ö»Ø²â
+echo ================
+echo.
+echo   ÇëÑ¡Ôñµ÷²ÖÊ±µÄÑ¡¹É²ßÂÔ:
+echo   ----------------
+echo   [1] ¼ÛÖµÑ¡¹É£¨PBÆÆ¾»+ROEÖÊÁ¿£©
+echo   [2] ºìÀûµÍ²¨Ñ¡¹É£¨¸ß¹ÉÏ¢+µÍ²¨¶¯£©
+echo.
+set /p MR_METHOD=ÇëÑ¡Ôñ (1-2, Ä¬ÈÏ1):
+
+if "%MR_METHOD%"=="2" (
+    set MR_ARG=--selection-method div_low_vol
     echo.
-    pause
-    goto :menu
-) else if "%SUBCHOICE%"=="2" (
-    "venv_ml\Scripts\python.exe" run_backtest.py --source ml --select-only
-    echo.
-    pause
-    goto :menu
-) else if "%SUBCHOICE%"=="3" (
-    goto :menu
+    echo   ÒÑÑ¡Ôñ: ºìÀûµÍ²¨Ñ¡¹É
 ) else (
-    echo Invalid choice.
-    pause
-    goto :select_only
+    set MR_ARG=--selection-method value
+    echo.
+    echo   ÒÑÑ¡Ôñ: ¼ÛÖµÑ¡¹É
 )
+echo.
+echo   ÅäÖÃ:
+echo     »Ø²âÇø¼ä: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+"venv_ml\Scripts\python.exe" run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% %MR_ARG%
+echo.
+pause
+goto :menu
+
+:set_stock_pool
+cls
+echo.
+echo ===============
+echo   ÉèÖÃ¹ÉÆ±³Ø
+echo ===============
+echo.
+echo   µ±Ç°: %STOCK_POOL%
+echo.
+echo   [1] »¦Éî300 (hs300)
+echo   [2] ÖÐÖ¤500 (zz500)
+echo   [3] ÖÐÖ¤800 (zz800)
+echo   [4] ÖÐÖ¤1000 (zz1000)
+echo   [5] È«A¹É (all)
+echo.
+set /p SP_CHOICE=ÇëÑ¡Ôñ (1-5, Ä¬ÈÏ5):
+echo.
+if "%SP_CHOICE%"=="1" set STOCK_POOL=hs300
+if "%SP_CHOICE%"=="2" set STOCK_POOL=zz500
+if "%SP_CHOICE%"=="3" set STOCK_POOL=zz800
+if "%SP_CHOICE%"=="4" set STOCK_POOL=zz1000
+if "%SP_CHOICE%"=="5" set STOCK_POOL=all
+if "%SP_CHOICE%"=="" set STOCK_POOL=all
+echo   [OK] ÒÑÉèÖÃ¹ÉÆ±³Ø: %STOCK_POOL%
+echo.
+REM Í¬²½µ½ config.py
+venv_ml\Scripts\python.exe update_stock_pool.py %STOCK_POOL%
+call :save_config
+pause
+goto :menu
 
 :eof
+cls
+echo.
+echo   ÔÙ¼û£¡
+echo.

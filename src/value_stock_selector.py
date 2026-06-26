@@ -51,7 +51,73 @@ class ValueStockSelector:
             logger.info(f"  Free cash flow: require {self.free_cash_flow_years} consecutive years > 0")
         else:
             logger.info(f"  Free cash flow check: DISABLED")
+
+        # 成分股缓存
+        self._hs300_cache = None
+        self._zz500_cache = None
+        self._zz800_cache = None
+        self._zz1000_cache = None
     
+    # ------------------------------------------------------------------ #
+    #  成分股查询（直接从本地数据库，不依赖 data_fetcher）
+    # ------------------------------------------------------------------ #
+    def _get_conn(self):
+        return sqlite3.connect(self.data_fetcher.local_db_path)
+
+    def _get_hs300_constituents(self) -> set:
+        """获取沪深300成分股（缓存），返回6位代码集合"""
+        if self._hs300_cache is not None:
+            return self._hs300_cache
+        conn = self._get_conn()
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000300.SH'",
+            conn,
+        )
+        conn.close()
+        # 去掉交易所后缀，只保留6位代码
+        self._hs300_cache = set(df["ts_code"].str[:6].tolist()) if len(df) > 0 else set()
+        return self._hs300_cache
+
+    def _get_zz500_constituents(self) -> set:
+        """获取中证500成分股（缓存），返回6位代码集合"""
+        if self._zz500_cache is not None:
+            return self._zz500_cache
+        conn = self._get_conn()
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000905.SH'",
+            conn,
+        )
+        conn.close()
+        self._zz500_cache = set(df["ts_code"].str[:6].tolist()) if len(df) > 0 else set()
+        return self._zz500_cache
+
+    def _get_zz800_constituents(self) -> set:
+        """获取中证800成分股（缓存），返回6位代码集合"""
+        if self._zz800_cache is not None:
+            return self._zz800_cache
+        conn = self._get_conn()
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000906.SH'",
+            conn,
+        )
+        conn.close()
+        self._zz800_cache = set(df["ts_code"].str[:6].tolist()) if len(df) > 0 else set()
+        return self._zz800_cache
+
+    def _get_zz1000_constituents(self) -> set:
+        """获取中证1000成分股（缓存），返回6位代码集合"""
+        if self._zz1000_cache is not None:
+            return self._zz1000_cache
+        conn = self._get_conn()
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000852.SH'",
+            conn,
+        )
+        conn.close()
+        self._zz1000_cache = set(df["ts_code"].str[:6].tolist()) if len(df) > 0 else set()
+        logger.info(f"  [中证1000] 获取到 {len(self._zz1000_cache)} 只成分股")
+        return self._zz1000_cache
+
     def get_market_benchmarks(self, date: str) -> Dict[str, float]:
         """
         获取全A股市场基准值（中位数/平均值）
@@ -327,174 +393,173 @@ class ValueStockSelector:
             return df
         
         logger.info(f"\n[条件7] 股价 > 60日均线...")
-        
-        conn = self.data_fetcher.conn
+
         passed_codes = []
-        
-        for _, row in df.iterrows():
-            ts_code = row['ts_code']
-            
-            # 获取过去60个交易日的收盘价
-            df_prices = pd.read_sql_query("""
-                SELECT trade_date, close
-                FROM daily
-                WHERE ts_code = ? AND trade_date <= ?
-                ORDER BY trade_date DESC
-                LIMIT 60
-            """, conn, params=(ts_code, trade_date))
-            
-            if len(df_prices) < 60:
-                continue  # 数据不足60天，跳过
-            
-            # 计算60日均线（简单平均）
-            ma60 = df_prices['close'].mean()
-            
-            # 获取最新收盘价（trade_date）
-            latest_price = pd.read_sql_query("""
-                SELECT close
-                FROM daily
-                WHERE ts_code = ? AND trade_date = ?
-            """, conn, params=(ts_code, trade_date))
-            
-            if len(latest_price) == 0:
-                continue  # 无数据
-            
-            close = latest_price.iloc[0]['close']
-            
-            # 判断：收盘价 > 60日均线
-            if close > ma60:
-                passed_codes.append(ts_code)
-        
+
+        with sqlite3.connect(self.data_fetcher.local_db_path) as conn:
+            for _, row in df.iterrows():
+                ts_code = row['ts_code']
+
+                # 获取过去60个交易日的收盘价
+                df_prices = pd.read_sql_query("""
+                    SELECT trade_date, close
+                    FROM daily
+                    WHERE ts_code = ? AND trade_date <= ?
+                    ORDER BY trade_date DESC
+                    LIMIT 60
+                """, conn, params=(ts_code, trade_date))
+
+                if len(df_prices) < 60:
+                    continue  # 数据不足60天，跳过
+
+                # 计算60日均线（简单平均）
+                ma60 = df_prices['close'].mean()
+
+                # 获取最新收盘价（trade_date）
+                latest_price = pd.read_sql_query("""
+                    SELECT close
+                    FROM daily
+                    WHERE ts_code = ? AND trade_date = ?
+                """, conn, params=(ts_code, trade_date))
+
+                if len(latest_price) == 0:
+                    continue  # 无数据
+
+                close = latest_price.iloc[0]['close']
+
+                # 判断：收盘价 > 60日均线
+                if close > ma60:
+                    passed_codes.append(ts_code)
+
         result = df[df['ts_code'].isin(passed_codes)].copy()
         logger.info(f"  条件: close > MA60")
         logger.info(f"  通过: {len(result)} / {len(df)} ({len(result)/len(df)*100:.1f}%)")
-        
+
         return result
-    
+
     def _filter_by_momentum(self, df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
         """
         过滤：买入前1个月涨幅 > -5%（不在自由落体）
-        
+
         Args:
             df: 候选股票DataFrame
             trade_date: 交易日期
-            
+
         Returns:
             过滤后的DataFrame
         """
         if len(df) == 0:
             return df
-        
+
         logger.info(f"\n[条件8] 买入前1个月涨幅 > -5%...")
-        
-        conn = self.data_fetcher.conn
-        passed_codes = []
-        
-        # 获取 trade_date 前20个交易日的日期
-        df_dates = pd.read_sql_query("""
-            SELECT DISTINCT trade_date
-            FROM daily
-            WHERE trade_date <= ?
-            ORDER BY trade_date DESC
-            LIMIT 21
-        """, conn, params=(trade_date,))
-        
-        if len(df_dates) < 21:
-            logger.warning("  数据不足，跳过此条件")
-            return df
-        
-        # 当前日期
-        current_date = df_dates.iloc[0]['trade_date']
-        # 前20个交易日（约1个月）
-        prev_date = df_dates.iloc[20]['trade_date']
-        
-        for _, row in df.iterrows():
-            ts_code = row['ts_code']
-            
-            # 获取当前价格和1个月前价格
-            df_prices = pd.read_sql_query("""
-                SELECT trade_date, close
+
+        with sqlite3.connect(self.data_fetcher.local_db_path) as conn:
+            # 获取 trade_date 前20个交易日的日期
+            df_dates = pd.read_sql_query("""
+                SELECT DISTINCT trade_date
                 FROM daily
-                WHERE ts_code = ? AND trade_date IN (?, ?)
-                ORDER BY trade_date
-            """, conn, params=(ts_code, prev_date, current_date))
-            
-            if len(df_prices) < 2:
-                continue  # 数据不足
-            
-            price_prev = df_prices.iloc[0]['close']
-            price_curr = df_prices.iloc[1]['close']
-            
-            # 计算涨幅
-            gain_1m = (price_curr - price_prev) / price_prev
-            
-            # 判断：涨幅 > -5%
-            if gain_1m > -0.05:
-                passed_codes.append(ts_code)
-        
+                WHERE trade_date <= ?
+                ORDER BY trade_date DESC
+                LIMIT 21
+            """, conn, params=(trade_date,))
+
+            if len(df_dates) < 21:
+                logger.warning("  数据不足，跳过此条件")
+                return df
+
+            # 当前日期
+            current_date = df_dates.iloc[0]['trade_date']
+            # 前20个交易日（约1个月）
+            prev_date = df_dates.iloc[20]['trade_date']
+
+            passed_codes = []
+            for _, row in df.iterrows():
+                ts_code = row['ts_code']
+
+                # 获取当前价格和1个月前价格
+                df_prices = pd.read_sql_query("""
+                    SELECT trade_date, close
+                    FROM daily
+                    WHERE ts_code = ? AND trade_date IN (?, ?)
+                    ORDER BY trade_date
+                """, conn, params=(ts_code, prev_date, current_date))
+
+                if len(df_prices) < 2:
+                    continue  # 数据不足
+
+                price_prev = df_prices.iloc[0]['close']
+                price_curr = df_prices.iloc[1]['close']
+
+                # 计算涨幅
+                gain_1m = (price_curr - price_prev) / price_prev
+
+                # 判断：涨幅 > -5%
+                if gain_1m > -0.05:
+                    passed_codes.append(ts_code)
+
         result = df[df['ts_code'].isin(passed_codes)].copy()
         logger.info(f"  条件: 1个月涨幅 > -5%")
         logger.info(f"  通过: {len(result)} / {len(df)} ({len(result)/len(df)*100:.1f}%)")
-        
+
         return result
-    
+
     def _filter_by_volume(self, df: pd.DataFrame, trade_date: str) -> pd.DataFrame:
         """
         过滤：最近成交量 > 60日平均成交量（有资金关注）
-        
+
         Args:
             df: 候选股票DataFrame
             trade_date: 交易日期
-            
+
         Returns:
             过滤后的DataFrame
         """
         if len(df) == 0:
             return df
-        
+
         logger.info(f"\n[条件9] 最近成交量 > 60日平均...")
-        
-        conn = self.data_fetcher.conn
+
         passed_codes = []
-        
-        for _, row in df.iterrows():
-            ts_code = row['ts_code']
-            
-            # 获取过去60个交易日的成交量
-            df_vol = pd.read_sql_query("""
-                SELECT trade_date, vol
-                FROM daily
-                WHERE ts_code = ? AND trade_date <= ?
-                ORDER BY trade_date DESC
-                LIMIT 60
-            """, conn, params=(ts_code, trade_date))
-            
-            if len(df_vol) < 60:
-                continue  # 数据不足60天，跳过
-            
-            # 计算60日平均成交量
-            vol_avg_60 = df_vol['vol'].mean()
-            
-            # 获取最新成交量（trade_date）
-            latest_vol = pd.read_sql_query("""
-                SELECT vol
-                FROM daily
-                WHERE ts_code = ? AND trade_date = ?
-            """, conn, params=(ts_code, trade_date))
-            
-            if len(latest_vol) == 0:
-                continue  # 无数据
-            
-            vol_latest = latest_vol.iloc[0]['vol']
-            
-            # 判断：最新成交量 > 60日平均
-            if vol_latest > vol_avg_60:
-                passed_codes.append(ts_code)
-        
+
+        with sqlite3.connect(self.data_fetcher.local_db_path) as conn:
+            for _, row in df.iterrows():
+                ts_code = row['ts_code']
+
+                # 获取过去60个交易日的成交量
+                df_vol = pd.read_sql_query("""
+                    SELECT trade_date, vol
+                    FROM daily
+                    WHERE ts_code = ? AND trade_date <= ?
+                    ORDER BY trade_date DESC
+                    LIMIT 60
+                """, conn, params=(ts_code, trade_date))
+
+                if len(df_vol) < 60:
+                    continue  # 数据不足60天，跳过
+
+                # 计算60日平均成交量
+                vol_avg_60 = df_vol['vol'].mean()
+
+                # 获取最新成交量（trade_date）
+                latest_vol = pd.read_sql_query("""
+                    SELECT vol
+                    FROM daily
+                    WHERE ts_code = ? AND trade_date = ?
+                """, conn, params=(ts_code, trade_date))
+
+                if len(latest_vol) == 0:
+                    continue  # 无数据
+
+                vol_latest = latest_vol.iloc[0]['vol']
+
+                # 判断：最新成交量 > 60日平均
+                if vol_latest > vol_avg_60:
+                    passed_codes.append(ts_code)
+
         result = df[df['ts_code'].isin(passed_codes)].copy()
         logger.info(f"  条件: 最新成交量 > 60日平均")
         logger.info(f"  通过: {len(result)} / {len(df)} ({len(result)/len(df)*100:.1f}%)")
-        
+
         return result
     
     def select_stocks(self, date: str = None, 
@@ -521,14 +586,39 @@ class ValueStockSelector:
         logger.info(f"选股数量: {top_n if top_n > 0 else '不限制 (按条件筛选)'}")
         logger.info("=" * 60 + "\n")
         
-        # ===== Step 1: 获取股票池（HS300成分股）=====
+        # ===== Step 1: 获取股票池 =====
+        logger.info("[Step 1] 获取股票池...")
+        # ===== Step 1: 获取股票池（直接从本地数据库，不依赖 data_fetcher）=====
         logger.info("[Step 1] 获取股票池...")
         if self.stock_pool == "hs300":
-            stock_pool_df = self.data_fetcher.get_hs300_components(date=date)
+            constituents = self._get_hs300_constituents()
+            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
+            logger.info(f"  [沪深300] 获取到 {len(stock_pool_df)} 只成分股")
         elif self.stock_pool == "zz500":
-            stock_pool_df = self.data_fetcher.get_zz500_components(date=date)
+            constituents = self._get_zz500_constituents()
+            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
+            logger.info(f"  [中证500] 获取到 {len(stock_pool_df)} 只成分股")
         elif self.stock_pool == "zz800":
-            stock_pool_df = self.data_fetcher.get_zz800_components(date=date)
+            constituents = self._get_zz800_constituents()
+            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
+            logger.info(f"  [中证800] 获取到 {len(stock_pool_df)} 只成分股")
+        elif self.stock_pool == "zz1000":
+            constituents = self._get_zz1000_constituents()
+            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
+            logger.info(f"  [中证1000] 获取到 {len(stock_pool_df)} 只成分股")
+        elif self.stock_pool == "all":
+            # 全A股模式：从数据库 stock_basic 表获取所有A股
+            import sqlite3
+            conn = sqlite3.connect(self.data_fetcher.local_db_path)
+            stock_pool_df = pd.read_sql_query(
+                "SELECT ts_code, name FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' ORDER BY ts_code",
+                conn,
+            )
+            conn.close()
+            # 提取6位代码（去掉交易所后缀 .SZ/.SH/.BJ）
+            stock_pool_df['code'] = stock_pool_df['ts_code'].str.extract(r'(\d{6})', expand=False)
+            stock_pool_df = stock_pool_df[['code', 'name']].dropna(subset=['code'])
+            logger.info(f"  [全A股] 获取到 {len(stock_pool_df)} 只股票")
         else:
             logger.error(f"未知的股票池: {self.stock_pool}")
             return pd.DataFrame()
@@ -565,7 +655,24 @@ class ValueStockSelector:
         logger.info("\n" + "=" * 60)
         logger.info(f"[选股完成] 共找到 {len(selected_df)} 只符合条件的股票")
         logger.info("=" * 60 + "\n")
-        
+
+        # 统一列名：确保 code 列为6位数字格式（与 dividend_low_vol_selector.py 一致）
+        if "ts_code" in selected_df.columns and "code" not in selected_df.columns:
+            selected_df["code"] = selected_df["ts_code"].str.extract(r"(\d{6})", expand=False)
+
+        # 补全 name 列（与 dividend_low_vol_selector 行为一致）
+        if "name" not in selected_df.columns and "ts_code" in selected_df.columns:
+            import sqlite3
+            name_map = {}
+            with sqlite3.connect(self.data_fetcher.local_db_path) as conn:
+                for ts_code in selected_df["ts_code"].unique():
+                    r = pd.read_sql_query(
+                        "SELECT name FROM stock_basic WHERE ts_code = ? LIMIT 1",
+                        conn, params=(ts_code,),
+                    )
+                    name_map[ts_code] = r.iloc[0, 0] if len(r) > 0 else ts_code
+            selected_df["name"] = selected_df["ts_code"].map(name_map)
+
         return selected_df
     
     def export_to_csv(self, df: pd.DataFrame, 
