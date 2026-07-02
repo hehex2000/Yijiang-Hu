@@ -12,8 +12,8 @@
 
 GLOBAL = {
     # 回测时间范围
-    "backtest_start": "20230102",
-    "backtest_end": "20231231",
+    "backtest_start": "20220102",
+    "backtest_end": "20221231",
 
     # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
     "selection_date": "20260102",
@@ -137,7 +137,8 @@ BACKTEST = {
     "end_date": GLOBAL["backtest_end"],      # ← 从GLOBAL读取
 
     # 每只股票初始资金（元）
-    "initial_capital": 100000,
+    # 总资金 = initial_capital × 股票只数
+    "initial_capital": 20000,
 
     # 基准指数（用于对比）
     "benchmark": "000906.SH",  # ← 中证800指数
