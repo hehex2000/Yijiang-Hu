@@ -75,9 +75,31 @@ def get_etf_price(ts_code, trade_date, scaled=True):
 def get_etf_open(ts_code, trade_date, scaled=True):
     """获取指数模拟ETF开盘价
 
-    指数没有真正的开盘价概念，用前一日收盘价代替（与网格策略一致）。
+    从 index_daily 表查询开盘价。
+    fallback: 若当天无开盘价，用前一日收盘价代替。
     """
-    return get_etf_price(ts_code, trade_date, scaled=scaled)
+    conn = get_conn()
+    # 优先取当日开盘价
+    row = pd.read_sql_query(
+        "SELECT open FROM index_daily WHERE ts_code = ? AND trade_date = ?",
+        conn, params=(ts_code, trade_date)
+    )
+    if len(row) > 0 and row.iloc[0]["open"] is not None:
+        conn.close()
+        price = float(row.iloc[0]["open"])
+        return price * PRICE_SCALE if scaled else price
+
+    # fallback: 前一日收盘价
+    row2 = pd.read_sql_query(
+        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date < ? "
+        "ORDER BY trade_date DESC LIMIT 1",
+        conn, params=(ts_code, trade_date)
+    )
+    conn.close()
+    if len(row2) > 0:
+        price = float(row2.iloc[0]["close"])
+        return price * PRICE_SCALE if scaled else price
+    return None
 
 
 # ── ETF 费用计算（免印花税）────────────────────────────────
@@ -185,15 +207,15 @@ def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
             score = roc_val
 
         elif method == "dual":
-            roc20 = calc_roc(code, trade_date, 20)
-            roc60 = calc_roc(code, trade_date, 60)
-            vol = calc_volatility(code, trade_date, 20)
-            if roc20 is None or roc60 is None or vol is None:
+            roc_short = calc_roc(code, trade_date, roc_period)
+            roc_long = calc_roc(code, trade_date, roc_period * 3)
+            vol = calc_volatility(code, trade_date, roc_period)
+            if roc_short is None or roc_long is None or vol is None:
                 continue
             # MA60 过滤：跌破MA60的不参与排名
             if ma60 is not None and close_price < ma60:
                 continue
-            score = roc20 * 0.5 + roc60 * 0.3 - vol * 0.2
+            score = roc_short * 0.5 + roc_long * 0.3 - vol * 0.2
 
         elif method == "ma_filter":
             roc_val = calc_roc(code, trade_date, roc_period)
@@ -295,15 +317,7 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         # 前一天日期
         prev_td = int(trade_dates[i - 1]) if i > 0 else td
 
-        # ── 每日市值记录（用于计算回撤） ──
-        total_value = cash
-        for code, pos in list(positions.items()):
-            price = get_etf_price(code, td)
-            if price is not None:
-                total_value += pos["shares"] * price
-        daily_vals.append({"date": td, "value": total_value})
-
-        # ── 调仓日：执行轮动 ──
+        # ── 调仓日：执行轮动（先调仓，再记录净值）──
         if td in rebalance_dates:
             # 用前一天收盘价打分
             scored = score_assets(prev_td, method=method,
@@ -317,7 +331,6 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
 
             # 获取目标代码集合
             target_codes = {c for c, _, _ in targets}
-            current_codes = set(positions.keys())
 
             # ── 卖出不在目标中的旧持仓（按开盘价） ──
             for code in list(positions.keys()):
@@ -369,6 +382,14 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                                 print(f"    → 买入 {name}：{max_shares}份 @ {open_price:.3f}")
 
             # 如果 targets 为空，全部转现金（已实现：现金自然保留）
+
+        # ── 每日市值记录（调仓后，反映当日实际持仓的收盘价）──
+        total_value = cash
+        for code, pos in list(positions.items()):
+            price = get_etf_price(code, td)
+            if price is not None:
+                total_value += pos["shares"] * price
+        daily_vals.append({"date": td, "value": total_value})
 
     # ── 回测结束：平仓 ──
     if trade_dates:
