@@ -352,8 +352,10 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"\n{'='*70}")
     print(f"  📈 最终汇总")
     print(f"{'='*70}")
+    profit_amount = final_value - INIT_CAPITAL * top_n
     print(f"  初始资金: {INIT_CAPITAL * top_n:>10,.2f}")
     print(f"  最终资产: {final_value:>10,.2f}")
+    print(f"  总盈亏: {profit_amount:>+10,.2f} 元")
     print(f"  总收益率: {total_return:>+9.2f}%")
     print(f"  年化收益率: {annual_return:>+9.2f}%")
     print(f"  基准收益: {b_total_ret:>+9.2f}%")

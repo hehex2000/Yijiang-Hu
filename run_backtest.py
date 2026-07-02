@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 多因子选股 + 回测系统 — 统一入口
 ==================================
@@ -1522,8 +1522,8 @@ def run_backtest(stocks):
         sname = scfg["name"]
         print(f"\n{'─'*100}")
         print(f"  【{sname}】")
-        print(f"  {'代码':<8} {'名称':<8} {'收益率':>8} {'超额':>8} {'vs买入持有':>10} {'交易':>6} {'跑赢':>6} {'最大回撤':>10}")
-        print(f"  {'─'*60}")
+        print(f"  {'代码':<8} {'名称':<8} {'初始本金':>9} {'期末资产':>9} {'盈亏金额':>9} {'收益率':>8} {'超额':>8} {'交易':>6} {'最大回撤':>10}")
+        print(f"  {'─'*80}")
 
         results = []
         for code, (name, df, start_idx) in stock_data.items():
@@ -1557,8 +1557,11 @@ def run_backtest(stocks):
                 bh = bh_results.get(code, 0)
                 vs_bh = ret - bh if skey != "buy_hold" else 0.0
                 beat = "[OK]" if ret > idx_ret else "[ERR]"
-                print(f"  {code:<8} {name:<8} {ret:>+7.2f}% {exc:>+7.2f}% {vs_bh:>+9.2f}% {trades:>6} {beat:>6}  {max_dd:>6.2f}%")
-                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd})
+                # 计算盈亏金额
+                final_val = capital * (1 + ret / 100)
+                profit = final_val - capital
+                print(f"  {code:<8} {name:<8} {capital:>9,} {final_val:>9,.0f} {profit:>+9,.0f} {ret:>+7.2f}% {exc:>+7.2f}% {trades:>6} {max_dd:>6.2f}%")
+                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd, "profit": profit, "final_val": final_val})
             except Exception as e:
                 print(f"  {code:<8} {name:<8} {'ERR':>8} ({e})")
 
@@ -1581,11 +1584,18 @@ def run_backtest(stocks):
                 better_bh_str = "优于BH N/A"
             else:
                 better_bh_str = f"优于BH {s['n_better_bh']}/{len(results)}"
-            print(f"  {'─'*60}")
+            print(f"  {'─'*80}")
             print(f"  汇总: 均值{s['mean']:+.2f}% 中位数{s['median']:+.2f}% "
                   f"正收益{s['n_pos']}/{len(results)} 跑赢{s['n_beat']}/{len(results)} "
                   f"{better_bh_str} 均交易{s['trades_mean']:.1f}次 "
                   f"均最大回撤{s['max_dd_mean']:.2f}%")
+            # 资金汇总
+            total_initial = capital * len(results)
+            total_final = sum(r["final_val"] for r in results)
+            total_profit = sum(r["profit"] for r in results)
+            total_ret = (total_final / total_initial - 1) * 100 if total_initial > 0 else 0
+            print(f"  资金汇总: 总投入{total_initial:>9,.0f}  总资产{total_final:>9,.0f}  "
+                  f"总盈亏{total_profit:>+9,.0f}  总收益率{total_ret:+.2f}%")
 
     # ══ 总表 ══
     print(f"\n\n{'='*100}")

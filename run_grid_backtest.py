@@ -275,8 +275,10 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     print(f"\n{'=' * 70}")
     print(f"  网格交易回测结果")
     print(f"{'=' * 70}")
+    profit_amount = final_value - initial_capital
     print(f"  初始资金：{initial_capital:,.0f}")
     print(f"  最终资产：{final_value:,.0f}")
+    print(f"  总盈亏：{profit_amount:+,.0f} 元")
     print(f"  总收益率：{total_return:+.2f}%")
     print(f"  年化收益率：{annual_return:+.2f}%")
     print(f"  最大回撤：{max_dd:.2f}%")

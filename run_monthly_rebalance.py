@@ -1138,8 +1138,10 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"\n{'='*70}")
     print("  回测结果")
     print(f"{'='*70}")
+    profit_amount = final_value - INIT_CAPITAL
     print(f"  初始资金：{INIT_CAPITAL:,.2f}")
     print(f"  最终资产：{final_value:,.2f}")
+    print(f"  总盈亏：{profit_amount:+,.2f} 元")
     print(f"  总收益率：{total_return:+.2f}%")
     print(f"  年化收益率：{annual_return:+.2f}%")
     print(f"  最大回撤：{max_dd:.2f}%")
@@ -1557,8 +1559,10 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
     print(f"\n{'=' * 70}")
     print(f"  动量{lookback_months}个月 × {freq_label}调仓 回测结果")
     print(f"{'=' * 70}")
+    profit_amount = final_value - INIT_CAPITAL
     print(f"  初始资金：{INIT_CAPITAL:,.2f}")
     print(f"  最终资产：{final_value:,.2f}")
+    print(f"  总盈亏：{profit_amount:+,.2f} 元")
     print(f"  总收益率：{total_return:+.2f}%")
     print(f"  年化收益率：{annual_return:+.2f}%")
     print(f"  最大回撤：{max_dd:.2f}%")
@@ -2018,8 +2022,10 @@ def run_reversal_backtest(start_date="20251201", end_date="20251231",
     print(f"\n{'=' * 70}")
     print(f"  短期逆转效应回测结果")
     print(f"{'=' * 70}")
+    profit_amount = fv - INIT_CAPITAL
     print(f"  回测天数：{days}个交易日 | 初始资金：{INIT_CAPITAL:,.0f}")
-    print(f"  最终资产：{fv:,.2f} | 总收益率：{tr:+.2f}% | 年化：{ar:+.2f}%")
+    print(f"  最终资产：{fv:,.2f} | 总盈亏：{profit_amount:+,.2f} 元")
+    print(f"  总收益率：{tr:+.2f}% | 年化：{ar:+.2f}%")
     stxt = f" | 止损 {stop_count}次" if stop_loss_pct > 0 and stop_count > 0 else ""
     print(f"  最大回撤：{dd:.2f}% | 夏普比率：{sp:.2f} | 交易：{len(trades)}{stxt}")
     print(f"\n  逐日净值：")

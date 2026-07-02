@@ -527,8 +527,10 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     print(f"\n{'=' * 70}")
     print(f"  动量{lookback_months}个月 × {freq_label}调仓 + 网格择时 回测结果")
     print(f"{'=' * 70}")
+    profit_amount = final_value - INIT_CAPITAL
     print(f"  初始资金：{INIT_CAPITAL:,.2f}")
     print(f"  最终资产：{final_value:,.2f}")
+    print(f"  总盈亏：{profit_amount:+,.2f} 元")
     print(f"  总收益率：{total_return:+.2f}%")
     print(f"  年化收益率：{annual_return:+.2f}%")
     print(f"  最大回撤：{max_dd:.2f}%")

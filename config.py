@@ -12,8 +12,8 @@
 
 GLOBAL = {
     # 回测时间范围
-    "backtest_start": "20250103",
-    "backtest_end": "20260701",
+    "backtest_start": "20230102",
+    "backtest_end": "20231231",
 
     # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
     "selection_date": "20260102",
