@@ -362,10 +362,11 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                         open_price = get_etf_open(code, td)
                         if open_price is None or open_price <= 0:
                             continue
-                        # 分配资金
-                        alloc = cash_per_target * weight * len(new_to_buy)  # 实际分配金额
+                        # 分配资金（预留手续费空间，避免费用超出现金）
+                        alloc = cash_per_target * weight * len(new_to_buy)
                         alloc = min(alloc, cash)  # 不超过剩余现金
-                        max_shares = int(alloc / open_price)
+                        alloc_after_fee = alloc * 0.998  # 预留0.2%给手续费+滑点
+                        max_shares = int(alloc_after_fee / open_price)
                         if max_shares < 1:
                             continue
                         cost = max_shares * open_price
