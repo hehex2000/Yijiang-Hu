@@ -12,8 +12,8 @@
 
 GLOBAL = {
     # 回测时间范围
-    "backtest_start": "20251231",
-    "backtest_end": "20260625",
+    "backtest_start": "20250103",
+    "backtest_end": "20260701",
 
     # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
     "selection_date": "20260102",
@@ -35,7 +35,7 @@ DATA = {
     # 行情数据优先本地DB，财务/估值数据优先Tushare
     "primary_source": "local_db",      # ← 优先使用本地数据库
 
-    "local_db_path": r"D:\tu-shareData\astock_daily.db",  # 注意大小写：tu-shareData
+    "local_db_path": r"C:\Users\99395\WorkBuddy\2026-07-01-10-38-55\astock_daily.db",
 
     "tushare_token": "761165a821532fe625262d6b33e144b9859a887c004acbcb981c319b",
 
@@ -212,7 +212,93 @@ STRATEGIES = {
         "atr_mult": 3.0,
         "trail_mult": 3.0,
     },
-    # ── bollinger 布林带策略 ──
+    # ── bollinger 布林带策略（已改造-加入凯利仓位）──
+    "bollinger": {
+        "enabled": True,
+        "name": "布林带策略（凯利仓位版）",
+        # ── 布林带参数 ──
+        "bb_period": 20,
+        "bb_std": 2.5,
+        # ── 止盈止损 ──
+        "take_profit": 0.50,
+        "stop_loss": 0.15,
+        # ── 仓位模式（use_kelly=False 时生效）──
+        "position_mode": "half",        # "half"=半仓, "full"=全仓
+        # ── ATR 动态止损 ──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
+        # ── 凯利公式仓位（use_kelly=True 时生效）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.50,         # BB策略胜率保守估计
+        "kelly_win_loss_ratio": 1.8,     # 盈亏比（赚1.8元亏1元）
+        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_max_position": 0.20,      # 最大仓位20%
+        "kelly_min_position": 0.05,      # 最小仓位5%
+        "kelly_safety_discount": 0.8,    # 参数不确定性再打8折
+    },
+    # ── BB+RSI组合策略（视频版-带宽挤压+半凯利）──
+    "bb_rsi_combo": {
+        "enabled": False,
+        "name": "BB+RSI组合策略（带宽挤压+半凯利）",
+        # ── 布林带参数 ──
+        "bb_period": 20,
+        "bb_std": 2.0,
+        # ── RSI参数 ──
+        "rsi_period": 14,
+        "rsi_oversold": 35,             # RSI超卖（入场确认，放宽至35）
+        "rsi_overbought": 70,           # RSI超买（出场确认）
+        # ── 带宽挤压参数 ──
+        "squeeze_lookback": 50,         # 挤压检测回看期
+        "squeeze_threshold": 1.20,      # 挤压阈值（带宽<历史最低×1.20，放宽至20%以内）
+        # ── 止盈止损 ──
+        "stop_loss": 0.05,              # 5%硬止损
+        "take_profit": 0.30,            # 30%止盈
+        # ── ATR 动态止损 ──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 2.0,                # 收紧止损（2倍ATR）
+        "trail_mult": 2.0,              # 收紧追踪止损
+        # ── 凯利公式仓位 ──
+        "use_kelly": True,
+        "kelly_win_rate": 0.55,         # 估计胜率55%（BB+RSI双确认更高）
+        "kelly_win_loss_ratio": 1.5,     # 估计盈亏比
+        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_max_position": 0.20,      # 最大仓位20%
+        "kelly_min_position": 0.05,      # 最小仓位5%
+        "kelly_safety_discount": 0.8,    # 参数不确定性再打8折
+    },
+    # ── RSI+布林带双确认策略（视频版-RSI超买超卖+布林带过滤+半凯利）──
+    "rsi_bb_dual": {
+        "enabled": True,
+        "name": "RSI+布林带双确认策略（A股优化参数+半凯利）",
+        # ── RSI参数（A股适配：9天比14更敏感）──
+        "rsi_period": 9,                # RSI周期（A股震荡市推荐9天）
+        "rsi_oversold": 30,             # RSI超卖阈值（入场确认）
+        "rsi_overbought": 70,           # RSI超买阈值（出场确认）
+        "rsi_center": 50,               # RSI中轴线
+        # ── 布林带参数 ──
+        "bb_period": 20,
+        "bb_std": 2.0,
+        # ── 止盈止损 ──
+        "stop_loss": 0.05,              # 5%硬止损
+        "take_profit": 0.20,            # 20%止盈
+        # ── ATR 动态止损 ──
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 2.0,
+        "trail_mult": 2.0,
+        # ── 凯利公式仓位 ──
+        "use_kelly": True,
+        "kelly_win_rate": 0.53,         # RSI策略回测胜率约53%
+        "kelly_win_loss_ratio": 1.5,
+        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_max_position": 0.20,
+        "kelly_min_position": 0.05,
+        "kelly_safety_discount": 0.8,
+    },
+    # ── 均值回归策略 ──
     "mean_reversion": {
         "enabled": True,
         "name": "均值回归策略（视频版）",
@@ -464,4 +550,38 @@ DIVIDEND_LOW_VOL = {
     # ── 输出配置 ──
     "output_dir": "data/results/dividend_low_vol",
     "output_file": "dividend_low_vol_{date}.csv",
+}
+
+# ============================================================
+# 十一、狗股策略配置（Dogs of the Market）
+# 视频参考：《凯利公式——只看一个指标，每年操作一次》
+# 核心理念：高股息率不是买分红，而是买错杀后的均值回归
+# ============================================================
+
+DOGS_OF_MARKET = {
+    # 选股日期（格式: "YYYYMMDD"，必须是交易日）
+    # 【自动计算】由 run_backtest.py 在执行时自动设为回测开始日前一交易日
+    "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
+
+    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
+
+    # 选股数量
+    "top_n": GLOBAL["top_n"],  # ← 从GLOBAL读取
+
+    # ── 因子阈值 ──
+    "dividend_yield_percentile": 0.5,      # 股息率高于市场中位数（50%分位）
+    "pb_percentile": 0.5,                  # PB低于市场中位数
+    "min_dividend_years": 3,               # 连续分红年数要求
+    "dividend_lookback_years": 3,          # 分红检查回溯年数
+
+    # ── 调仓配置 ──
+    "annual_rebalance_month": 4,           # 每年4月调仓（年报出完）
+
+    # ── 波动率计算 ──
+    "volatility_window": 120,               # 波动率计算窗口（交易日）
+
+    # ── 输出配置 ──
+    "output_dir": "data/results/dogs_of_market",
+    "output_file": "dogs_of_market_{date}.csv",
 }

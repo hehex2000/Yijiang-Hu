@@ -66,10 +66,13 @@ echo   [4] 选择选股策略
 echo   [5] 设置股票池
 echo   [6] 仅选股（不回测）
 echo   [7] 仅回测（使用最新选股结果）
-echo   [8] 月度调仓回测
-echo   [9] 退出
+echo   [8] 月度调仓回测（价值/红利低波/动量）
+echo   [9] 狗股年度调仓
+echo   [A] 短线逆转策略（超跌反弹）
+echo   [B] 网格交易策略（波劙收割）
+echo   [0] 退出
 echo.
-set /p CHOICE=请选择 (1-9):
+set /p CHOICE=请选择 (1-0):
 echo.
 
 if "%CHOICE%"=="1" goto :run_all
@@ -80,7 +83,10 @@ if "%CHOICE%"=="5" goto :set_stock_pool
 if "%CHOICE%"=="6" goto :select_only
 if "%CHOICE%"=="7" goto :backtest_only
 if "%CHOICE%"=="8" goto :monthly_rebalance
-if "%CHOICE%"=="9" goto :eof
+if "%CHOICE%"=="9" goto :dogs_annual
+if /i "%CHOICE%"=="A" goto :reversal
+if /i "%CHOICE%"=="B" goto :grid
+if "%CHOICE%"=="0" goto :eof
 goto :menu
 
 :set_date
@@ -138,8 +144,9 @@ echo.
 echo   [1] 多因子选股（技术+基本面因子）
 echo   [2] 价值投资选股（价值投资量化策略）
 echo   [3] 红利低波选股（高股息率+低波动率）
+echo   [4] 狗股策略选股（高股息+低PB+均值回归）
 echo.
-set /p METHOD_CHOICE=请选择 (1-3):
+set /p METHOD_CHOICE=请选择 (1-4):
 echo.
 
 if "%METHOD_CHOICE%"=="1" (
@@ -160,6 +167,12 @@ if "%METHOD_CHOICE%"=="3" (
     call :save_config
     goto :menu
 )
+if "%METHOD_CHOICE%"=="4" (
+    set SELECTION_METHOD=dogs
+    echo   [OK] 已选择: 狗股策略选股
+    call :save_config
+    goto :menu
+)
 goto :set_method
 
 :run_all
@@ -174,7 +187,7 @@ echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo     选股数量: %TOP_N% 只
 echo     选股策略: %SELECTION_METHOD%
 echo.
-"venv_ml\Scripts\python.exe" run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N%
+venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N%
 echo.
 pause
 goto :menu
@@ -191,7 +204,7 @@ echo     选股策略: %SELECTION_METHOD%
 echo     选股数量: %TOP_N% 只
 echo     股票池: %STOCK_POOL%
 echo.
-"venv_ml\Scripts\python.exe" run_backtest.py --source %SELECTION_METHOD% --select-only --top-n %TOP_N% --stock-pool %STOCK_POOL%
+venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --select-only --top-n %TOP_N% --stock-pool %STOCK_POOL%
 echo.
 pause
 goto :menu
@@ -206,7 +219,7 @@ echo.
 echo   配置:
 echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
-"venv_ml\Scripts\python.exe" run_backtest.py --source csv --auto --start-date %BACKTEST_START% --end-date %BACKTEST_END%
+venv_ml\Scripts\python.exe run_backtest.py --source csv --auto --start-date %BACKTEST_START% --end-date %BACKTEST_END%
 echo.
 pause
 goto :menu
@@ -222,13 +235,21 @@ echo   请选择调仓时的选股策略:
 echo   ----------------
 echo   [1] 价值选股（PB破净+ROE质量）
 echo   [2] 红利低波选股（高股息+低波动）
+echo   [3] 动量效应追涨（12月动量+2×ATR止损）
+echo   [0] 返回主菜单
 echo.
-set /p MR_METHOD=请选择 (1-2, 默认1):
+set MR_ARG=
+set /p MR_METHOD=请选择 (1-3, 0返回):
 
+if "%MR_METHOD%"=="0" goto :menu
 if "%MR_METHOD%"=="2" (
     set MR_ARG=--selection-method div_low_vol
     echo.
     echo   已选择: 红利低波选股
+) else if "%MR_METHOD%"=="3" (
+    set MR_ARG=--selection-method momentum
+    echo.
+    echo   已选择: 动量效应追涨
 ) else (
     set MR_ARG=--selection-method value
     echo.
@@ -238,8 +259,9 @@ echo.
 echo   配置:
 echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
-"venv_ml\Scripts\python.exe" run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% %MR_ARG%
+venv_ml\Scripts\python.exe run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% %MR_ARG%
 echo.
+echo   [返回主菜单]
 pause
 goto :menu
 
@@ -274,8 +296,102 @@ call :save_config
 pause
 goto :menu
 
+:dogs_annual
+cls
+echo.
+echo ================
+echo   狗股策略年度调仓回测
+echo ================
+echo.
+echo   配置:
+echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo     选股数量: %TOP_N% 只
+echo.
+"venv_ml\Scripts\python.exe" run_backtest.py --source dogs_annual --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N%
+echo.
+pause
+goto :menu
+
 :eof
 cls
 echo.
 echo   再见！
 echo.
+
+:reversal
+cls
+echo.
+echo ================
+echo   短线逆转策略（超跌反弹·20日跌幅·8日持有）
+echo ================
+echo.
+echo   请选择股票池:
+echo   ----------------
+echo   [1] 沪深300
+echo   [2] 中证800
+echo   [3] 中证500
+echo.
+set /p REV_POOL=请选择 (1-3, 默认1):
+
+if "%REV_POOL%"=="2" set REV_ARG=--stock-pool 000906.SH
+if "%REV_POOL%"=="3" set REV_ARG=--stock-pool 000905.SH
+if "%REV_POOL%"=="" set REV_ARG=--stock-pool 000300.SH
+if not defined REV_ARG set REV_ARG=--stock-pool 000300.SH
+
+echo.
+echo   配置: 20日跌幅排名, 8日持有, 5只, MACD金叉过滤, 8%%止损
+echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   正在运行...
+"venv_ml\Scripts\python.exe" run_monthly_rebalance.py %BACKTEST_START% %BACKTEST_END% --selection-method reversal %REV_ARG% --top-n 5 --reversal-lookback 20 --reversal-hold 8 --market-filter macd --reversal-stop 0.08
+echo.
+pause
+goto :menu
+
+:grid
+cls
+echo.
+echo ================
+echo   网格交易策略（百分比网格·波劙收割）
+echo ================
+echo.
+echo   请选择标的:
+echo   ----------------
+echo   [1] 沪深300 ETF (510300，指数代理模拟)
+echo   [2] 中证500 ETF (510500，指数代理模拟)
+echo   [3] 中证800 ETF (512100，指数代理模拟)
+echo   [0] 返回主菜单
+echo.
+set GRID_ARG=
+set /p GRID_CODE=请选择 (1-3, 0返回):
+
+if "%GRID_CODE%"=="0" goto :menu
+if "%GRID_CODE%"=="2" set GRID_ARG=000905.SH
+if "%GRID_CODE%"=="3" set GRID_ARG=000906.SH
+if "%GRID_CODE%"=="" set GRID_ARG=000300.SH
+if not defined GRID_ARG set GRID_ARG=000300.SH
+
+echo.
+echo   请设置网格间距:
+echo   ----------------
+echo   [1] 1%% (窄网格，高频交易)
+echo   [2] 2%% (标准，推荐)
+echo   [3] 3%% (宽网格，低频交易)
+echo.
+set /p GRID_PCT=请选择 (1-3, 默认2):
+
+if "%GRID_PCT%"=="1" set GRID_PCT_ARG=--grid-pct 0.01
+if "%GRID_PCT%"=="3" set GRID_PCT_ARG=--grid-pct 0.03
+if "%GRID_PCT%"=="" set GRID_PCT_ARG=--grid-pct 0.02
+if not defined GRID_PCT_ARG set GRID_PCT_ARG=--grid-pct 0.02
+
+echo.
+echo   配置: 网格间距已设置, 每格5000元, 初始50%%仓位
+echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   正在运行...
+"venv_ml\Scripts\python.exe" run_grid_backtest.py %GRID_ARG% %BACKTEST_START% %BACKTEST_END% %GRID_PCT_ARG% --per-grid 5000
+echo.
+echo   [返回主菜单]
+pause
+goto :menu

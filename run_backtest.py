@@ -26,7 +26,7 @@ logger.add(lambda _: None, level="CRITICAL")  # 空 sink，只吞不吐
 from config import (
     DATA, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR,
     BACKTEST, STRATEGIES, OUTPUT, INDUSTRY_MOMENTUM,
-    VALUE_STRATEGY, DIVIDEND_LOW_VOL,
+    VALUE_STRATEGY, DIVIDEND_LOW_VOL, DOGS_OF_MARKET,
 )
 
 DB_PATH = DATA["local_db_path"]
@@ -1322,6 +1322,88 @@ def run_dividend_low_vol_selection() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# ══════════════════════════════════════════════════════
+# 狗股策略选股（Dogs of the Market）
+# ══════════════════════════════════════════════════════
+
+def run_dogs_of_market_selection():
+    """
+    执行狗股策略选股，返回选股结果DataFrame
+    选股失败时自动后移交易日重试，直到选出股票或达到最大尝试次数
+    """
+    from src.dogs_of_market_selector import DogsOfMarketSelector
+    from src.data_fetcher import DataFetcher
+
+    backtest_start = BACKTEST["start_date"]
+    DOGS_OF_MARKET["top_n"] = SELECTION["top_n"]
+    DOGS_OF_MARKET["stock_pool"] = SELECTION["stock_pool"]
+
+    # 获取交易日列表（用于后移）
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    trade_dates = pd.read_sql_query(
+        "SELECT DISTINCT trade_date FROM daily ORDER BY trade_date",
+        conn
+    )["trade_date"].tolist()
+    conn.close()
+
+    # 找到回测开始日前一个交易日的索引
+    prev_day = _get_prev_trading_day(backtest_start)
+    if prev_day not in trade_dates:
+        print(f"  [ERROR] 选股日 {prev_day} 不在交易日列表中！")
+        return pd.DataFrame()
+    date_idx = trade_dates.index(prev_day)
+
+    MAX_ATTEMPTS = 20  # 最多尝试20个交易日
+
+    for attempt in range(MAX_ATTEMPTS):
+        current_date = trade_dates[date_idx]
+        DOGS_OF_MARKET["date"] = current_date
+
+        if attempt == 0:
+            print(f"  狗股策略选股日: 回测开始 {backtest_start} → 前交易日 {current_date}")
+        else:
+            print(f"  [重试] 选股日后移 {attempt} 天 → {current_date}")
+
+        df_config = {
+            "primary_source": DATA["primary_source"],
+            "tushare_token": DATA.get("tushare_token", ""),
+            "local_db_path": DATA["local_db_path"],
+            "use_akshare_backup": DATA["use_akshare_backup"],
+            "use_tushare_backup": False,
+        }
+        fetcher = DataFetcher(**df_config)
+        selector = DogsOfMarketSelector(DOGS_OF_MARKET, fetcher)
+
+        print(f"\n{'='*60}")
+        print(f"  狗股策略选股 — {current_date} | 池:{DOGS_OF_MARKET['stock_pool']}")
+        print(f"{'='*60}")
+
+        selected = selector.select_stocks(date=current_date)
+
+        if selected is not None and len(selected) > 0:
+            # 选股成功，保存结果
+            output_dir = DOGS_OF_MARKET.get("output_dir", "data/results/dogs_of_market")
+            output_file = DOGS_OF_MARKET.get("output_file", "dogs_of_market_{date}.csv")
+            filepath = selector.export_to_csv(selected, filename=output_file, output_dir=output_dir)
+
+            print(f"\n{'='*60}")
+            print(f"  狗股策略选股完成！共找到 {len(selected)} 只股票（选股日: {current_date}）")
+            print(f"  结果已保存 → {filepath}")
+            print(f"{'='*60}\n")
+
+            return selected[["code", "name"]] if "name" in selected.columns else selected[["code"]]
+
+        # 选股失败，后移一天
+        print(f"  [WARN] 选股失败，后移到下一交易日重试...")
+        date_idx += 1
+        if date_idx >= len(trade_dates):
+            print(f"\n  [ERROR] 已尝试 {attempt+1} 个交易日，仍无法选出股票！")
+            break
+
+    return pd.DataFrame()
+
+
 def run_backtest(stocks):
     """对股票列表执行所有已启用的策略"""
     capital = BACKTEST["initial_capital"]
@@ -1572,9 +1654,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", "-s",
         type=str,
-        choices=["multi", "value", "div_low_vol", "csv", "manual", "monthly_rebalance"],
+        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance"],
         default=None,
-        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓)"
+        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓)"
     )
     parser.add_argument(
         "--start-date", type=str, default=None,
@@ -1625,8 +1707,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--selection-method", type=str, default="value",
-        choices=["value", "div_low_vol"],
-        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波)"
+        choices=["value", "div_low_vol", "momentum"],
+        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨)"
     )
     args = parser.parse_args()
 
@@ -1761,23 +1843,79 @@ if __name__ == "__main__":
         run_backtest(stocks)
         sys.exit(0)
         
+    elif args.source == "dogs":
+        # 狗股策略选股
+        print(f"\n  狗股策略选股模式...")
+        stocks = run_dogs_of_market_selection()
+        if stocks is None or len(stocks) == 0:
+            print(f"\n  [ERROR] 狗股策略选股失败！")
+            sys.exit(1)
+        
+        if args.select_only:
+            print(f"\n{'='*60}")
+            print(f"  选股结果（共 {len(stocks)} 只）:")
+            for i, (_, row) in enumerate(stocks.iterrows(), 1):
+                print(f"    {i}. {row['code']}  {row.get('name', '')}")
+            print(f"\n{'='*60}")
+            output_dir = DOGS_OF_MARKET.get("output_dir", "data/results/dogs_of_market")
+            print(f"  结果已保存到 {output_dir}/")
+            print(f"{'='*60}\n")
+            sys.exit(0)
+        
+        run_backtest(stocks)
+        sys.exit(0)
+        
+    elif args.source == "dogs_annual":
+        # 狗股策略年度调仓回测
+        print(f"\n  狗股策略年度调仓回测模式...")
+        print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
+        print(f"  选股数量: {SELECTION.get('top_n', 5)}")
+        print(f"  {'='*60}")
+        
+        from run_dogs_annual import run_backtest as run_dogs_annual_bt
+        run_dogs_annual_bt(
+            start_date=BACKTEST["start_date"],
+            end_date=BACKTEST["end_date"],
+            top_n=SELECTION.get("top_n", 5),
+        )
+        sys.exit(0)
+        
     elif args.source == "monthly_rebalance":
         # 月度调仓回测（直接导入调用，避免子进程输出混乱）
         sel_method = args.selection_method or "value"
-        method_names = {"value": "价值选股", "div_low_vol": "红利低波选股"}
+        method_names = {"value": "价值选股", "div_low_vol": "红利低波选股", "momentum": "动量效应追涨"}
         print(f"\n  月度调仓回测模式...")
         print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
         print(f"  选股策略: {method_names.get(sel_method, sel_method)}")
         print(f"  选股数量: {SELECTION.get('top_n', 5)}")
-        
-        from run_monthly_rebalance import run_backtest as run_monthly_rebalance_bt
-        print(f"  {'='*60}")
-        run_monthly_rebalance_bt(
-            start_date=BACKTEST["start_date"],
-            end_date=BACKTEST["end_date"],
-            top_n=SELECTION.get("top_n", 5),
-            selection_method=sel_method,
-        )
+
+        if sel_method == "momentum":
+            from run_monthly_rebalance import run_momentum_backtest
+            print(f"  {'='*60}")
+            # 动量12个月 + 月度调仓 + 2×ATR止损 + 不跳近期 + MA200熊市空仓
+            run_momentum_backtest(
+                start_date=BACKTEST["start_date"],
+                end_date=BACKTEST["end_date"],
+                top_n=SELECTION.get("top_n", 5),
+                lookback_months=12,
+                stock_pool={
+                    "hs300": "000300.SH", "zz500": "000905.SH",
+                    "zz800": "000906.SH", "zz1000": "000852.SH",
+                }.get(SELECTION.get("stock_pool", "zz800"), None),
+                rebalance_freq_months=1,
+                atr_stop_multiple=2.0,
+                skip_recent_months=0,
+                trend_filter_ma=200,
+            )
+        else:
+            from run_monthly_rebalance import run_backtest as run_monthly_rebalance_bt
+            print(f"  {'='*60}")
+            run_monthly_rebalance_bt(
+                start_date=BACKTEST["start_date"],
+                end_date=BACKTEST["end_date"],
+                top_n=SELECTION.get("top_n", 5),
+                selection_method=sel_method,
+            )
         sys.exit(0)
         
     elif args.source == "csv":

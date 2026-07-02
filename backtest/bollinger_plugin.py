@@ -9,6 +9,10 @@
 价格触及上轨 → 卖出（超买）
 止盈50%，止损15%
 
+仓位管理（v2）:
+- use_kelly=False: 固定半仓(50%)/全仓(95%)
+- use_kelly=True: 半凯利公式动态仓位（默认上限20%）
+
 优化：使用 TA-Lib 计算布林带和 RSI（性能提升 10-100 倍）
 """
 import pandas as pd
@@ -16,6 +20,7 @@ import numpy as np
 import talib as ta  # ← 新增 TA-Lib
 from backtest.base_strategy import BaseStrategy
 from backtest.atr_stop_loss import ATRStopLoss
+from backtest.kelly_sizer import KellySizer
 from loguru import logger
 
 
@@ -29,6 +34,8 @@ class BollingerStrategyPlugin(BaseStrategy):
         self.take_profit = cfg.get("take_profit", 0.50)
         self.stop_loss = cfg.get("stop_loss", 0.15)
         self.position_mode = cfg.get("position_mode", "half")
+        # ── RSI 入场阈值（修复硬编码 40）──
+        self.rsi_oversold = cfg.get("rsi_oversold", 40)
         # ── ATR 动态止损 ──
         self.use_atr_sl = cfg.get("atr_stop_loss", False)
         self.atr_sl = ATRStopLoss(
@@ -36,7 +43,20 @@ class BollingerStrategyPlugin(BaseStrategy):
             atr_mult=cfg.get("atr_mult", 3.0),
             trail_mult=cfg.get("trail_mult", 3.0),
         )
-        logger.info(f"BollingerStrategyPlugin initialized: period={self.bb_period}, std={self.bb_std}")
+        # ── 凯利公式仓位 ──
+        self.use_kelly = cfg.get("use_kelly", False)
+        if self.use_kelly:
+            self.kelly = KellySizer(
+                estimated_win_rate=cfg.get("kelly_win_rate", 0.55),
+                estimated_win_loss_ratio=cfg.get("kelly_win_loss_ratio", 1.5),
+                kelly_fraction=cfg.get("kelly_fraction", 0.5),
+                max_position_pct=cfg.get("kelly_max_position", 0.25),
+                min_position_pct=cfg.get("kelly_min_position", 0.05),
+                safety_discount=cfg.get("kelly_safety_discount", 0.8),
+            )
+        mode_str = "kelly" if self.use_kelly else self.position_mode
+        logger.info(f"BollingerStrategyPlugin initialized: period={self.bb_period}, std={self.bb_std}, "
+                     f"position={mode_str}")
     
     def _calculate_bollinger(self, close: pd.Series) -> pd.DataFrame:
         """计算布林带指标（使用 TA-Lib 优化）"""
@@ -99,7 +119,7 @@ class BollingerStrategyPlugin(BaseStrategy):
         prev_lower = data['lower'].shift(1)
         prev_rsi = data['rsi'].shift(1)
         
-        data['buy_signal'] = (prev_close <= prev_lower * 1.02) & (prev_rsi < 40)
+        data['buy_signal'] = (prev_close <= prev_lower * 1.02) & (prev_rsi < self.rsi_oversold)
         data['sell_signal_bb'] = prev_close >= prev_upper
         
         # ── ATR 计算 ──
@@ -110,7 +130,7 @@ class BollingerStrategyPlugin(BaseStrategy):
         else:
             atr_arr = np.zeros(len(data))
         
-        for i in range(len(data)):
+        for i in range(start_idx, len(data)):  # ← 修复：循环起点用 start_idx（避免回测期前数据干扰）
             row = data.iloc[i]
             date = row['trade_date']
             open_price = row['adj_open']
@@ -127,7 +147,17 @@ class BollingerStrategyPlugin(BaseStrategy):
             
             # 买入逻辑
             if self.position == 0 and bool(data.iloc[i]['buy_signal']) and not pd.isna(row['rsi']):
-                buy_amount = self.cash * (0.95 if self.position_mode == 'full' else 0.50)
+                # 计算仓位比例
+                if self.use_kelly:
+                    position_pct = self.kelly.get_position_pct()
+                    if position_pct <= 0:
+                        # 凯利公式给出零仓位（期望值为负），跳过
+                        v = self.cash
+                        self.daily_values.append({'date': date, 'portfolio_value': v})
+                        continue
+                else:
+                    position_pct = 0.95 if self.position_mode == 'full' else 0.50
+                buy_amount = self.cash * position_pct
                 shares = int(buy_amount / open_price / 100) * 100
                 if shares > 0:
                     success = self.buy(date, open_price, shares, reason="布林带下轨+RSI超卖")
@@ -176,6 +206,8 @@ class BollingerStrategyPlugin(BaseStrategy):
         if self.position > 0:
             last_price = float(data.iloc[-1]['adj_close'])
             self.sell(data.iloc[-1]['trade_date'], last_price, reason="回测结束平仓")
+            # 更新最终资产值（扣除卖出费用后的实际现金）
+            self.daily_values[-1]['portfolio_value'] = self.cash
         
         ret = self.calc_returns()
         logger.info(f"BollingerStrategyPlugin finished: returns={ret:.2f}%, trades={len(self.trades)}")
