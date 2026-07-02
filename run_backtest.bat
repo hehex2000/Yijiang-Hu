@@ -27,6 +27,47 @@ REM  （子程序，用 call :save_config 调用）
 REM ================================
 goto :menu_start
 
+:momentum_grid_timing
+cls
+echo.
+echo ========================================
+echo   动量策略 + 网格持仓择时（方案①）
+echo ========================================
+echo.
+echo   核心逻辑：
+echo     网格持仓 ^< 20%%  → 市场偏贵 → 选3只（减仓防守）
+echo     网格持仓 20-80%% → 正常市场 → 选5只（默认）
+echo     网格持仓 ^> 80%%  → 市场便宜 → 选8只（低吸进攻）
+echo.
+echo   默认配置:
+echo     动量12个月 + 季度调仓 + 2×ATR止损 + MA200过滤
+echo     网格参考：沪深300指数 (2%%间距, 每格5000元)
+echo.
+echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   请选择股票池:
+echo   ----------------
+echo   [1] 沪深300 (推荐·与网格参考指数一致)
+echo   [2] 中证800
+echo   [3] 中证500
+echo   [0] 返回主菜单
+echo.
+set /p MT_POOL=请选择 (1-3, 默认1):
+
+if "%MT_POOL%"=="0" goto :menu
+if "%MT_POOL%"=="2" set MT_POOL_ARG=--stock-pool 000906.SH
+if "%MT_POOL%"=="3" set MT_POOL_ARG=--stock-pool 000905.SH
+if "%MT_POOL%"=="" set MT_POOL_ARG=--stock-pool 000300.SH
+if not defined MT_POOL_ARG set MT_POOL_ARG=--stock-pool 000300.SH
+
+echo.
+echo   正在运行...
+"venv_ml\Scripts\python.exe" run_momentum_grid_timing.py %BACKTEST_START% %BACKTEST_END% --top-n 5 --lookback 12 --rebalance-freq 3 --atr-stop 2.0 --trend-filter 200 --grid-pct 0.02 --per-grid 5000 --grid-index 000300.SH %MT_POOL_ARG%
+echo.
+echo   [返回主菜单]
+pause
+goto :menu
+
 :save_config
 (
 echo set P_BACKTEST_START=%BACKTEST_START%
@@ -70,6 +111,7 @@ echo   [8] 月度调仓回测（价值/红利低波/动量）
 echo   [9] 狗股年度调仓
 echo   [A] 短线逆转策略（超跌反弹）
 echo   [B] 网格交易策略（波劙收割）
+echo   [C] 动量+网格择时（方案①·网格作为市场温度计）
 echo   [0] 退出
 echo.
 set /p CHOICE=请选择 (1-0):
@@ -86,6 +128,7 @@ if "%CHOICE%"=="8" goto :monthly_rebalance
 if "%CHOICE%"=="9" goto :dogs_annual
 if /i "%CHOICE%"=="A" goto :reversal
 if /i "%CHOICE%"=="B" goto :grid
+if /i "%CHOICE%"=="C" goto :momentum_grid_timing
 if "%CHOICE%"=="0" goto :eof
 goto :menu
 
