@@ -68,6 +68,46 @@ echo   [返回主菜单]
 pause
 goto :menu
 
+:etf_rotation
+cls
+echo.
+echo ========================================
+echo   ETF轮动策略
+echo ========================================
+echo.
+echo.  标的池（纯国内·0海外/0黄金）：
+echo.    上证50(超大盘) | 沪深300(大盘)
+echo.    中证500(中盘) | 中证1000(小盘) | 创业板指(科技)
+echo.
+echo   核心逻辑：
+echo     ROC动量×0.5 + 中期动量×0.3 - 波动率×0.2
+echo     MA60过滤：跌破均线不买入，全部走弱时转现金
+echo.
+echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   请选择调仓方法:
+echo   ----------------
+echo   [1] 双动量法（默认·前2名等权·最常用）
+echo   [2] 单动量法（满仓第1名·激进）
+echo   [3] 均线过滤法（MA60过滤·保守）
+echo   [0] 返回主菜单
+echo.
+set /p ETF_METHOD=请选择 (1-3, 默认1):
+
+if "%ETF_METHOD%"=="0" goto :menu
+set ETF_METHOD_ARG=dual
+if "%ETF_METHOD%"=="1" set ETF_METHOD_ARG=dual
+if "%ETF_METHOD%"=="2" set ETF_METHOD_ARG=single
+if "%ETF_METHOD%"=="3" set ETF_METHOD_ARG=ma_filter
+
+echo.
+echo   正在运行...
+"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG%
+echo.
+echo   [返回主菜单]
+pause
+goto :menu
+
 :save_config
 (
 echo set P_BACKTEST_START=%BACKTEST_START%
@@ -112,6 +152,7 @@ echo   [9] 狗股年度调仓
 echo   [A] 短线逆转策略（超跌反弹）
 echo   [B] 网格交易策略（波劙收割）
 echo   [C] 动量+网格择时（方案①·网格作为市场温度计）
+echo   [D] ETF轮动策略（动量轮动·纯国内资产）
 echo   [0] 退出
 echo.
 set /p CHOICE=请选择 (1-0):
@@ -129,6 +170,7 @@ if "%CHOICE%"=="9" goto :dogs_annual
 if /i "%CHOICE%"=="A" goto :reversal
 if /i "%CHOICE%"=="B" goto :grid
 if /i "%CHOICE%"=="C" goto :momentum_grid_timing
+if /i "%CHOICE%"=="D" goto :etf_rotation
 if "%CHOICE%"=="0" goto :eof
 goto :menu
 
