@@ -98,7 +98,16 @@ def get_etf_price(ts_code, trade_date):
 
 
 def get_etf_open(ts_code, trade_date):
-    """获取ETF开盘价"""
+    """获取ETF交易执行价格
+
+    2026-07-06起：盘后30分钟可用收盘价定价交易（非未来函数）
+    之前：正常开盘价交易
+    """
+    td = int(trade_date) if isinstance(trade_date, str) else trade_date
+    if td >= 20260706:
+        # 收盘盘后定价交易
+        return _query_price(ts_code, trade_date, field="close")
+    # 正常盘中交易：开盘价
     return _query_price(ts_code, trade_date, field="open", fallback_field="close")
 
 

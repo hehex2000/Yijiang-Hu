@@ -19,12 +19,17 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from config import DATA, BACKTEST, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR
-    DB_PATH = DATA.get("local_db_path", "D:/tu-shareData/astock_daily.db")
+    from config import DATA, BACKTEST, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR, BASE_DIR
+    DB_PATH = DATA.get("local_db_path", "")
+    if not DB_PATH or not os.path.exists(DB_PATH):
+        # 优先使用项目目录下的数据文件
+        DB_PATH = os.path.join(BASE_DIR, "data", "tu-sharedata", "astock_daily.db")
     INIT_CAPITAL = BACKTEST.get("initial_capital", 50000)
     # 不再使用模块级 TOP_N，改为动态读取 SELECTION["top_n"]
 except (ImportError, KeyError, AttributeError):
-    DB_PATH = "D:/tu-shareData/astock_daily.db"
+    # fallback: 使用项目相对路径
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DB_PATH = os.path.join(_BASE_DIR, "data", "tu-sharedata", "astock_daily.db")
     INIT_CAPITAL = 50000
     FACTOR_CALCULATOR = {}
     FACTOR_PROCESSOR = {}
@@ -163,7 +168,17 @@ def get_price(ts_code, trade_date):
 
 
 def get_open_price(ts_code, trade_date):
-    """获取不复权开盘价（实际使用价格）"""
+    """获取交易执行价格
+
+    2026-07-06前：开盘价（正常盘中交易）
+    2026-07-06后：收盘价（盘后30分钟定价交易，非未来函数）
+    """
+    td = int(trade_date) if isinstance(trade_date, str) else trade_date
+    if td >= 20260706:
+        # 盘后定价交易 → 使用当日收盘价
+        return get_price(ts_code, trade_date)
+
+    # 以下为原有逻辑：开盘价（2026-07-06前）
     if ts_code in ("000906.SH",):
         return get_price(ts_code, trade_date)
 
