@@ -108,6 +108,39 @@ echo   [返回主菜单]
 pause
 goto :menu
 
+:pairs_trading
+cls
+echo.
+echo ========================================
+echo   配对套利策略（均值回归·多头轮动）
+echo ========================================
+echo.
+echo   逻辑：两只高相关ETF，价差拉大时从贵的换到便宜的
+echo   市场过滤：沪深300ETF跌破MA60时强制空仓
+echo.
+echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   请选择配对:
+echo   ----------------
+echo   [1] 沪深300ETF vs 上证50ETF（宽基轮动）
+echo   [2] 中证500ETF vs 中证1000ETF（中小盘）
+echo   [3] 创业板ETF vs 创业板50ETF（创业板）
+echo   [0] 返回主菜单
+echo.
+set /p PAIR_CHOICE=请选择 (1-3, 默认1):
+
+if "%PAIR_CHOICE%"=="0" goto :menu
+if "%PAIR_CHOICE%"=="" set PAIR_CHOICE=1
+set PAIR_ARG=%PAIR_CHOICE%
+
+echo.
+echo   正在运行...
+"venv_ml\Scripts\python.exe" run_pairs_trading.py %BACKTEST_START% %BACKTEST_END% --pair %PAIR_ARG%
+echo.
+echo   [返回主菜单]
+pause
+goto :menu
+
 :save_config
 (
 echo set P_BACKTEST_START=%BACKTEST_START%
@@ -153,6 +186,7 @@ echo   [A] 短线逆转策略（超跌反弹）
 echo   [B] 网格交易策略（波劙收割）
 echo   [C] 动量+网格择时（方案①·网格作为市场温度计）
 echo   [D] ETF轮动策略（动量轮动·纯国内资产）
+echo   [E] 配对套利（均值回归·多头轮动）
 echo   [0] 退出
 echo.
 set /p CHOICE=请选择 (1-0):
@@ -171,6 +205,7 @@ if /i "%CHOICE%"=="A" goto :reversal
 if /i "%CHOICE%"=="B" goto :grid
 if /i "%CHOICE%"=="C" goto :momentum_grid_timing
 if /i "%CHOICE%"=="D" goto :etf_rotation
+if /i "%CHOICE%"=="E" goto :pairs_trading
 if "%CHOICE%"=="0" goto :eof
 goto :menu
 
