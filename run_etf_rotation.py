@@ -7,14 +7,16 @@ ETF轮动策略 - 国内资产动量轮动
   dual        双动量法（默认）：前2名等权，MA60过滤
   ma_filter   均线过滤法：MA60之上才买，全部跌破MA60时空仓
 
-标的池（5个国内指数，0黄金/0海外资产）：
-  000016.SH 上证50    — 超大盘蓝筹
-  000300.SH 沪深300   — 大盘价值（基准指数）
-  000905.SH 中证500   — 中盘成长
-  000852.SH 中证1000  — 小盘
-  399006.SZ 创业板指  — 科技成长
+标的池（7只国内ETF）：
+  510300.SH 沪深300ETF  — 大盘价值（基准）
+  510050.SH 上证50ETF   — 超大盘蓝筹
+  510500.SH 中证500ETF  — 中盘成长
+  512100.SH 中证1000ETF — 小盘
+  159915.SZ 创业板ETF   — 科技成长
+  518880.SH 黄金ETF     — 商品避险
+  511990.SH 华宝添益    — 货币基金
 
-数据来自 index_daily 表，价格 ÷1000 模拟ETF净值。
+数据来源：etf_daily 表（真实ETF价格），无指数÷1000缩放。
 """
 
 import sys, os, argparse, numpy as np, pandas as pd
@@ -28,78 +30,76 @@ from run_monthly_rebalance import get_conn, get_monthly_5th_trading_days, COMMIS
 # ── 常量 ──────────────────────────────────────────────────
 STAMP_DUTY_RATE_ETF = 0.0       # ETF 免印花税
 INITIAL_CAPITAL = 100000        # 初始总资金
-PRICE_SCALE = 0.001             # 指数价格缩放因子（÷1000 → ~元/份）
 
-# ── 标的池定义 ────────────────────────────────────────────
+# ── 标的池定义（真实ETF）─────────────────────────────────
 ETF_UNIVERSE = [
-    {"code": "000016.SH", "name": "上证50",    "desc": "超大盘蓝筹"},
-    {"code": "000300.SH", "name": "沪深300",   "desc": "大盘价值"},
-    {"code": "000905.SH", "name": "中证500",   "desc": "中盘成长"},
-    {"code": "000852.SH", "name": "中证1000",  "desc": "小盘"},
-    {"code": "399006.SZ", "name": "创业板指",  "desc": "科技成长"},
+    {"code": "510300.SH", "name": "沪深300ETF", "desc": "大盘价值"},
+    {"code": "510050.SH", "name": "上证50ETF",  "desc": "超大盘蓝筹"},
+    {"code": "510500.SH", "name": "中证500ETF", "desc": "中盘成长"},
+    {"code": "512100.SH", "name": "中证1000ETF","desc": "小盘"},
+    {"code": "159915.SZ", "name": "创业板ETF",  "desc": "科技成长"},
+    {"code": "518880.SH", "name": "黄金ETF",    "desc": "商品避险"},
+    {"code": "511990.SH", "name": "华宝添益",   "desc": "货币基金"},
 ]
 
-BENCHMARK_CODE = "000300.SH"   # 基准指数代码
+BENCHMARK_CODE = "510300.SH"   # 基准（沪深300ETF）
 CASH_NAME = "货币基金"          # 现金避险名称
+
+
+# ── 数据表路由 ────────────────────────────────────────────
+
+def _get_data_table(ts_code):
+    """判断从哪个表读取数据
+
+    - etf_daily: 真实ETF价格（51xxxx/58xxxx.SH, 159xxxx.SZ）
+    - index_daily: 指数价格（用于非ETF代码的fallback）
+    """
+    if ts_code.endswith('.SH') and len(ts_code) == 9 and ts_code[:2] in ('51', '58'):
+        return 'etf_daily'
+    if ts_code.endswith('.SZ') and len(ts_code) == 9 and ts_code[:3] == '159':
+        return 'etf_daily'
+    return 'index_daily'
 
 
 # ── 价格辅助函数 ──────────────────────────────────────────
 
-def get_etf_price(ts_code, trade_date, scaled=True):
-    """获取指数模拟ETF价格
+def _query_price(ts_code, trade_date, field="close", fallback_field="close"):
+    """从 etf_daily 或 index_daily 表查询价格
 
-    从 index_daily 表查询收盘价，除以 PRICE_SCALE 模拟ETF净值。
-    支持精确日期匹配 + fallback 到最近交易日。
+    内部函数：先用精确日期匹配，fallback到最近交易日。
+    返回原始数据库中的数值（ETF实际价格 / 指数原始点数）。
     """
+    table = _get_data_table(ts_code)
     conn = get_conn()
+
     row = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date = ?",
+        f"SELECT {field} FROM {table} WHERE ts_code = ? AND trade_date = ?",
         conn, params=(ts_code, trade_date)
     )
-    if len(row) > 0:
+    if len(row) > 0 and row.iloc[0][field] is not None:
         conn.close()
-        price = float(row.iloc[0]["close"])
-        return price * PRICE_SCALE if scaled else price
+        return float(row.iloc[0][field])
 
+    # fallback: 最近交易日
     row2 = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date < ? ORDER BY trade_date DESC LIMIT 1",
+        f"SELECT {fallback_field} FROM {table} WHERE ts_code = ? "
+        f"AND trade_date < ? ORDER BY trade_date DESC LIMIT 1",
         conn, params=(ts_code, trade_date)
     )
     conn.close()
-    if len(row2) > 0:
-        price = float(row2.iloc[0]["close"])
-        return price * PRICE_SCALE if scaled else price
+    if len(row2) > 0 and row2.iloc[0][fallback_field] is not None:
+        return float(row2.iloc[0][fallback_field])
     return None
 
 
-def get_etf_open(ts_code, trade_date, scaled=True):
-    """获取指数模拟ETF开盘价
+def get_etf_price(ts_code, trade_date):
+    """获取ETF收盘价（真实价格，无需缩放）"""
+    return _query_price(ts_code, trade_date, field="close")
 
-    从 index_daily 表查询开盘价。
-    fallback: 若当天无开盘价，用前一日收盘价代替。
-    """
-    conn = get_conn()
-    # 优先取当日开盘价
-    row = pd.read_sql_query(
-        "SELECT open FROM index_daily WHERE ts_code = ? AND trade_date = ?",
-        conn, params=(ts_code, trade_date)
-    )
-    if len(row) > 0 and row.iloc[0]["open"] is not None:
-        conn.close()
-        price = float(row.iloc[0]["open"])
-        return price * PRICE_SCALE if scaled else price
 
-    # fallback: 前一日收盘价
-    row2 = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date < ? "
-        "ORDER BY trade_date DESC LIMIT 1",
-        conn, params=(ts_code, trade_date)
-    )
-    conn.close()
-    if len(row2) > 0:
-        price = float(row2.iloc[0]["close"])
-        return price * PRICE_SCALE if scaled else price
-    return None
+def get_etf_open(ts_code, trade_date):
+    """获取ETF开盘价"""
+    return _query_price(ts_code, trade_date, field="open", fallback_field="close")
 
 
 # ── ETF 费用计算（免印花税）────────────────────────────────
@@ -114,52 +114,45 @@ def calc_etf_fee(buy_or_sell, price, shares):
 
 # ── 技术指标函数 ──────────────────────────────────────────
 
-def calc_roc(ts_code, trade_date, period=20):
-    """ROC涨跌幅：close / close_N_days_ago - 1
+def _query_history(ts_code, trade_date, field, limit):
+    """从 etf_daily 或 index_daily 查询历史序列
 
-    使用缩放后价格计算（不影响ROC百分比值，因为缩放因子约掉了）。
-    但为了统一，直接用原始指数价格计算。
+    返回: 降序排列的 float 列表，或 None
     """
+    table = _get_data_table(ts_code)
     conn = get_conn()
     rows = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
-        conn, params=(ts_code, trade_date, period + 5)
+        f"SELECT {field} FROM {table} WHERE ts_code = ? AND trade_date <= ? "
+        f"ORDER BY trade_date DESC LIMIT ?",
+        conn, params=(ts_code, trade_date, limit)
     )
     conn.close()
-    if len(rows) < period + 1:
+    if len(rows) < 1:
         return None
-    closes = [float(r) for r in rows["close"].values]
+    return [float(r) for r in rows[field].values]
+
+
+def calc_roc(ts_code, trade_date, period=20):
+    """ROC涨跌幅：close / close_N_days_ago - 1"""
+    closes = _query_history(ts_code, trade_date, "close", period + 5)
+    if closes is None or len(closes) < period + 1:
+        return None
     return closes[0] / closes[period] - 1.0
 
 
 def calc_ma(ts_code, trade_date, period=60):
-    """计算指数移动平均线"""
-    conn = get_conn()
-    rows = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
-        conn, params=(ts_code, trade_date, period + 5)
-    )
-    conn.close()
-    if len(rows) < period:
+    """计算移动平均线"""
+    closes = _query_history(ts_code, trade_date, "close", period + 5)
+    if closes is None or len(closes) < period:
         return None
-    closes = [float(r) for r in rows["close"].values]
     return np.mean(closes[:period])
 
 
 def calc_volatility(ts_code, trade_date, window=20):
-    """计算指数年化波动率
-
-    基于 window 个交易日的对数收益率计算年化标准差。
-    """
-    conn = get_conn()
-    rows = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
-        conn, params=(ts_code, trade_date, window + 5)
-    )
-    conn.close()
-    if len(rows) < window + 1:
+    """计算年化波动率"""
+    closes = _query_history(ts_code, trade_date, "close", window + 5)
+    if closes is None or len(closes) < window + 1:
         return None
-    closes = [float(r) for r in rows["close"].values]
     closes = closes[::-1]  # 升序
     returns = np.diff(np.log(closes))
     return float(np.std(returns) * np.sqrt(252))
@@ -191,7 +184,7 @@ def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
     results = []
     for etf in ETF_UNIVERSE:
         code = etf["code"]
-        close_price = get_etf_price(code, trade_date, scaled=False)
+        close_price = get_etf_price(code, trade_date)
         if close_price is None:
             continue
 
@@ -428,9 +421,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
     else:
         sharpe = 0.0
 
-    # ── 基准指数收益 ──
-    b_start = get_etf_price(BENCHMARK_CODE, trade_dates[0], scaled=False)
-    b_end = get_etf_price(BENCHMARK_CODE, trade_dates[-1], scaled=False)
+    # ── 基准收益 ──
+    b_start = get_etf_price(BENCHMARK_CODE, trade_dates[0])
+    b_end = get_etf_price(BENCHMARK_CODE, trade_dates[-1])
     idx_return = (b_end / b_start - 1) * 100 if b_start and b_end else 0
 
     # ── 输出 ──
