@@ -29,7 +29,6 @@ from run_etf_rotation import get_conn, get_trade_dates, COMMISSION_RATE, COMMISS
 
 # ── 常量 ──────────────────────────────────────────────────
 INITIAL_CAPITAL = 100000
-CASH_NAME = "货币基金"
 BENCHMARK = "510300.SH"    # 沪深300ETF 用作市场过滤器
 CASH_NAME = "货币基金"
 
