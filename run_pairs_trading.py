@@ -8,9 +8,14 @@
   叠加市场趋势过滤（沪深300ETF > MA60时才开仓）。
 
 支持的配对（--pair 编号）：
-  [1] 沪深300ETF vs 上证50ETF    — 宽基轮动
-  [2] 中证500ETF vs 中证1000ETF   — 中小盘序列
-  [3] 创业板ETF vs 创业板50ETF   — 创业板系列
+  [1]  沪深300 vs 上证50       — 宽基·大盘内部
+  [2]  中证500 vs 中证800      — 宽基·中大盘
+  [3]  创业板   vs 创业板50     — 宽基·创业板系列
+  [4]  科创50   vs 创业板50    — 宽基·科技成长
+  [5]  半导体   vs 新能源车    — 行业·科技制造
+  [6]  沪深300 vs 中证800      — 宽基·高度相关
+  [7]  恒生ETF vs 沪深300     — 跨境·AH溢价
+  [8]  黄金ETF vs 国债ETF      — 避险·股债轮动
 
 回测频率（--check-freq）：
   daily   每日检查
@@ -42,15 +47,46 @@ PAIRS = [
     },
     {
         "id": 2,
-        "name": "中证500-中证1000",
+        "name": "中证500-中证800",
         "a": "510500.SH", "a_name": "中证500ETF",
-        "b": "512100.SH", "b_name": "中证1000ETF",
+        "b": "515800.SH", "b_name": "中证800ETF",
     },
     {
         "id": 3,
         "name": "创业板-创业板50",
         "a": "159915.SZ", "a_name": "创业板ETF",
         "b": "159949.SZ", "b_name": "创业板50ETF",
+    },
+    # ── 新增配对 ──────────────────────────────────────────
+    {
+        "id": 4,
+        "name": "科创50-创业板50",
+        "a": "588000.SH", "a_name": "科创50ETF",
+        "b": "159949.SZ", "b_name": "创业板50ETF",
+    },
+    {
+        "id": 5,
+        "name": "半导体-新能源车",
+        "a": "512480.SH", "a_name": "半导体ETF",
+        "b": "515030.SH", "b_name": "新能源车ETF",
+    },
+    {
+        "id": 6,
+        "name": "沪深300-中证800",
+        "a": "510300.SH", "a_name": "沪深300ETF",
+        "b": "515800.SH", "b_name": "中证800ETF",
+    },
+    {
+        "id": 7,
+        "name": "恒生-沪深300",
+        "a": "159920.SZ", "a_name": "恒生ETF",
+        "b": "510300.SH", "b_name": "沪深300ETF",
+    },
+    {
+        "id": 8,
+        "name": "黄金-国债",
+        "a": "518880.SH", "a_name": "黄金ETF",
+        "b": "511010.SH", "b_name": "国债ETF",
     },
 ]
 
@@ -201,14 +237,16 @@ def run_pairs_backtest(start_date="20200101", end_date="20251231",
 
     # ── 获取交易日 ──
     trade_dates = get_trade_dates(start_date, end_date)
-    if len(trade_dates) < 120:
+    # 至少需要 window+10 个交易日才能算出有意义的 Z-score
+    min_days = window + 10
+    if len(trade_dates) < min_days:
         print(f"[ERR] 交易日数据不足：{len(trade_dates)} 天")
         return None
 
     # ── 计算相关系数（用户可见） ──
     corr = calc_correlation(code_a, code_b, start_date, end_date)
     if verbose:
-        method_names = {1: "沪深300-上证50", 2: "中证500-中证1000", 3: "创业板-创业板50"}
+        method_names = {1: "沪深300-上证50", 2: "中证500-中证800", 3: "创业板-创业板50"}
         check_names = {"daily": "每日", "weekly": "每周"}
         print(f"\n{'=' * 70}")
         print(f"  配对套利回测")
@@ -313,30 +351,32 @@ def run_pairs_backtest(start_date="20200101", end_date="20251231",
                         pos_shares = 0
 
                 # ── 开仓（exit后或新开） ──
+                # ★★★ 修复：已持有目标仓位则跳过开仓 ★★★
                 if action in ("buy_a", "buy_b"):
-                    buy_code = code_a if action == "buy_a" else code_b
-                    buy_name = name_a if action == "buy_a" else name_b
-                    open_price = get_etf_open(buy_code, td)
-                    if open_price and open_price > 0:
-                        # 预留费用空间
-                        alloc = cash * 0.998
-                        max_shares = int(alloc / open_price)
-                        if max_shares >= 1:
-                            cost = max_shares * open_price
-                            fee = calc_etf_fee('buy', open_price, max_shares)
-                            if cost + fee <= cash:
-                                cash -= cost + fee
-                                position = "A" if action == "buy_a" else "B"
-                                pos_shares = max_shares
-                                pos_buy_price = open_price
-                                trades.append({
-                                    "date": td, "action": "BUY", "code": buy_code,
-                                    "name": buy_name, "price": open_price,
-                                    "shares": max_shares, "pnl": None,
-                                    "reason": "open"
-                                })
-                                if verbose:
-                                    print(f"    → 买入 {buy_name}：{max_shares}份 @ {open_price:.3f}")
+                    if not ((action == "buy_a" and position == "A") or (action == "buy_b" and position == "B")):
+                        buy_code = code_a if action == "buy_a" else code_b
+                        buy_name = name_a if action == "buy_a" else name_b
+                        open_price = get_etf_open(buy_code, td)
+                        if open_price and open_price > 0:
+                            # 预留费用空间
+                            alloc = cash * 0.998
+                            max_shares = int(alloc / open_price)
+                            if max_shares >= 1:
+                                cost = max_shares * open_price
+                                fee = calc_etf_fee('buy', open_price, max_shares)
+                                if cost + fee <= cash:
+                                    cash -= cost + fee
+                                    position = "A" if action == "buy_a" else "B"
+                                    pos_shares = max_shares
+                                    pos_buy_price = open_price
+                                    trades.append({
+                                        "date": td, "action": "BUY", "code": buy_code,
+                                        "name": buy_name, "price": open_price,
+                                        "shares": max_shares, "pnl": None,
+                                        "reason": "open"
+                                    })
+                                    if verbose:
+                                        print(f"    → 买入 {buy_name}：{max_shares}份 @ {open_price:.3f}")
 
         # ── 每日净值 ──
         total_value = cash
@@ -418,8 +458,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="配对套利策略回测（A股多头轮动版）")
     parser.add_argument("start_date", nargs="?", default="20200101")
     parser.add_argument("end_date", nargs="?", default="20251231")
-    parser.add_argument("--pair", type=int, default=1, choices=[1, 2, 3],
-                        help="配对编号 1=沪深300-上证50, 2=中证500-中证1000, 3=创业板-创业板50")
+    parser.add_argument("--pair", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8],
+                        help="配对编号 1=沪深300-上证50, 2=中证500-中证800, 3=创业板-创业板50")
     parser.add_argument("--threshold", type=float, default=2.0,
                         help="Z-score开仓阈值（默认2.0）")
     parser.add_argument("--window", type=int, default=60,

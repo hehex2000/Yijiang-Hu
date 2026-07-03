@@ -23,7 +23,7 @@ from run_monthly_rebalance import (
     get_trade_dates, get_monthly_5th_trading_days,
     get_stock_pool_index, get_stock_name,
     select_momentum_stocks, is_above_ma,
-    INIT_CAPITAL, INDEX_DISPLAY_NAME,
+    INIT_CAPITAL, INDEX_DISPLAY_NAME, calc_win_rate,
 )
 from run_grid_backtest import generate_grid_levels
 
@@ -536,6 +536,9 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     print(f"  最大回撤：{max_dd:.2f}%")
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}")
+    win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
+    if tot_cnt > 0:
+        print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     if atr_stop_multiple > 0 or trailing_stop_pct > 0:
         print(f"  止损次数：{stop_count}")
     print(f"  基准涨幅：{idx_return:+.2f}%")

@@ -21,6 +21,14 @@ from run_monthly_rebalance import (
     get_conn, get_price, get_open_price, calc_fee,
     INIT_CAPITAL, INDEX_DISPLAY_NAME,
 )
+from run_backtest import calc_win_rate_from_trades
+
+# ETF显示名称（专供网格交易使用）
+ETF_DISPLAY_NAME = {
+    "510300.SH": "沪深300ETF",
+    "510500.SH": "中证500ETF",
+    "512100.SH": "中证800ETF",
+}
 
 # ── 默认参数 ──
 GRID_PCT = 0.02          # 每格百分比 (2%)
@@ -58,7 +66,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     百分比网格交易回测
 
     Args:
-        ts_code:           标的代码（指数或ETF）
+        ts_code:           标的代码（ETF或指数）
         start_date:        回测开始日期 YYYYMMDD
         end_date:          回测结束日期 YYYYMMDD
         grid_pct:          每格百分比 (0.02 = 2%)
@@ -69,22 +77,12 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     Returns:
         dict: 绩效指标
     """
-    # ETF/指数映射：ETF代码→模拟指数代理
-    ETF_PROXY = {
-        "510300.SH": "000300.SH",  # 沪深300ETF→沪深300指数
-        "510500.SH": "000905.SH",  # 中证500ETF→中证500指数
-        "512100.SH": "000906.SH",  # 中证800ETF→中证800指数
-    }
-    if ts_code in ETF_PROXY:
-        ts_code = ETF_PROXY[ts_code]
-
-    # 判断标的类型（000XXX.SH=指数，其余=个股）
+    # 判断标的类型（000XXX.SH=指数，其余=ETF/个股）
     is_index = (ts_code.endswith(".SH") and ts_code[:3] == "000" and len(ts_code) == 9)
     table = "index_daily" if is_index else "daily"
-    price_scale = 0.001 if is_index else 1.0
-    lot_size = 1 if is_index else 100
+    lot_size = 1 if is_index else 100  # 指数最少1份，ETF/股票最少1手100股
 
-    display = INDEX_DISPLAY_NAME.get(ts_code, ts_code)
+    display = INDEX_DISPLAY_NAME.get(ts_code, ETF_DISPLAY_NAME.get(ts_code, ts_code))
     print("=" * 70)
     print(f"百分比网格交易回测")
     print("=" * 70)
@@ -98,6 +96,9 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
 
     # ===== 1. 获取历史数据 =====
     conn = get_conn()
+    # 非指数标的直接查 etf_daily 表（网格交易只针对ETF）
+    if not is_index:
+        table = "etf_daily"
     df = pd.read_sql_query(f"""
         SELECT trade_date, open, high, low, close
         FROM {table}
@@ -110,19 +111,11 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         print(f"⚠️ 数据不足（{len(df)}条），无法回测")
         return None
 
-    # 价格缩放（指数÷1000模拟ETF，约4元/份）
-    df['scaled_open']  = df['open']  * price_scale
-    df['scaled_high']  = df['high']  * price_scale
-    df['scaled_low']   = df['low']   * price_scale
-    df['scaled_close'] = df['close'] * price_scale
-
     print(f"  交易日数：{len(df)}")
-    print(f"  原始价格范围：{df['close'].min():.2f} ~ {df['close'].max():.2f}")
-    print(f"  缩放后价格（模拟ETF）：{df['scaled_close'].min():.2f} ~ {df['scaled_close'].max():.2f}")
+    print(f"  价格范围：{df['close'].min():.2f} ~ {df['close'].max():.2f}")
 
     # ===== 2. 生成网格线 =====
-    first_scaled_close = float(df.iloc[0]['scaled_close'])
-    base_price = first_scaled_close
+    base_price = float(df.iloc[0]['close'])
     levels_down, levels_up = generate_grid_levels(base_price, grid_pct)
     all_levels = sorted(set(levels_down + [base_price] + levels_up))
     all_levels = [round(lv, 4) for lv in all_levels]
@@ -134,7 +127,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     # ===== 3. 初始化仓位（按金额，股票取整手）=====
     cash = initial_capital * (1 - init_position_pct)
     position_amount = initial_capital * init_position_pct
-    first_open = float(df.iloc[0]['scaled_open'])
+    first_open = float(df.iloc[0]['open'])
     raw_units = position_amount / first_open if first_open > 0 else 0
     if lot_size > 1:
         units = int(raw_units / lot_size) * lot_size  # 股票取整手
@@ -150,16 +143,22 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
 
     daily_vals = []
     trades = []
-    prev_close = float(df.iloc[0]['scaled_close'])
+    prev_close = float(df.iloc[0]['close'])
     buy_count = 0
     sell_count = 0
 
+    # 记录初始建仓（用于胜率计算）
+    trades.append({
+        "date": int(df.iloc[0]['trade_date']), "action": "BUY",
+        "price": first_open, "shares": units, "reason": "initial_position"
+    })
+
     for _, row in df.iterrows():
         td = int(row['trade_date']) if hasattr(row['trade_date'], 'item') else int(row['trade_date'])
-        op = row['scaled_open']
-        hi = row['scaled_high']
-        lo = row['scaled_low']
-        cl = row['scaled_close']
+        op = row['open']
+        hi = row['high']
+        lo = row['low']
+        cl = row['close']
 
         # ── 检查买入触发（价格跌穿买入格线）──
         for lv in reversed(levels_down):
@@ -239,7 +238,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
 
     # ===== 4. 平仓结算 =====
     if units > 0:
-        last_close = float(df.iloc[-1]['scaled_close'])
+        last_close = float(df.iloc[-1]['close'])
         proceeds = units * last_close
         fee = calc_fee('sell', last_close, units)
         cash += proceeds - fee
@@ -256,6 +255,9 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     years = days / 252
     annual_return = ((final_value / initial_capital) ** (1 / years) - 1) * 100 if years > 0 else 0
 
+    # 计算胜率
+    win_rate, win_cnt, total_closed = calc_win_rate_from_trades(trades)
+
     vals = np.array([d["value"] for d in daily_vals])
     cummax = np.maximum.accumulate(vals)
     safe_cummax = np.where(cummax == 0, 1, np.array(cummax, dtype=float))
@@ -269,7 +271,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         sharpe = 0.0
 
     # ===== 6. 基准对比 =====
-    idx_return = (float(df.iloc[-1]['scaled_close']) / float(df.iloc[0]['scaled_close']) - 1) * 100
+    idx_return = (float(df.iloc[-1]['close']) / float(df.iloc[0]['close']) - 1) * 100
 
     # ===== 7. 输出 =====
     print(f"\n{'=' * 70}")
@@ -284,6 +286,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     print(f"  最大回撤：{max_dd:.2f}%")
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}（买{buy_count}次 / 卖{sell_count}次）")
+    print(f"  胜率：{win_rate:.1f}%（{win_cnt}胜 / {total_closed}笔平仓）")
     print(f"  {display}涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
 

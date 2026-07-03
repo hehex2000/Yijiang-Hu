@@ -14,6 +14,7 @@ if not defined P_BACKTEST_END set P_BACKTEST_END=20211231
 if not defined P_TOP_N set P_TOP_N=5
 if not defined P_SELECTION_METHOD set P_SELECTION_METHOD=multi
 if not defined P_STOCK_POOL set P_STOCK_POOL=all
+if not defined P_PAIRS_CAPITAL set P_PAIRS_CAPITAL=500000
 
 REM 应用到会话变量
 set BACKTEST_START=%P_BACKTEST_START%
@@ -55,10 +56,11 @@ echo.
 set /p MT_POOL=请选择 (1-3, 默认1):
 
 if "%MT_POOL%"=="0" goto :menu
+
+:: 先设默认值，再按输入覆盖（修复变量残留bug）
+set MT_POOL_ARG=--stock-pool 000300.SH
 if "%MT_POOL%"=="2" set MT_POOL_ARG=--stock-pool 000906.SH
 if "%MT_POOL%"=="3" set MT_POOL_ARG=--stock-pool 000905.SH
-if "%MT_POOL%"=="" set MT_POOL_ARG=--stock-pool 000300.SH
-if not defined MT_POOL_ARG set MT_POOL_ARG=--stock-pool 000300.SH
 
 echo.
 echo   正在运行...
@@ -75,9 +77,11 @@ echo ========================================
 echo   ETF轮动策略
 echo ========================================
 echo.
-echo   标的池（7只国内ETF · 真实价格）：
+echo   标的池（20只精选ETF · 真实价格）：
 echo     沪深300 - 上证50 - 中证500 - 中证1000
-echo     创业板 - 黄金 - 货币
+echo     创业板50 - 科创50 - 证券 - 医药
+echo     消费 - 5G通信 - 新能源车 - 旅游
+echo     黄金 - 红利 - 货币 - 更多...
 echo.
 echo   核心逻辑：
 echo     ROC动量×0.5 + 中期动量×0.3 - 波动率×0.2
@@ -92,11 +96,12 @@ echo   [2] 单动量法（满仓第1名·激进）
 echo   [3] 均线过滤法（MA60过滤·保守）
 echo   [0] 返回主菜单
 echo.
+set ETF_METHOD=
 set /p ETF_METHOD=请选择 (1-3, 默认1):
 
 if "%ETF_METHOD%"=="0" goto :menu
+if "%ETF_METHOD%"=="" set ETF_METHOD=1
 set ETF_METHOD_ARG=dual
-if "%ETF_METHOD%"=="1" set ETF_METHOD_ARG=dual
 if "%ETF_METHOD%"=="2" set ETF_METHOD_ARG=single
 if "%ETF_METHOD%"=="3" set ETF_METHOD_ARG=ma_filter
 
@@ -111,23 +116,29 @@ goto :menu
 :pairs_trading
 cls
 echo.
-echo ========================================
+echo =======================================
 echo   配对套利策略（均值回归·多头轮动）
-echo ========================================
+echo =======================================
 echo.
 echo   逻辑：两只高相关ETF，价差拉大时从贵的换到便宜的
 echo   市场过滤：沪深300ETF跌破MA60时强制空仓
+echo   初始资金：%P_PAIRS_CAPITAL% 元
 echo.
 echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
 echo   请选择配对:
-echo   ----------------
-echo   [1] 沪深300ETF vs 上证50ETF（宽基轮动）
-echo   [2] 中证500ETF vs 中证1000ETF（中小盘）
-echo   [3] 创业板ETF vs 创业板50ETF（创业板）
+echo   -----------------
+echo   [1] 沪深300   vs 上证50    （宽基·大盘内部）
+echo   [2] 中证500   vs 中证800   （宽基·中大盘）
+echo   [3] 创业板     vs 创业板50  （宽基·创业板系列）
+echo   [4] 科创50     vs 创业板50   （宽基·科技成长）
+echo   [5] 半导体     vs 新能源车   （行业·科技制造）
+echo   [6] 沪深300   vs 中证800   （宽基·高度相关）
+echo   [7] 恒生ETF   vs 沪深300   （跨境·AH溢价）
+echo   [8] 黄金ETF   vs 国债ETF   （避险·股债轮动）
 echo   [0] 返回主菜单
 echo.
-set /p PAIR_CHOICE=请选择 (1-3, 默认1):
+set /p PAIR_CHOICE=请选择 (1-8, 默认1):
 
 if "%PAIR_CHOICE%"=="0" goto :menu
 if "%PAIR_CHOICE%"=="" set PAIR_CHOICE=1
@@ -135,18 +146,18 @@ set PAIR_ARG=%PAIR_CHOICE%
 
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_pairs_trading.py %BACKTEST_START% %BACKTEST_END% --pair %PAIR_ARG%
+"venv_ml\Scripts\python.exe" run_pairs_trading.py %BACKTEST_START% %BACKTEST_END% --pair %PAIR_ARG% --capital %P_PAIRS_CAPITAL%
 echo.
-echo   [返回主菜单]
+echo   [返回配对菜单]
 pause
-goto :menu
-
+goto :pairs_trading
 :save_config
 (
 echo set P_BACKTEST_START=%BACKTEST_START%
 echo set P_BACKTEST_END=%BACKTEST_END%
 echo set P_TOP_N=%TOP_N%
 echo set P_SELECTION_METHOD=%SELECTION_METHOD%
+echo set P_PAIRS_CAPITAL=%P_PAIRS_CAPITAL%
 ) > user_config.bat
 goto :eof
 
@@ -178,15 +189,13 @@ echo   [2] 设置回测区间
 echo   [3] 设置选股数量
 echo   [4] 选择选股策略
 echo   [5] 设置股票池
-echo   [6] 仅选股（不回测）
-echo   [7] 仅回测（使用最新选股结果）
-echo   [8] 月度调仓回测（价值/红利低波/动量）
-echo   [9] 狗股年度调仓
-echo   [A] 短线逆转策略（超跌反弹）
-echo   [B] 网格交易策略（波劙收割）
-echo   [C] 动量+网格择时（方案①·网格作为市场温度计）
-echo   [D] ETF轮动策略（动量轮动·纯国内资产）
-echo   [E] 配对套利（均值回归·多头轮动）
+echo   [6] 月度调仓回测（价值/红利低波/动量）
+echo   [7] 狗股年度调仓
+echo   [8] 短线逆转策略（超跌反弹）
+echo   [9] 网格交易策略（波劙收割）
+echo   [A] 动量+网格择时（方案①·网格作为市场温度计）
+echo   [B] ETF轮动策略（动量轮动·纯国内资产）
+echo   [C] 配对套利（均值回归·多头轮动）
 echo   [0] 退出
 echo.
 set /p CHOICE=请选择 (1-0):
@@ -197,15 +206,13 @@ if "%CHOICE%"=="2" goto :set_date
 if "%CHOICE%"=="3" goto :set_top_n
 if "%CHOICE%"=="4" goto :set_method
 if "%CHOICE%"=="5" goto :set_stock_pool
-if "%CHOICE%"=="6" goto :select_only
-if "%CHOICE%"=="7" goto :backtest_only
-if "%CHOICE%"=="8" goto :monthly_rebalance
-if "%CHOICE%"=="9" goto :dogs_annual
-if /i "%CHOICE%"=="A" goto :reversal
-if /i "%CHOICE%"=="B" goto :grid
-if /i "%CHOICE%"=="C" goto :momentum_grid_timing
-if /i "%CHOICE%"=="D" goto :etf_rotation
-if /i "%CHOICE%"=="E" goto :pairs_trading
+if "%CHOICE%"=="6" goto :monthly_rebalance
+if "%CHOICE%"=="7" goto :dogs_annual
+if /i "%CHOICE%"=="8" goto :reversal
+if /i "%CHOICE%"=="9" goto :grid
+if /i "%CHOICE%"=="A" goto :momentum_grid_timing
+if /i "%CHOICE%"=="B" goto :etf_rotation
+if /i "%CHOICE%"=="C" goto :pairs_trading
 if "%CHOICE%"=="0" goto :eof
 goto :menu
 
@@ -308,38 +315,6 @@ echo     选股数量: %TOP_N% 只
 echo     选股策略: %SELECTION_METHOD%
 echo.
 venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N%
-echo.
-pause
-goto :menu
-
-:select_only
-cls
-echo.
-echo ================
-echo   仅选股（不回测）
-echo ================
-echo.
-echo   配置:
-echo     选股策略: %SELECTION_METHOD%
-echo     选股数量: %TOP_N% 只
-echo     股票池: %STOCK_POOL%
-echo.
-venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --select-only --top-n %TOP_N% --stock-pool %STOCK_POOL%
-echo.
-pause
-goto :menu
-
-:backtest_only
-cls
-echo.
-echo ================
-echo   仅回测（使用最新选股结果）
-echo ================
-echo.
-echo   配置:
-echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
-echo.
-venv_ml\Scripts\python.exe run_backtest.py --source csv --auto --start-date %BACKTEST_START% --end-date %BACKTEST_END%
 echo.
 pause
 goto :menu
@@ -450,13 +425,15 @@ echo   ----------------
 echo   [1] 沪深300
 echo   [2] 中证800
 echo   [3] 中证500
+echo   [0] 返回主菜单
 echo.
-set /p REV_POOL=请选择 (1-3, 默认1):
+set /p REV_POOL=请选择 (1-3, 0返回主菜单):
 
+if "%REV_POOL%"=="0" goto :menu
+
+set REV_ARG=--stock-pool 000300.SH
 if "%REV_POOL%"=="2" set REV_ARG=--stock-pool 000906.SH
 if "%REV_POOL%"=="3" set REV_ARG=--stock-pool 000905.SH
-if "%REV_POOL%"=="" set REV_ARG=--stock-pool 000300.SH
-if not defined REV_ARG set REV_ARG=--stock-pool 000300.SH
 
 echo.
 echo   配置: 20日跌幅排名, 8日持有, 5只, MACD金叉过滤, 8%%止损
@@ -466,7 +443,7 @@ echo   正在运行...
 "venv_ml\Scripts\python.exe" run_monthly_rebalance.py %BACKTEST_START% %BACKTEST_END% --selection-method reversal %REV_ARG% --top-n 5 --reversal-lookback 20 --reversal-hold 8 --market-filter macd --reversal-stop 0.08
 echo.
 pause
-goto :menu
+goto :reversal
 
 :grid
 cls
@@ -477,19 +454,19 @@ echo ================
 echo.
 echo   请选择标的:
 echo   ----------------
-echo   [1] 沪深300 ETF (510300，指数代理模拟)
-echo   [2] 中证500 ETF (510500，指数代理模拟)
-echo   [3] 中证800 ETF (512100，指数代理模拟)
+echo   [1] 沪深300 ETF (510300，真实ETF)
+echo   [2] 中证500 ETF (510500，真实ETF)
+echo   [3] 中证800 ETF (512100，真实ETF)
 echo   [0] 返回主菜单
 echo.
 set GRID_ARG=
 set /p GRID_CODE=请选择 (1-3, 0返回):
 
 if "%GRID_CODE%"=="0" goto :menu
-if "%GRID_CODE%"=="2" set GRID_ARG=000905.SH
-if "%GRID_CODE%"=="3" set GRID_ARG=000906.SH
-if "%GRID_CODE%"=="" set GRID_ARG=000300.SH
-if not defined GRID_ARG set GRID_ARG=000300.SH
+if "%GRID_CODE%"=="2" set GRID_ARG=510500.SH
+if "%GRID_CODE%"=="3" set GRID_ARG=512100.SH
+if "%GRID_CODE%"=="" set GRID_ARG=510300.SH
+if not defined GRID_ARG set GRID_ARG=510300.SH
 
 echo.
 echo   请设置网格间距:

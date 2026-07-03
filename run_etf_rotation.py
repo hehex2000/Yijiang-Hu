@@ -7,14 +7,13 @@ ETF轮动策略 - 国内资产动量轮动
   dual        双动量法（默认）：前2名等权，MA60过滤
   ma_filter   均线过滤法：MA60之上才买，全部跌破MA60时空仓
 
-标的池（7只国内ETF）：
-  510300.SH 沪深300ETF  — 大盘价值（基准）
-  510050.SH 上证50ETF   — 超大盘蓝筹
-  510500.SH 中证500ETF  — 中盘成长
-  512100.SH 中证1000ETF — 小盘
-  159915.SZ 创业板ETF   — 科技成长
-  518880.SH 黄金ETF     — 商品避险
-  511990.SH 华宝添益    — 货币基金
+标的池（20只·分类覆盖）：
+  宽基(9)：沪深300/上证50/中证800/上证指数/中证500/中证1000/创业板/创业板50/科创50
+  行业(5)：半导体/新能源车/医药/消费/证券
+  跨境(2)：恒生ETF(港股)/纳指ETF(美股)
+  商品(2)：黄金ETF/原油LOF
+  债券(1)：国债ETF
+  货币(1)：华宝添益
 
 数据来源：etf_daily 表（真实ETF价格），无指数÷1000缩放。
 """
@@ -31,15 +30,34 @@ from run_monthly_rebalance import get_conn, get_monthly_5th_trading_days, COMMIS
 STAMP_DUTY_RATE_ETF = 0.0       # ETF 免印花税
 INITIAL_CAPITAL = 100000        # 初始总资金
 
-# ── 标的池定义（真实ETF）─────────────────────────────────
+# ── 标的池定义（真实ETF·扩大版）───────────────────────────────
+#  分类：宽基 / 行业 / 跨境 / 商品债券 / 货币
 ETF_UNIVERSE = [
-    {"code": "510300.SH", "name": "沪深300ETF", "desc": "大盘价值"},
-    {"code": "510050.SH", "name": "上证50ETF",  "desc": "超大盘蓝筹"},
-    {"code": "510500.SH", "name": "中证500ETF", "desc": "中盘成长"},
-    {"code": "512100.SH", "name": "中证1000ETF","desc": "小盘"},
-    {"code": "159915.SZ", "name": "创业板ETF",  "desc": "科技成长"},
-    {"code": "518880.SH", "name": "黄金ETF",    "desc": "商品避险"},
-    {"code": "511990.SH", "name": "华宝添益",   "desc": "货币基金"},
+    # ── 宽基 ──────────────────────────────────────────────
+    {"code": "510300.SH", "name": "沪深300ETF", "desc": "大盘价值",   "cat": "宽基"},
+    {"code": "510050.SH", "name": "上证50ETF",  "desc": "超大盘蓝筹", "cat": "宽基"},
+    {"code": "515800.SH", "name": "中证800ETF", "desc": "大中盘",     "cat": "宽基"},
+    {"code": "510980.SH", "name": "上证指数ETF","desc": "上证全指",   "cat": "宽基"},
+    {"code": "510500.SH", "name": "中证500ETF", "desc": "中盘成长",   "cat": "宽基"},
+    {"code": "512100.SH", "name": "中证1000ETF","desc": "小盘",       "cat": "宽基"},
+    {"code": "159915.SZ", "name": "创业板ETF",  "desc": "科技成长",   "cat": "宽基"},
+    {"code": "159949.SZ", "name": "创业板50ETF","desc": "创业板龙头", "cat": "宽基"},
+    {"code": "588000.SH", "name": "科创50ETF",  "desc": "科创板",     "cat": "宽基"},
+    # ── 行业 ──────────────────────────────────────────────
+    {"code": "512480.SH", "name": "半导体ETF",  "desc": "芯片半导体", "cat": "行业"},
+    {"code": "515030.SH", "name": "新能源车ETF","desc": "新能源",     "cat": "行业"},
+    {"code": "512010.SH", "name": "医药ETF",    "desc": "医药生物",   "cat": "行业"},
+    {"code": "159928.SZ", "name": "消费ETF",    "desc": "大消费",     "cat": "行业"},
+    {"code": "512880.SH", "name": "证券ETF",    "desc": "券商金融",   "cat": "行业"},
+    # ── 跨境 ──────────────────────────────────────────────
+    {"code": "159920.SZ", "name": "恒生ETF",    "desc": "港股宽基",   "cat": "跨境"},
+    {"code": "513100.SH", "name": "纳指ETF",    "desc": "美股科技",   "cat": "跨境"},
+    # ── 商品/债券 ─────────────────────────────────────────
+    {"code": "518880.SH", "name": "黄金ETF",     "desc": "商品避险",   "cat": "商品"},
+    {"code": "501018.SH", "name": "原油LOF",    "desc": "商品能源",   "cat": "商品"},
+    {"code": "511010.SH", "name": "国债ETF",     "desc": "利率债",     "cat": "债券"},
+    # ── 货币 ──────────────────────────────────────────────
+    {"code": "511990.SH", "name": "华宝添益",    "desc": "货币基金",   "cat": "货币"},
 ]
 
 BENCHMARK_CODE = "510300.SH"   # 基准（沪深300ETF）
@@ -119,6 +137,41 @@ def calc_etf_fee(buy_or_sell, price, shares):
     commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
     slippage = amount * SLIPPAGE_RATE
     return commission + slippage
+
+
+# ── 胜率计算 ─────────────────────────────────────────────
+
+def calc_win_rate(trades):
+    """从交易记录计算胜率（FIFO匹配买卖对）"""
+    if not trades:
+        return 0.0, 0, 0
+    pending = {}
+    win = 0
+    total = 0
+    for t in trades:
+        code = t["code"]
+        action = t["action"]
+        shares = t["shares"]
+        price = t["price"]
+        if action.startswith("BUY"):
+            if code not in pending:
+                pending[code] = []
+            pending[code].append({"price": price, "shares": shares})
+        elif action.startswith("SELL"):
+            remaining = shares
+            while remaining > 0 and code in pending and pending[code]:
+                first = pending[code][0]
+                pnl_shares = min(first["shares"], remaining)
+                pnl = (price - first["price"]) * pnl_shares
+                total += 1
+                if pnl > 0:
+                    win += 1
+                first["shares"] -= pnl_shares
+                remaining -= pnl_shares
+                if first["shares"] <= 0:
+                    pending[code].pop(0)
+    wr = (win / total * 100) if total > 0 else 0.0
+    return wr, win, total
 
 
 # ── 技术指标函数 ──────────────────────────────────────────
@@ -449,6 +502,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}（买{sum(1 for t in trades if t['action']=='BUY')}次 / "
           f"卖{sum(1 for t in trades if t['action']=='SELL')}次）")
+    win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
+    if tot_cnt > 0:
+        print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     print(f"  基准（沪深300）涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
 

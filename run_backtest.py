@@ -36,6 +36,48 @@ DB_PATH = DATA["local_db_path"]
 # 策略插件自动发现（无需修改此文件即可添加新策略）
 # ══════════════════════════════════════════════════════
 
+# ---- 胜率计算函数 ----
+def calc_win_rate_from_trades(trade_records):
+    """
+    从交易记录计算胜率
+    trade_records: list of dicts with keys: action, price, shares
+    Returns: (win_rate_pct, win_count, total_closed)
+    """
+    if not trade_records:
+        return 0.0, 0, 0
+    
+    # FIFO 匹配买卖对
+    pending_buys = []  # [{"price": p, "shares": s}]
+    win = 0
+    total = 0
+    
+    for t in trade_records:
+        action = t.get("action", "")
+        shares = t.get("shares", 0)
+        price = t.get("price", 0.0)
+        
+        if action.startswith("BUY"):
+            pending_buys.append({"price": price, "shares": shares})
+        elif action.startswith("SELL"):
+            remaining = shares
+            while remaining > 0 and pending_buys:
+                first = pending_buys[0]
+                match_shares = min(first["shares"], remaining)
+                pnl = (price - first["price"]) * match_shares
+                total += 1
+                if pnl > 0:
+                    win += 1
+                
+                first["shares"] -= match_shares
+                remaining -= match_shares
+                
+                if first["shares"] <= 0:
+                    pending_buys.pop(0)
+    
+    wr = (win / total * 100) if total > 0 else 0.0
+    return wr, win, total
+
+
 def load_strategy_plugins():
     """
     自动扫描 backtest/*.py，发现所有 BaseStrategy 子类
@@ -1522,19 +1564,21 @@ def run_backtest(stocks):
         sname = scfg["name"]
         print(f"\n{'─'*100}")
         print(f"  【{sname}】")
-        print(f"  {'代码':<8} {'名称':<8} {'初始本金':>9} {'期末资产':>9} {'盈亏金额':>9} {'收益率':>8} {'超额':>8} {'交易':>6} {'最大回撤':>10}")
+        print(f"  {'代码':<8} {'名称':<8} {'初始本金':>9} {'期末资产':>9} {'盈亏金额':>9} {'收益率':>8} {'超额':>8} {'交易':>6} {'最大回撤':>10} {'胜率':>6}")
         print(f"  {'─'*80}")
 
         results = []
         for code, (name, df, start_idx) in stock_data.items():
             try:
-                # ═─ 优先使用插件（类方式）══─
+                # ── 优先使用插件（类方式）───
                 if skey in plugins:
                     strategy_class = plugins[skey]
                     strategy = strategy_class(capital, scfg)
                     result = strategy.run(df, start_idx)
                     ret = result.get("returns", 0.0)
                     trades = len(result.get("trades", []))
+                    # 计算胜率
+                    win_rate, win_cnt, total_trades = calc_win_rate_from_trades(result.get("trades", []))
                     # 计算最大回撤
                     daily_values = result.get("daily_values", [])
                     if daily_values:
@@ -1543,10 +1587,11 @@ def run_backtest(stocks):
                     else:
                         max_dd = 0.0
                     
-                # ═─ 回退到硬编码函数（兼容旧策略）══─
+                # ── 回退到硬编码函数（兼容旧策略）───
                 elif skey in strategy_funcs:
                     func = strategy_funcs[skey][0]
                     ret, trades, max_dd = func(df, capital, scfg, start_idx)
+                    win_rate = 0.0  # 内置函数暂不支持胜率
                 else:
                     print(f"  [ERR] 未找到策略: {skey}")
                     continue
@@ -1560,8 +1605,8 @@ def run_backtest(stocks):
                 # 计算盈亏金额
                 final_val = capital * (1 + ret / 100)
                 profit = final_val - capital
-                print(f"  {code:<8} {name:<8} {capital:>9,} {final_val:>9,.0f} {profit:>+9,.0f} {ret:>+7.2f}% {exc:>+7.2f}% {trades:>6} {max_dd:>6.2f}%")
-                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd, "profit": profit, "final_val": final_val})
+                print(f"  {code:<8} {name:<8} {capital:>9,} {final_val:>9,.0f} {profit:>+9,.0f} {ret:>+7.2f}% {exc:>+7.2f}% {trades:>6} {max_dd:>6.2f}% {win_rate:>6.1f}%")
+                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd, "profit": profit, "final_val": final_val, "win_rate": win_rate})
             except Exception as e:
                 print(f"  {code:<8} {name:<8} {'ERR':>8} ({e})")
 
@@ -1578,6 +1623,7 @@ def run_backtest(stocks):
                 "n": len(results),
                 "trades_mean": np.mean([r["trades"] for r in results]),
                 "max_dd_mean": np.mean([r["max_dd"] for r in results]),
+                "win_rate_mean": np.mean([r["win_rate"] for r in results]),
             }
             # 买入持有不显示"优于BH"
             if skey == "buy_hold":
@@ -1588,7 +1634,7 @@ def run_backtest(stocks):
             print(f"  汇总: 均值{s['mean']:+.2f}% 中位数{s['median']:+.2f}% "
                   f"正收益{s['n_pos']}/{len(results)} 跑赢{s['n_beat']}/{len(results)} "
                   f"{better_bh_str} 均交易{s['trades_mean']:.1f}次 "
-                  f"均最大回撤{s['max_dd_mean']:.2f}%")
+                  f"均最大回撤{s['max_dd_mean']:.2f}% 胜率{s['win_rate_mean']:.1f}%")
             # 资金汇总
             total_initial = capital * len(results)
             total_final = sum(r["final_val"] for r in results)
@@ -1601,7 +1647,7 @@ def run_backtest(stocks):
     print(f"\n\n{'='*100}")
     print(f"  【策略对比总表】")
     print(f"{'='*100}")
-    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'均最大回撤':>12} {'最佳':>10} {'最差':>10}")
+    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'均最大回撤':>12} {'胜率':>6} {'最佳':>10} {'最差':>10}")
     print(f"  {'─'*90}")
     for skey, scfg in enabled:
         s = all_summaries.get(scfg["name"], {})
@@ -1609,7 +1655,7 @@ def run_backtest(stocks):
             better_bh_display = f"{s['n_better_bh']}/{s['n']}" if skey != "buy_hold" else "N/A"
             print(f"  {scfg['name']:<16} {s['mean']:>+7.2f}% {s['median']:>+7.2f}% "
                   f"{s['n_pos']}/{s['n']:>4}  {s['n_beat']}/{s['n']:>4}  {better_bh_display:>6}  "
-                  f"{s['trades_mean']:>5.1f}  {s['max_dd_mean']:>11.2f}%  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%")
+                  f"{s['trades_mean']:>5.1f}  {s['max_dd_mean']:>11.2f}%  {s['win_rate_mean']:>5.1f}%  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%")
     bh_mean = np.mean(list(bh_results.values()))
     print(f"  {'─'*90}")
     print(f"  {'买入持有(等权)':<16} {bh_mean:>+7.2f}%")
@@ -1629,6 +1675,7 @@ def run_backtest(stocks):
                     "跑赢指数比": f"{s['n_beat']}/{s['n']}", "优于买入持有比": f"{s['n_better_bh']}/{s['n']}",
                     "平均交易次数": round(s["trades_mean"], 1),
                     "均最大回撤%": round(s["max_dd_mean"], 2),
+                    "胜率%": round(s["win_rate_mean"], 2),
                     "最佳%": round(s["best"], 2), "最差%": round(s["worst"], 2),
                 })
         rows.append({"策略": "买入持有(等权)", "均值收益%": round(bh_mean, 2)})

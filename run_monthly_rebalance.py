@@ -49,6 +49,40 @@ COMMISSION_RATE = 0.00025  # 佣金率
 COMMISSION_MIN = 5.0       # 最低佣金
 STAMP_DUTY_RATE = 0.001    # 印花税率（卖出收取）
 
+# ---- 辅助函数 ----
+
+def calc_win_rate(trades):
+    """从交易记录列表计算胜率（FIFO匹配买卖对）"""
+    if not trades:
+        return 0.0, 0, 0
+    pending = {}  # code -> [{"price": p, "shares": s}]
+    win = 0
+    total = 0
+    for t in trades:
+        code = t["code"]
+        action = t["action"]
+        shares = t["shares"]
+        price = t["price"]
+        if action.startswith("BUY"):
+            if code not in pending:
+                pending[code] = []
+            pending[code].append({"price": price, "shares": shares})
+        elif action.startswith("SELL"):
+            remaining = shares
+            while remaining > 0 and code in pending and pending[code]:
+                first = pending[code][0]
+                pnl_shares = min(first["shares"], remaining)
+                pnl = (price - first["price"]) * pnl_shares
+                total += 1
+                if pnl > 0:
+                    win += 1
+                first["shares"] -= pnl_shares
+                remaining -= pnl_shares
+                if first["shares"] <= 0:
+                    pending[code].pop(0)
+    wr = (win / total * 100) if total > 0 else 0.0
+    return wr, win, total
+
 # ---- MACD参数 ----
 MACD_FAST   = 12
 MACD_SLOW   = 26
@@ -1162,6 +1196,9 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"  最大回撤：{max_dd:.2f}%")
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}")
+    win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
+    if tot_cnt > 0:
+        print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     print(f"  止损触发：{stop_count} 次")
     print(f"  减仓次数：{reduce_count} 次")
 
@@ -1583,6 +1620,9 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
     print(f"  最大回撤：{max_dd:.2f}%")
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}")
+    win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
+    if tot_cnt > 0:
+        print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     if atr_stop_multiple > 0 or trailing_stop_pct > 0:
         print(f"  止损次数：{stop_count}")
     print(f"  中证800涨幅：{idx_return:+.2f}%")
@@ -1615,6 +1655,7 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         "max_drawdown": max_dd,
         "sharpe": sharpe,
         "trades": len(trades),
+        "win_rate": calc_win_rate(trades)[0],
         "idx_return": idx_return,
         "stop_count": stop_count,
         "daily_values": daily_vals,
@@ -1670,6 +1711,7 @@ def compare_momentum_periods(start_date="20200101", end_date="20251231",
         ("最大回撤(%)",     [results[lb]["max_drawdown"]    for lb in lookbacks] + ["-"]),
         ("夏普比率",       [results[lb]["sharpe"]          for lb in lookbacks] + ["-"]),
         ("交易次数",       [results[lb]["trades"]          for lb in lookbacks] + ["-"]),
+        ("胜率(%)",        [results[lb].get("win_rate", 0) for lb in lookbacks] + ["-"]),
     ]
 
     for label, vals in rows:
@@ -2042,6 +2084,9 @@ def run_reversal_backtest(start_date="20251201", end_date="20251231",
     print(f"  最终资产：{fv:,.2f} | 总盈亏：{profit_amount:+,.2f} 元")
     print(f"  总收益率：{tr:+.2f}% | 年化：{ar:+.2f}%")
     stxt = f" | 止损 {stop_count}次" if stop_loss_pct > 0 and stop_count > 0 else ""
+    win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
+    if tot_cnt > 0:
+        stxt += f" | 胜率 {win_rate:.1f}%"
     print(f"  最大回撤：{dd:.2f}% | 夏普比率：{sp:.2f} | 交易：{len(trades)}{stxt}")
     print(f"\n  逐日净值：")
     for dv in daily_vals:
