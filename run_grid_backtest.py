@@ -146,6 +146,10 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     print(f"  网格：每涨跌 {grid_pct*100:.0f}% 触发买卖")
     print(f"  每格金额：{per_grid_cash:,.0f} 元")
     print(f"  初始仓位：{init_position_pct*100:.0f}%")
+    # 防止起始/结束日期填反导致「时间倒流」查不到数据
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+        print(f"  [提示] 起始日期晚于结束日期，已自动交换为 {start_date} ~ {end_date}")
     print(f"  回测区间：{start_date} ~ {end_date}")
     print(f"  佣金：万2.5（最低5元）| 印花税：千1 | 滑点：0.1%")
     if mode == "asymmetric":
