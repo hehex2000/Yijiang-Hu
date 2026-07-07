@@ -1938,6 +1938,7 @@ if __name__ == "__main__":
             start_date=BACKTEST["start_date"],
             end_date=BACKTEST["end_date"],
             top_n=SELECTION.get("top_n", 5),
+            capital=BACKTEST["per_stock_capital"],
         )
         sys.exit(0)
         

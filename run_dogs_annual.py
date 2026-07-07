@@ -24,10 +24,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-from config import DATA, SELECTION, GLOBAL, DOGS_OF_MARKET
+from config import DATA, SELECTION, GLOBAL, DOGS_OF_MARKET, BACKTEST
 
 DB_PATH = DATA.get("local_db_path", "D:/tu-shareData/astock_daily.db")
-INIT_CAPITAL = 100000  # 每只股票初始资金
+# 每只股票初始资金：默认跟随 config 的 per_stock_capital（与「选股+回测」一致），
+# 也可通过 run_backtest(capital=...) 或 CLI --capital 覆盖
+INIT_CAPITAL = BACKTEST.get("per_stock_capital", 100000)
 
 
 def ts_code(code):
@@ -140,10 +142,16 @@ def get_stock_pool_index():
     return pool_map.get(pool, "000906.SH")
 
 
-def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_only=False):
+def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_only=False, capital=None):
     """执行狗股策略年度调仓回测"""
     if top_n is None:
         top_n = SELECTION.get("top_n", 5)
+
+    # 初始资金：优先用传入 capital，否则跟随 config 的 per_stock_capital（与「选股+回测」一致）
+    if capital is None:
+        capital = BACKTEST.get("per_stock_capital", 100000)
+    global INIT_CAPITAL
+    INIT_CAPITAL = capital
 
     DOGS_OF_MARKET["top_n"] = top_n
     DOGS_OF_MARKET["stock_pool"] = SELECTION["stock_pool"]
@@ -440,7 +448,10 @@ if __name__ == "__main__":
     parser.add_argument("start_date", nargs="?", default="20200102")
     parser.add_argument("end_date", nargs="?", default="20261231")
     parser.add_argument("--top-n", type=int, default=None)
+    parser.add_argument("--capital", type=int, default=None,
+                        help="每只股票初始资金（默认跟随 config 的 per_stock_capital）")
     parser.add_argument("--select-only", action="store_true")
     args = parser.parse_args()
 
-    run_backtest(args.start_date, args.end_date, top_n=args.top_n, select_only=args.select_only)
+    run_backtest(args.start_date, args.end_date, top_n=args.top_n,
+                 select_only=args.select_only, capital=args.capital)
