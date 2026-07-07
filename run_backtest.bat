@@ -94,20 +94,24 @@ echo   ----------------
 echo   [1] 双动量法（默认·前2名等权·最常用）
 echo   [2] 单动量法（满仓第1名·激进）
 echo   [3] 均线过滤法（MA60过滤·保守）
+echo   [4] MA200均线过滤法（长周期·更保守）
 echo   [0] 返回主菜单
 echo.
 set ETF_METHOD=
-set /p ETF_METHOD=请选择 (1-3, 默认1):
+set /p ETF_METHOD=请选择 (1-4, 默认1):
 
 if "%ETF_METHOD%"=="0" goto :menu
 if "%ETF_METHOD%"=="" set ETF_METHOD=1
 set ETF_METHOD_ARG=dual
+set ETF_MA_ARG=
 if "%ETF_METHOD%"=="2" set ETF_METHOD_ARG=single
 if "%ETF_METHOD%"=="3" set ETF_METHOD_ARG=ma_filter
+if "%ETF_METHOD%"=="4" set ETF_METHOD_ARG=ma_filter
+if "%ETF_METHOD%"=="4" set ETF_MA_ARG=--ma-period 200
 
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG%
+"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG% %ETF_MA_ARG%
 echo.
 echo   [返回主菜单]
 pause
@@ -138,6 +142,7 @@ echo   [7] 恒生ETF   vs 沪深300   （跨境·AH溢价）
 echo   [8] 黄金ETF   vs 国债ETF   （避险·股债轮动）
 echo   [0] 返回主菜单
 echo.
+set PAIR_CHOICE=
 set /p PAIR_CHOICE=请选择 (1-8, 默认1):
 
 if "%PAIR_CHOICE%"=="0" goto :menu
@@ -192,10 +197,11 @@ echo   [5] 设置股票池
 echo   [6] 月度调仓回测（价值/红利低波/动量）
 echo   [7] 狗股年度调仓
 echo   [8] 短线逆转策略（超跌反弹）
-echo   [9] 网格交易策略（波劙收割）
+echo   [9] 网格交易策略（波段收割）
 echo   [A] 动量+网格择时（方案①·网格作为市场温度计）
 echo   [B] ETF轮动策略（动量轮动·纯国内资产）
 echo   [C] 配对套利（均值回归·多头轮动）
+echo   [D] 指数/ETF 涨跌一览（回测周期表现）
 echo   [0] 退出
 echo.
 set /p CHOICE=请选择 (1-0):
@@ -213,6 +219,7 @@ if /i "%CHOICE%"=="9" goto :grid
 if /i "%CHOICE%"=="A" goto :momentum_grid_timing
 if /i "%CHOICE%"=="B" goto :etf_rotation
 if /i "%CHOICE%"=="C" goto :pairs_trading
+if /i "%CHOICE%"=="D" goto :index_etf_changes
 if "%CHOICE%"=="0" goto :eof
 goto :menu
 
@@ -407,6 +414,26 @@ echo.
 pause
 goto :menu
 
+:index_etf_changes
+cls
+echo.
+echo ================
+echo   指数 / ETF 涨跌一览
+echo ================
+echo.
+echo   覆盖主要宽基与风格指数（优先显示ETF，无ETF则显示指数）
+echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   正在统计...
+echo.
+"venv_ml\Scripts\python.exe" show_index_etf_changes.py %BACKTEST_START% %BACKTEST_END%
+echo.
+echo   [HTML报告] outputs\index_etf_changes_%BACKTEST_START%_%BACKTEST_END%.html
+echo.
+echo   [返回主菜单]
+pause
+goto :menu
+
 :eof
 cls
 echo.
@@ -449,14 +476,14 @@ goto :reversal
 cls
 echo.
 echo ================
-echo   网格交易策略（百分比网格·波劙收割）
+echo   网格交易策略（百分比网格·波段收割）
 echo ================
 echo.
 echo   请选择标的:
 echo   ----------------
 echo   [1] 沪深300 ETF (510300，真实ETF)
 echo   [2] 中证500 ETF (510500，真实ETF)
-echo   [3] 中证800 ETF (512100，真实ETF)
+echo   [3] 中证800 ETF (515800，真实ETF)
 echo   [0] 返回主菜单
 echo.
 set GRID_ARG=
@@ -464,30 +491,54 @@ set /p GRID_CODE=请选择 (1-3, 0返回):
 
 if "%GRID_CODE%"=="0" goto :menu
 if "%GRID_CODE%"=="2" set GRID_ARG=510500.SH
-if "%GRID_CODE%"=="3" set GRID_ARG=512100.SH
+if "%GRID_CODE%"=="3" set GRID_ARG=515800.SH
 if "%GRID_CODE%"=="" set GRID_ARG=510300.SH
 if not defined GRID_ARG set GRID_ARG=510300.SH
 
 echo.
-echo   请设置网格间距:
+echo   请设置网格策略:
 echo   ----------------
-echo   [1] 1%% (窄网格，高频交易)
-echo   [2] 2%% (标准，推荐)
-echo   [3] 3%% (宽网格，低频交易)
+echo   [1] 2%% 对称网格    (窄间距·高频收割·标准)
+echo   [2] 4%% 对称网格    (宽间距·低频·减少趋势踏空·推荐·默认)
+echo   [3] 非对称 2/8%%   (锚定成本线·浮亏不割·浮盈宽卖)
 echo.
-set /p GRID_PCT=请选择 (1-3, 默认2):
+set GRID_STRAT=
+set /p GRID_STRAT=请选择 (1-3, 默认2):
 
-if "%GRID_PCT%"=="1" set GRID_PCT_ARG=--grid-pct 0.01
-if "%GRID_PCT%"=="3" set GRID_PCT_ARG=--grid-pct 0.03
-if "%GRID_PCT%"=="" set GRID_PCT_ARG=--grid-pct 0.02
-if not defined GRID_PCT_ARG set GRID_PCT_ARG=--grid-pct 0.02
+rem 默认 = 4%% 对称网格
+set GRID_MODE=symmetric
+set GRID_PCT_ARG=--grid-pct 0.04
+set GRID_SELL_ARG=
+if "%GRID_STRAT%"=="1" (
+    set GRID_MODE=symmetric
+    set GRID_PCT_ARG=--grid-pct 0.02
+)
+if "%GRID_STRAT%"=="3" (
+    set GRID_MODE=asymmetric
+    set GRID_PCT_ARG=--grid-pct 0.02
+    set GRID_SELL_ARG=--sell-pct 0.08
+)
+if "%GRID_STRAT%"=="" (
+    set GRID_MODE=symmetric
+    set GRID_PCT_ARG=--grid-pct 0.04
+)
 
 echo.
-echo   配置: 网格间距已设置, 每格5000元, 初始50%%仓位
+echo   趋势过滤（站上250日均线只持有不卖）:
+echo   [1] 关闭（纯网格）
+echo   [2] 开启
+echo.
+set GRID_TF=
+set /p GRID_TF=请选择 (1-2, 默认1关闭):
+set GRID_TF_ARG=
+if "%GRID_TF%"=="2" set GRID_TF_ARG=--trend-filter
+
+echo.
+echo   配置: 每格5000元, 初始50%%仓位
 echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_grid_backtest.py %GRID_ARG% %BACKTEST_START% %BACKTEST_END% %GRID_PCT_ARG% --per-grid 5000
+"venv_ml\Scripts\python.exe" run_grid_backtest.py %GRID_ARG% %BACKTEST_START% %BACKTEST_END% %GRID_PCT_ARG% --mode %GRID_MODE% %GRID_SELL_ARG% %GRID_TF_ARG% --per-grid 5000
 echo.
 echo   [返回主菜单]
 pause

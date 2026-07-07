@@ -63,7 +63,7 @@ def get_first_trading_days(trade_dates):
 
 
 def get_stock_price(ts_code, trade_date, price_type="close"):
-    """获取单只股票在某日的价格"""
+    """获取单只股票在某日的「原始(未复权)」价格"""
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
         f"SELECT {price_type} FROM daily WHERE ts_code=? AND trade_date=?",
@@ -71,6 +71,44 @@ def get_stock_price(ts_code, trade_date, price_type="close"):
     )
     conn.close()
     return float(df.iloc[0, 0]) if len(df) > 0 else None
+
+
+def get_hfq_price(ts_code, trade_date, price_type="close"):
+    """获取单只股票在某日的「后复权」价格 = 当日原始价 × 复权因子。
+
+    后复权价已内含现金分红与拆/送股，即用「买入并持有、分红再投入」的
+    投资者真实总回报口径计价。对狗股这类高股息策略，必须用后复权，
+    否则除息日的股价跳降会被记成亏损、而分红却没入账 → 长期收益被低估。
+
+    关键防坑: adj_factor 表相对 daily 存在大量缺口(每只股缺数百~上千天)。
+    若用 `... JOIN adj_factor ON trade_date = a.trade_date` 直接关联，缺因子的
+    那天会回退成原始价(因子=1)，而相邻有因子的天是后复权价(因子可达 50+)，
+    造成同一只股票价格在 4 元↔200 元间反复跳变 → 日净值出现 50 倍假尖峰 →
+    收益被算成天文数字。因此这里对因子做「前向填充」: 取 trade_date <= 当日
+    最近一条有效 adj_factor。复权因子仅在除权除息日跳变、其余交易日恒定，
+    前向填充完全正确，可彻底消除价格断层。
+    """
+    conn = sqlite3.connect(DB_PATH)
+    # 1) 当日(或之前最近)的原始价
+    px = pd.read_sql_query(
+        f"SELECT {price_type} AS p FROM daily WHERE ts_code = ? AND trade_date <= ? "
+        f"ORDER BY trade_date DESC LIMIT 1",
+        conn, params=(ts_code, trade_date),
+    )
+    # 2) 前向填充的复权因子: trade_date <= 当日 最近一条
+    fac = pd.read_sql_query(
+        "SELECT adj_factor FROM adj_factor WHERE ts_code = ? AND trade_date <= ? "
+        "ORDER BY trade_date DESC LIMIT 1",
+        conn, params=(ts_code, trade_date),
+    )
+    conn.close()
+    if len(px) == 0 or px.iloc[0]["p"] is None:
+        return None
+    p = float(px.iloc[0]["p"])
+    f = fac.iloc[0]["adj_factor"] if (len(fac) > 0 and fac.iloc[0]["adj_factor"] is not None) else None
+    if f is None or f == 0:
+        return p  # 无复权因子(如因子数据起始前的日期) → 退化为原始价
+    return p * f
 
 
 def get_index_close(index_code, trade_date):
@@ -96,7 +134,8 @@ def get_stock_pool_index():
         "zz500": "000905.SH",
         "zz800": "000906.SH",
         "zz1000": "000852.SH",
-        "all": "000906.SH",
+        "zz2000": "932000.SH",  # 中证2000 = 微盘基准
+        "all": "000985.SH",   # 中证全指 = 全市场基准（之前误用 000906.SH 中证800）
     }
     return pool_map.get(pool, "000906.SH")
 
@@ -177,7 +216,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         # 获取当日所有持仓股票的收盘价
         total_value = cash
         for code, pos in positions.items():
-            close = get_stock_price(code, td)
+            close = get_hfq_price(code, td, "close")
             if close:
                 total_value += pos["shares"] * close
         daily_vals.append({"date": td, "value": total_value})
@@ -212,7 +251,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
             for code in codes_to_sell:
                 pos = positions.pop(code, None)
                 if pos:
-                    open_price = get_stock_price(code, td, "open")
+                    open_price = get_hfq_price(code, td, "open")
                     if open_price:
                         revenue = pos["shares"] * open_price * 0.99955  # 扣手续费
                         cash += revenue
@@ -228,7 +267,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
             bought = 0
             skipped = []
             for code in new_to_buy:
-                open_price = get_stock_price(code, td, "open")
+                open_price = get_hfq_price(code, td, "open")
                 if open_price is None or open_price <= 0:
                     skipped.append(code)
                     continue
@@ -254,8 +293,9 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"\n  {'─'*60}")
     if positions:
         total_cashout = 0
+        last_holdings = list(positions.keys())  # 平仓前捕获末年持仓，供汇总展示
         for code, pos in list(positions.items()):
-            close = get_stock_price(code, trade_dates[-1])
+            close = get_hfq_price(code, trade_dates[-1], "close")
             if close:
                 # 卖出：扣佣金+印花税，同 sell() 逻辑
                 revenue = pos["shares"] * close
@@ -275,7 +315,10 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"\n\n{'='*70}")
     print(f"  📊 年度收益对比")
     print(f"{'='*70}")
-    print(f"  {'年份':<8} {'策略收益':>10} {'基准收益':>10} {'超额收益':>10} {'持仓股票'}")
+    print(f"  [口径] 策略 = 后复权价(含分红再投, 投资者真实总回报)")
+    print(f"  [口径] 基准 = {benchmark_idx} 价格指数(不含分红)")
+    print(f"  [提示] 带 * 年度为区间未结束的半年度，收益按实际持有期计")
+    print(f"  {'年份':<9} {'策略收益':>10} {'基准收益':>10} {'超额收益':>10} {'持仓股票'}")
     print(f"  {'─'*60}")
 
     # 按年计算收益
@@ -283,9 +326,10 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     for d in daily_vals:
         y = d["date"][:4]
         if y not in year_groups:
-            year_groups[y] = {"first": d["value"], "first_date": d["date"]}
+            year_groups[y] = {"first": d["value"], "first_date": d["date"], "n_days": 0}
         year_groups[y]["last"] = d["value"]
         year_groups[y]["last_date"] = d["date"]
+        year_groups[y]["n_days"] += 1
 
     total_strategy_return = 0
     for idx, year in enumerate(sorted(year_groups.keys())):
@@ -302,10 +346,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         else:
             strategy_ret = 0
 
-        # 基准指数年度收益
-        first_td = years[list(years_done).index(year)] if year in years_done else None
-        
-        # 获取基准值
+        # 基准指数年度收益（价格指数，不含分红）
         benchmark_ret = 0
         b_start_idx = get_index_close(benchmark_idx, yg["first_date"])
         b_end_idx = get_index_close(benchmark_idx, yg["last_date"])
@@ -314,10 +355,17 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
 
         excess = strategy_ret - benchmark_ret
 
-        # 获取该年持仓股票简要信息
-        year_stocks = ", ".join(list(positions.keys())[:5]) if idx == len(year_groups) - 1 else "-"
+        # 区间未结束的年度（如回测截止在年中）标注 *
+        is_partial = yg.get("n_days", 0) < 200
+        year_label = f"{year}*" if is_partial else year
 
-        print(f"  {year:<8} {strategy_ret:>+9.2f}% {benchmark_ret:>+9.2f}% {excess:>+9.2f}%  {year_stocks[:40]}")
+        # 获取该年持仓股票简要信息（末年用平仓前捕获的持仓）
+        if idx == len(year_groups) - 1:
+            year_stocks = ", ".join(last_holdings[:5])
+        else:
+            year_stocks = "-"
+
+        print(f"  {year_label:<9} {strategy_ret:>+9.2f}% {benchmark_ret:>+9.2f}% {excess:>+9.2f}%  {year_stocks[:36]}")
         total_strategy_return = strategy_ret
 
     # 总收益（回测全程）
@@ -363,6 +411,9 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"  最大回撤: {max_dd:>+9.2f}%")
     print(f"  夏普比率: {sharpe:>9.4f}")
     print(f"  调仓次数: {len(years)} 次")
+    print(f"{'='*70}")
+    print(f"  [口径说明] 策略=后复权(含分红再投); 基准={benchmark_idx}价格指数(不含分红)。")
+    print(f"  [口径说明] 二者口径不同，超额收益含策略分红优势，非纯粹选股超额。")
     print(f"{'='*70}\n")
 
     # 保存CSV

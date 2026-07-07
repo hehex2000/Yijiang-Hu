@@ -1448,7 +1448,7 @@ def run_dogs_of_market_selection():
 
 def run_backtest(stocks):
     """对股票列表执行所有已启用的策略"""
-    capital = BACKTEST["initial_capital"]
+    capital = BACKTEST["per_stock_capital"]
     start, end = BACKTEST["start_date"], BACKTEST["end_date"]
 
     # 自动根据股票池设置基准指数
@@ -1591,7 +1591,11 @@ def run_backtest(stocks):
                 elif skey in strategy_funcs:
                     func = strategy_funcs[skey][0]
                     ret, trades, max_dd = func(df, capital, scfg, start_idx)
-                    win_rate = 0.0  # 内置函数暂不支持胜率
+                    # 买入持有：只有1次买卖，盈利=100%胜率，亏损=0%胜率
+                    if skey == "buy_hold":
+                        win_rate = 100.0 if ret > 0 else 0.0
+                    else:
+                        win_rate = 0.0  # 其他内置函数暂不支持胜率
                 else:
                     print(f"  [ERR] 未找到策略: {skey}")
                     continue

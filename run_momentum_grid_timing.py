@@ -50,15 +50,7 @@ def get_grid_position_series(ts_code="000300.SH", start_date="20200102", end_dat
     Returns:
         dict: {int(trade_date): float(position_pct)}
     """
-    # ETF/指数映射
-    ETF_PROXY = {
-        "510300.SH": "000300.SH",
-        "510500.SH": "000905.SH",
-        "512100.SH": "000906.SH",
-    }
-    if ts_code in ETF_PROXY:
-        ts_code = ETF_PROXY[ts_code]
-
+    # ETF/指数判断
     is_index = (ts_code.endswith(".SH") and ts_code[:3] == "000" and len(ts_code) == 9)
     table = "index_daily" if is_index else "daily"
     price_scale = 0.001 if is_index else 1.0
@@ -372,7 +364,7 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
                 continue
 
             # === 关键：根据网格持仓比例动态确定选股数量 ===
-            grid_pos = grid_positions.get(td, 0.5)  # 默认0.5（正常）
+            grid_pos = grid_positions.get(int(td), 0.5)  # 默认0.5（正常），int(td)因调仓日为str类型
             dynamic_top_n, regime = get_dynamic_top_n(grid_pos, default_top_n)
             top_n_history.append({"date": td, "grid_pos": grid_pos, "top_n": dynamic_top_n, "regime": regime})
 

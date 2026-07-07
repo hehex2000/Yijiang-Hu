@@ -63,11 +63,9 @@ class DogsOfMarketSelector:
         self.output_dir = config.get("output_dir", "data/results/dogs_of_market")
         self.output_file = config.get("output_file", "dogs_of_market_{date}.csv")
 
-        # 缓存（用于股票池查询）
-        self._hs300_cache = None
-        self._zz500_cache = None
-        self._zz800_cache = None
-        self._zz1000_cache = None
+        # 缓存（按 (pool, date) 区分，支持真正的时点成分股查询）
+        self._constituent_cache = {}
+        self._constituent_warned = False
 
     # ------------------------------------------------------------------ #
     #  内部工具
@@ -76,25 +74,32 @@ class DogsOfMarketSelector:
         return sqlite3.connect(DB_PATH)
 
     def _get_constituents(self, pool_name: str, trade_date: str = None) -> set:
-        """通用成分股获取（带缓存，支持日期过滤）
+        """通用成分股获取（带缓存，真正的「时点」查询）
 
         Args:
             pool_name: 股票池名称 (hs300/zz500/zz800/zz1000/all)
-            trade_date: 调仓日期（YYYYMMDD），用于获取当时的成分股
+            trade_date: 调仓日期（YYYYMMDD），取该日期之前最近一次发布的成分股快照
+
+        时点语义：index_constituent 每个 trade_date 是一份完整快照。
+            取 MAX(trade_date) <= 调仓日 的那一份，即为当时真实成分股，
+            可避免「用未来才知道的成分股」(前视偏差) 与「只含幸存者」(生存偏差)。
+            若数据库仅含单时点快照(如只有最新一期)，则该查询会退化为「每年都用
+            同一份当前名单」——此时打印偏差警告，结果仅供参考。
         """
-        cache_attr = f"_{pool_name}_cache"
-        if getattr(self, cache_attr, None) is not None:
-            return getattr(self, cache_attr)
+        cache_key = f"{pool_name}|{trade_date}"
+        if cache_key in self._constituent_cache:
+            return self._constituent_cache[cache_key]
 
         pool_to_index = {
             "hs300": "000300.SH",
             "zz500": "000905.SH",
             "zz800": "000906.SH",
             "zz1000": "000852.SH",
+            "zz2000": "932000.SH",
         }
         index_code = pool_to_index.get(pool_name)
         if index_code is None:
-            # all模式
+            # all模式：全市场（排除北交所）
             conn = self._get_conn()
             df = pd.read_sql_query(
                 "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ'",
@@ -104,22 +109,55 @@ class DogsOfMarketSelector:
             result = set(df["ts_code"].tolist()) if len(df) > 0 else set()
         else:
             conn = self._get_conn()
-            if trade_date:
-                # 优先查询该日期附近的成分股
-                df = pd.read_sql_query(
-                    "SELECT ts_code FROM index_constituent WHERE index_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT 800",
-                    conn, params=(index_code, trade_date),
-                )
-            if not trade_date or df.empty:
-                # 回退到全量查询（部分数据库无历史成分股数据）
-                df = pd.read_sql_query(
-                    "SELECT ts_code FROM index_constituent WHERE index_code = ?",
+            # 1) 该调仓日之前最近的一次快照日期
+            #    CAST 确保 trade_date(INTEGER 列) 与参数(可能含字符串)比较时类型一致
+            snap_row = pd.read_sql_query(
+                "SELECT MAX(CAST(trade_date AS INTEGER)) AS d FROM index_constituent "
+                "WHERE index_code = ? AND CAST(trade_date AS INTEGER) <= CAST(? AS INTEGER)",
+                conn, params=(index_code, trade_date or "99999999"),
+            )
+            # ⚠️ 关键：snap 来自 pandas → numpy.int64，直接作为 sqlite 参数会绑定失败
+            #    （numpy 类型无法被 sqlite3 正确转换，导致 = 匹配 0 行，回退全市场）。
+            #    必须转成原生 int 再用于后续查询参数。
+            snap = int(snap_row.iloc[0, 0]) if (len(snap_row) > 0 and snap_row.iloc[0, 0] is not None) else None
+            look_ahead = False
+            if snap is None:
+                # 没有任何 <= 调仓日的快照 → 取最早一期（实为前视，需警告）
+                snap_row = pd.read_sql_query(
+                    "SELECT MIN(CAST(trade_date AS INTEGER)) AS d FROM index_constituent WHERE index_code = ?",
                     conn, params=(index_code,),
                 )
-            conn.close()
-            result = set(df["ts_code"].tolist()) if len(df) > 0 else set()
+                snap = int(snap_row.iloc[0, 0]) if (len(snap_row) > 0 and snap_row.iloc[0, 0] is not None) else None
+                look_ahead = True
 
-        setattr(self, cache_attr, result)
+            result = set()
+            if snap is not None:
+                df = pd.read_sql_query(
+                    "SELECT ts_code FROM index_constituent WHERE index_code = ? AND CAST(trade_date AS INTEGER) = CAST(? AS INTEGER)",
+                    conn, params=(index_code, snap),
+                )
+                result = set(df["ts_code"].tolist()) if len(df) > 0 else set()
+
+            # 2) 偏差检测：若整个表只有 1 个时点快照，时点查询退化 → 警告
+            nsnap = pd.read_sql_query(
+                "SELECT COUNT(DISTINCT CAST(trade_date AS INTEGER)) AS n FROM index_constituent WHERE index_code = ?",
+                conn, params=(index_code,),
+            ).iloc[0, 0]
+            conn.close()
+
+            if not self._constituent_warned:
+                if nsnap <= 1:
+                    print(f"  [⚠️ 偏差警告] index_constituent 仅含单时点快照({snap})，"
+                          f"所有年度将使用同一份「当前成分股」→ 存在生存偏差/前视偏差，"
+                          f"回测收益偏高，仅供参考。\n            → 建议运行 "
+                          f"download_index_constituents.py 回补历史成分股快照。")
+                    self._constituent_warned = True
+                elif look_ahead:
+                    print(f"  [⚠️ 偏差警告] 调仓日 {trade_date} 之前无成分股快照，"
+                          f"已退化为使用最早快照({snap})，含前视偏差。")
+                    self._constituent_warned = True
+
+        self._constituent_cache[cache_key] = result
         return result
 
     def _get_prev_trading_day(self, date_str: str) -> str:

@@ -19,18 +19,19 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from config import DATA, BACKTEST, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR, BASE_DIR
+    from config import DATA, BACKTEST, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DB_PATH = DATA.get("local_db_path", "")
     if not DB_PATH or not os.path.exists(DB_PATH):
         # 优先使用项目目录下的数据文件
-        DB_PATH = os.path.join(BASE_DIR, "data", "tu-sharedata", "astock_daily.db")
-    INIT_CAPITAL = BACKTEST.get("initial_capital", 50000)
+        DB_PATH = os.path.join(_BASE_DIR, "data", "tu-sharedata", "astock_daily.db")
+    INIT_CAPITAL = BACKTEST.get("monthly_rebalance_capital", 100000)
     # 不再使用模块级 TOP_N，改为动态读取 SELECTION["top_n"]
 except (ImportError, KeyError, AttributeError):
     # fallback: 使用项目相对路径
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DB_PATH = os.path.join(_BASE_DIR, "data", "tu-sharedata", "astock_daily.db")
-    INIT_CAPITAL = 50000
+    INIT_CAPITAL = 100000
     FACTOR_CALCULATOR = {}
     FACTOR_PROCESSOR = {}
 

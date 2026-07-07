@@ -46,8 +46,7 @@ ETF_TARGETS = [
     ("511990.SH",  "华宝添益(货币)",  None),          # 货币基金
 ]
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "data", "tu-sharedata", "astock_daily.db")
+DB_PATH = r"D:\tu-shareData\astock_daily.db"
 
 # tushare 请求间隔（秒），避免触发频率限制
 TUSHARE_INTERVAL = 0.5

@@ -421,8 +421,8 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                         alloc = cash_per_target * weight * len(new_to_buy)
                         alloc = min(alloc, cash)  # 不超过剩余现金
                         alloc_after_fee = alloc * 0.998  # 预留0.2%给手续费+滑点
-                        max_shares = int(alloc_after_fee / open_price)
-                        if max_shares < 1:
+                        max_shares = int(alloc_after_fee / open_price / 100) * 100  # 取整到100份(1手)
+                        if max_shares < 100:
                             continue
                         cost = max_shares * open_price
                         fee = calc_etf_fee('buy', open_price, max_shares)

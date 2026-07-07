@@ -28,6 +28,7 @@ outputs/
 data/results/
 data/models/
 data/models_v5/
+.workbuddy/
 
 # 数据库文件
 *.db

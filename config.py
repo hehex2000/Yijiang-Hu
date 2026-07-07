@@ -12,14 +12,14 @@
 
 GLOBAL = {
     # 回测时间范围
-    "backtest_start": "20200103",
-    "backtest_end": "20260702",
+    "backtest_start": "20220102",
+    "backtest_end": "20241231",
 
     # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
     "selection_date": "20260102",
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "zz800",
+    "stock_pool": "zz500",
 
     # 选股数量
     "top_n": 5,
@@ -35,7 +35,7 @@ DATA = {
     # 行情数据优先本地DB，财务/估值数据优先Tushare
     "primary_source": "local_db",      # ← 优先使用本地数据库
 
-    "local_db_path": r"C:\Users\99395\WorkBuddy\2026-07-01-10-38-55\astock_daily.db",
+    "local_db_path": r"D:\tu-shareData\astock_daily.db",
 
     "tushare_token": "761165a821532fe625262d6b33e144b9859a887c004acbcb981c319b",
 
@@ -136,8 +136,13 @@ BACKTEST = {
     "start_date": GLOBAL["backtest_start"],  # ← 从GLOBAL读取
     "end_date": GLOBAL["backtest_end"],      # ← 从GLOBAL读取
 
-    # 初始资金（月度调仓：总资金；多股回测：每只股票资金）
-    "initial_capital": 100000,
+    # 多股回测「每只股票」资金（选股+回测 / 狗股 / 价值 / 红利低波 / csv / manual）
+    # 注意：多股回测时「总投入 = per_stock_capital × 股票数」
+    # 此处 20000 → 5 支股票合计 100,000（总投入 10 万、每支 2 万）
+    "per_stock_capital": 20000,
+
+    # 月度调仓「总资金」（独立于上面的每支资金；仅 run_monthly_rebalance 使用）
+    "monthly_rebalance_capital": 100000,
 
     # 基准指数（用于对比）
     "benchmark": "000906.SH",  # ← 中证800指数

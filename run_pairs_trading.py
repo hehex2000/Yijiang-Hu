@@ -360,8 +360,8 @@ def run_pairs_backtest(start_date="20200101", end_date="20251231",
                         if open_price and open_price > 0:
                             # 预留费用空间
                             alloc = cash * 0.998
-                            max_shares = int(alloc / open_price)
-                            if max_shares >= 1:
+                            max_shares = int(alloc / open_price / 100) * 100  # 取整到100份(1手)
+                            if max_shares >= 100:
                                 cost = max_shares * open_price
                                 fee = calc_etf_fee('buy', open_price, max_shares)
                                 if cost + fee <= cash:
