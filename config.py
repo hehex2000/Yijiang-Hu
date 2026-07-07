@@ -19,7 +19,7 @@ GLOBAL = {
     "selection_date": "20260102",
 
     # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "zz500",
+    "stock_pool": "hs300",
 
     # 选股数量
     "top_n": 5,
