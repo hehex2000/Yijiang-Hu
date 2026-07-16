@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小市值轮动策略 · 回测稳健性报告</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#ffffff; --ink:#1f2933; --sub:#5b6b7b;
+    --line:#e3e8ee; --brand:#2f6fed; --brand-soft:#eaf1fe;
+    --up:#d4380d; --up-bg:#fff2ec;   /* 涨·红 */
+    --dn:#1f9d55; --dn-bg:#ecfaf1;   /* 跌·绿 */
+    --warn:#b8860b; --warn-bg:#fff8e6;
+    --ok:#1f9d55; --ok-bg:#ecfaf1;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.7;font-size:15px;}
+  .wrap{max-width:940px;margin:0 auto;padding:32px 22px 64px;}
+  header.hero{background:linear-gradient(135deg,#2f6fed,#5b8def);color:#fff;border-radius:16px;padding:30px 32px;box-shadow:0 8px 24px rgba(47,111,237,.18);}
+  header.hero h1{margin:0 0 6px;font-size:25px;letter-spacing:.5px;}
+  header.hero .meta{opacity:.9;font-size:13px;margin-top:10px;}
+  header.hero .verdict{margin-top:16px;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);border-radius:10px;padding:12px 16px;font-size:14.5px;}
+  h2{font-size:20px;margin:38px 0 12px;padding-left:11px;border-left:4px solid var(--brand);}
+  h3{font-size:16.5px;margin:22px 0 8px;color:var(--brand);}
+  p{margin:9px 0;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0;box-shadow:0 1px 3px rgba(20,40,80,.04);}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  @media(max-width:680px){.grid2{grid-template-columns:1fr;}}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:center;}
+  th{background:var(--brand-soft);color:#1d4fb0;font-weight:600;}
+  td.lab{text-align:left;font-weight:600;background:#fafbfc;}
+  .up{color:var(--up);background:var(--up-bg);font-weight:600;}
+  .dn{color:var(--dn);background:var(--dn-bg);font-weight:600;}
+  .hl{background:var(--brand-soft);font-weight:700;}
+  .callout{border-radius:10px;padding:13px 16px;margin:14px 0;font-size:14px;}
+  .callout.warn{background:var(--warn-bg);border:1px solid #f0e0a8;color:#7a5b00;}
+  .callout.ok{background:var(--ok-bg);border:1px solid #b7e6c8;color:#14663c;}
+  .callout.info{background:var(--brand-soft);border:1px solid #c9dcfb;color:#1d4fb0;}
+  .tag{display:inline-block;background:var(--brand);color:#fff;border-radius:6px;padding:2px 9px;font-size:12px;margin-right:6px;}
+  .tag.g{background:#6b7785;}
+  ul{margin:8px 0 8px 4px;padding-left:20px;}
+  li{margin:5px 0;}
+  .num{font-variant-numeric:tabular-nums;font-family:"SF Mono",Consolas,Menlo,monospace;}
+  footer{margin-top:40px;color:var(--sub);font-size:12.5px;text-align:center;border-top:1px solid var(--line);padding-top:16px;}
+  .small{font-size:12.5px;color:var(--sub);}
+  code{background:#eef1f5;padding:1px 6px;border-radius:5px;font-size:13px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>小市值轮动策略 · 回测稳健性报告</h1>
+  <div class="meta">策略文件：<code>backtest_small_cap_rotation.py</code> + <code>src/small_cap_rotation_selector.py</code> ｜ 数据：<code>D:/tu-shareData/astock_daily.db</code> ｜ 生成时间：2026-07-09</div>
+  <div class="verdict">
+    <b>一句话结论：</b>这不是未来函数、也不是纯运气——小市值轮动是个<b>真实、跨宇宙、跨牛熊都能盈利</b>的因子；但 headline 的 <b>+548%（年化 40.6%）是 2020–2025 极顺风窗口的 inflated 数字</b>。拉到完整周期（2015–2025），诚实预期应锚定 <b>年化 ~26–29%、夏普 ~0.84、最大回撤 40–62%</b>。真正的风险是<b>回撤不是爆仓</b>——能否扛住腰斩不割肉，才是赚到钱的门槛。
+  </div>
+</header>
+
+<!-- ============ 0 策略与配置 ============ -->
+<h2>一、策略与回测配置</h2>
+<div class="card">
+  <ul>
+    <li><b>选股逻辑：</b>沪深两市（剔除北交所）按<b>流通市值（circ_mv）升序</b>取最小 N 只持有；周频、每周二等权换仓。</li>
+    <li><b>无前视（已对齐投研手册）：</b>选股用"成交日前一交易日"快照排序，次日/本周二开盘成交（信号 <code>shift(1)</code>）。</li>
+    <li><b>涨跌停：</b>按代码前缀区分——主板 ±10%、创业板(300/301) 2020-08-24 前 ±10% 后 ±20%、科创板(688) ±20%；涨停买不进 / 跌停卖不出。</li>
+    <li><b>流动性过滤：</b>选股剔除 20 日日均成交额 &lt; 3000 万；单票下单 ≤ 当日成交额 5%。</li>
+    <li><b>三层止损（本次默认关）：</b>单票回撤 &gt;12% 清仓；中证2000 单日跌 &gt;-6.6% 清仓；昨涨停今炸板清仓。</li>
+    <li><b>退市处理：</b>LEFT JOIN 含退市股（规避幸存者偏差）；持仓连续无数据 &gt;30 日归零。</li>
+    <li><b>成本：</b>佣金万 2.5（最低 5）+ 印花税千 1（卖）；滑点流动性自适应（base 8bp + 10%×参与度，上限 200bp）。</li>
+    <li><b>选股宇宙（pool_mode）：</b><code>cyb</code> 创业板(300/301) ｜ <code>zz2000</code> 全市场流通市值最小 2000 只 ｜ <code>zz1000</code> 市值排名 801–1800。</li>
+  </ul>
+</div>
+
+<div class="callout info">
+  <b>前置修复（重要）：</b>报告所有数字均基于修复后的代码。原 <code>fundamental_filter</code> 分支误查<b>空表 <code>income</code></b>（0 行），导致开过滤时全宇宙被清零、整段回测 +0.00%。已改为查真实有数据的 <code>fina_indicator</code>（<code>eps&gt;0</code> 判盈利），且<b>财务数据缺失的股票保留</b>（无法证伪就不排除），绝不再因底层表为空清零。
+</div>
+
+<!-- ============ 1 未来函数 ============ -->
+<h2>二、检验一 · 未来函数审计</h2>
+<div class="card">
+  <h3>方法</h3>
+  <p>代码层逐行审查所有数据读取均带 <code>trade_date &lt;= snapshot</code>（snapshot = 成交周二的前一交易日）。为坐实，临时加开关让选股<b>故意用周二当天数据</b>（真·前视）重跑同一配置。</p>
+  <h3>结果（cyb / 7只 / 空仓1·4月 / 止损关 / 过滤关，2020–2025）</h3>
+  <table>
+    <tr><th>版本</th><th>总收益率</th><th>年化</th><th>最大回撤</th><th>夏普</th></tr>
+    <tr><td class="lab">正常版（无前视）</td><td class="up">+548.53%</td><td>+40.59%</td><td>-28.27%</td><td>1.08</td></tr>
+    <tr><td class="lab">前视版（偷看未来）</td><td class="up">+179.92%</td><td>+20.63%</td><td>-42.14%</td><td>0.65</td></tr>
+  </table>
+  <div class="callout ok"><b>结论：无未来函数。</b>若代码偷看未来，前视版收益应 ≥ 正常版；实际前视版（180%）远低于正常版（548%），二者明显不同，证明代码确用"前一交易日"快照。前视版更低是因"用周二收盘市值排名、却只能在周二开盘买"，属真实小市值效应而非泄漏。审计开关已还原。</div>
+</div>
+
+<!-- ============ 2 集中度 ============ -->
+<h2>三、检验二 · 集中度检验（hold_count 扫描）</h2>
+<div class="card">
+  <h3>方法</h3>
+  <p>固定 cyb / 空仓1·4月 / 止损关 / 过滤关，仅改变持仓只数，看收益是否随分散大幅回落。</p>
+  <h3>结果（2020–2025）</h3>
+  <table>
+    <tr><th>hold_count</th><th>总收益率</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>轮动胜率</th><th>超额基准</th></tr>
+    <tr><td class="lab">7（原配置）</td><td class="up">+548.53%</td><td>+40.59%</td><td>-28.27%</td><td>1.08</td><td>50.19%</td><td>+478.75%</td></tr>
+    <tr><td class="lab">15</td><td class="up">+361.12%</td><td>+32.12%</td><td>-30.82%</td><td>0.994</td><td>49.14%</td><td>+291.34%</td></tr>
+    <tr><td class="lab">20</td><td class="up">+433.18%</td><td>+35.66%</td><td>-28.42%</td><td>1.098</td><td>49.29%</td><td>+363.40%</td></tr>
+  </table>
+  <div class="callout warn"><b>结论：收益未因分散塌缩，但响应非单调。</b>即使分散到 20 只仍有 +433%，说明 +548% 主因是<b>创业板小市值因子本身强 + 2024 空仓运气</b>，而非 7 只极端集中。但 <code>7(548%) &gt; 20(433%) &gt; 15(361%)</code> 的<b>非单调</b>形态（15 比 7 低、20 反而比 15 高）是典型<b>过拟合 / 运气特征</b>——结果对"选几只"这一参数极其脆弱。</div>
+</div>
+
+<!-- ============ 3 样本外 ============ -->
+<h2>四、检验三 · 样本外检验（2024–2025）</h2>
+<div class="card">
+  <h3>方法</h3>
+  <p>把区间切成 2024-01-01 ~ 2025-12-31（未被前面观察污染），同配置 cyb/7/空仓1·4月/止损关/过滤关。</p>
+  <h3>结果</h3>
+  <table>
+    <tr><th>指标</th><th>2024–2025（样本外）</th><th>对照：全样本 2020–2025</th></tr>
+    <tr><td class="lab">总收益率</td><td class="up">+163.22%</td><td class="up">+548.53%</td></tr>
+    <tr><td class="lab">年化</td><td>+70.72%</td><td>+40.59%</td></tr>
+    <tr><td class="lab">最大回撤</td><td>-21.27%</td><td>-28.27%</td></tr>
+    <tr><td class="lab">夏普</td><td>1.4634</td><td>1.08</td></tr>
+    <tr><td class="lab">轮动胜率</td><td>54.32%</td><td>50.19%</td></tr>
+  </table>
+  <p class="small">分年：2024 <span class="up">+107.91%</span>（基准 -2.24%，超额 +110.16%）｜ 2025 <span class="up">+28.72%</span>（基准 +38.44%，超额 <span class="dn">-9.72%</span> 首年跑输基准）</p>
+  <div class="callout ok"><b>结论：策略活过样本外且仍强</b>（否定"换窗口就碎"）。但<b>全部收益几乎压在 2024 异常年</b>（空仓躲 2 月微盘崩 + 下半年微小盘狂飙），2025 已跑输基准近 10%。⚠️ 注意：2024–2025 本身是最友好的顺风窗口，只证"顺风能赚"、未证"逆风不碎"。</div>
+</div>
+
+<!-- ============ 4 跨宇宙 ============ -->
+<h2>五、检验四 · 跨宇宙对比</h2>
+<div class="card">
+  <h3>方法</h3>
+  <p>固定 7只 / 空仓1·4月 / 止损关 / 过滤关 / 2020–2025，仅切换选股宇宙，看是否创业板特别猛。</p>
+  <h3>结果</h3>
+  <table>
+    <tr><th>选股宇宙</th><th>总收益率</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>超额基准</th></tr>
+    <tr><td class="lab">cyb（创业板 300/301）</td><td class="up hl">+548.53%</td><td class="hl">+40.59%</td><td>-28.27%</td><td class="hl">1.08</td><td>+478.75%</td></tr>
+    <tr><td class="lab">zz2000（全市场最小2000）</td><td class="up">+192.87%</td><td>+21.63%</td><td>-30.60%</td><td>0.707</td><td>+123.09%</td></tr>
+    <tr><td class="lab">zz1000（排名801–1800）</td><td class="up">+201.92%</td><td>+22.30%</td><td>-33.11%</td><td>0.790</td><td>+132.14%</td></tr>
+  </table>
+  <p class="small">2025 分年：cyb <span class="up">+26.67%</span> ｜ zz2000 <span class="dn">-6.49%</span> ｜ zz1000 <span class="up">+6.11%</span>（基准 +38.44%，微小盘除创业板外集体跑输）</p>
+  <div class="callout warn"><b>结论：因子真实跨宇宙有效（三宇宙均大幅跑赢基准）；但创业板是其他宇宙的 2.5~2.8 倍、夏普高 1.4 倍。</b>光是"选创业板 vs 选全市场最小2000只"这一个选择，就让总收益从 +193% 蹦到 +548%——宇宙选择造成 2.8 倍摆动。叠加集中度非单调，证明 +548% 对"选哪个宇宙 / 选几只 / 哪段年份"极度敏感，是<b>"创业板 + 极友好窗口 + 2024 异常 + 空仓运气"四重叠加的乐观上界</b>。2025 分化最刺眼：大盘/红利年，微小盘整体跑输，仅创业板微小盘逆势 +26.67%。</div>
+</div>
+
+<!-- ============ 5 逆风压力 ============ -->
+<h2>六、检验五 · 逆风压力测试（2015–2025 全周期）</h2>
+<div class="card">
+  <h3>方法</h3>
+  <p>把起点推到 2015-01-01，穿越 2015 股灾 + 2016 熔断 + 2017 小盘杀估值（一九行情）+ 2020–2025 顺风，看逆风期是否把利润吐光。cyb 与 zz2000 同跑。</p>
+  <h3>结果</h3>
+  <table>
+    <tr><th>选股宇宙</th><th>总收益率</th><th>年化</th><th>最大回撤</th><th>夏普</th><th>超额基准</th></tr>
+    <tr><td class="lab">cyb（创业板）</td><td class="up">+1244.33%</td><td>+29.17%</td><td class="dn">-62.49%</td><td>0.835</td><td>+1136.59%</td></tr>
+    <tr><td class="lab">zz2000（全市场最小2000）</td><td class="up">+991.19%</td><td>+26.55%</td><td class="dn">-41.94%</td><td>0.837</td><td>+883.44%</td></tr>
+    <tr><td class="lab">基准 932000</td><td class="up">+107.74%</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+  </table>
+  <p class="small">逆风期 2015–2018：基准 932000 累计约 <span class="dn">-45%</span>，cyb / zz2000 大致走平（约 +10% / 持平）→ 熊市反而护住本金。</p>
+  <div class="callout ok"><b>结论：因子全周期存活、未爆掉、熊市护本金</b>（否定"纯运气/换窗口就碎"）。但<b>创业板 2.8 倍优势在长周期塌缩</b>：年化仅 1.1 倍（29.17% vs 26.55%）、夏普几乎相等（0.835 vs 0.837）、回撤反而更深（-62% vs -42%）。证明 2020–2025 的 2.8 倍是特定顺风窗口产物，长周期里创业板<b>并无风险调整后优势</b>。</div>
+</div>
+
+<!-- ============ 6 终审 ============ -->
+<h2>七、综合终审结论</h2>
+<div class="card">
+  <table>
+    <tr><th>检验</th><th>核心结论</th></tr>
+    <tr><td class="lab">未来函数</td><td>排除（前视版 +180% &lt; 正常版 +548%）</td></tr>
+    <tr><td class="lab">集中度（7→15→20）</td><td>收益不塌缩（548→361→433），但<b>非单调=脆弱</b></td></tr>
+    <tr><td class="lab">样本外（2024–25）</td><td>存活且强，但几乎全靠 2024 异常年，2025 已跑输基准</td></tr>
+    <tr><td class="lab">跨宇宙（cyb/zz2000/zz1000）</td><td>因子真实；cyb 窗口内 2.8 倍</td></tr>
+    <tr><td class="lab">逆风压力（2015–2025）</td><td>全周期存活、熊市护本金；cyb 优势塌缩至 1.1 倍、夏普持平、回撤 -62%</td></tr>
+  </table>
+  <div class="callout ok" style="margin-top:14px;">
+    <b>终审定性：</b>
+    <ul style="margin:6px 0 2px;">
+      <li>这不是运气、也不是未来函数——<b>小市值轮动是真实、跨宇宙、跨牛熊都盈利的因子</b>，最坏十年也没爆掉。</li>
+      <li>但 headline 的 <b>+548%（年化 40.6%）是 2020–2025 极顺风窗口的 inflated 数字</b>。拉到完整周期，诚实预期应锚定：<b>年化 ~26–29%、夏普 ~0.84、最大回撤 40–62%</b>。该夏普(0.84)是"好"而非"白捡"。</li>
+      <li><b>真正风险是回撤不是爆仓</b>：cyb 在 2017–2018 能让你腰斩（-62%），zz2000 也要扛 -42%。能否拿住不割肉，才是这个策略能不能赚到钱的真正门槛。</li>
+      <li><b>创业板并不比全市场小市值"更优"</b>（长周期夏普持平、回撤更狠）——选创业板只是选了一个"短期更刺激、长期不占便宜"的版本。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============ 7 已知缺陷 ============ -->
+<h2>八、已知数据缺陷（不影响主结论）</h2>
+<div class="card">
+  <ul>
+    <li><b>932000 指数 2023 全年缺口：</b><code>index_daily</code> 中 <code>932000.SH</code> 在 2023 年 0 行，导致年度对照表 2023 基准显示 +0.00%。<b>仅影响该年基准对照显示</b>，策略自身收益按真实持仓净值计算、不受影响。需重下 932000 日线才能补。</li>
+    <li><b><code>income</code> 利润表为空：</b>下载脚本仅填充 <code>fina_indicator</code>（20.6 万行），且 <code>TUSHARE_TOKEN</code> 仍为占位符。基本面过滤已改用 <code>fina_indicator.eps&gt;0</code> 判盈利；若日后配置有效 token 并补全 <code>income</code>，可恢复原"净利润&gt;0 且营收&gt;5亿"判据。</li>
+    <li><b>年份边界归因微差：</b>同一配置从不同起点跑，跨年收益因"年末持仓是否带入次年"略有差异（如 2020 在 2020–2025 段为 +94.42%、在 2015–2025 段为 +109.50%），属正常会计口径差异，不影响区间总收益与结论。</li>
+  </ul>
+</div>
+
+<footer>
+  本报告由回测日志与五段稳健性检验结果整理而成 · 所有收益均未扣除税费外其他成本之外的模型外风险 · 仅供研究复盘，不构成投资建议。<br>
+  生成于 2026-07-09 · 小市值轮动策略回测稳健性报告
+</footer>
+
+</div>
+</body>
+</html>

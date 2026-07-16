@@ -3,9 +3,16 @@
 ETF轮动策略 - 国内资产动量轮动
 ============================
 支持的调仓方法（--method）：
-  single      单动量法：每期满仓第1名，全部走弱时转现金
-  dual        双动量法（默认）：前2名等权，MA60过滤
-  ma_filter   均线过滤法：MA60之上才买，全部跌破MA60时空仓
+  single      单动量法：每期满仓第1名，全部走弱时转货币基金避险
+  dual        双动量法（默认）：前N名等权，MA60过滤+波动率惩罚+追高保护
+  ma_filter   均线过滤法：MA60之上才买，全部跌破MA60时转货币基金避险
+
+风控特性（基于《ETF轮动策略投研手册》精华）：
+  · 最小切换阈值（防抖动）：新标的领先超过阈值才切换，避免临界来回换手
+  · 现金缓冲：保留10%现金（可配置），降低满仓风险
+  · 追高保护：60日涨幅超过40%时扣分，避免追涨见顶
+  · 熊市避险：全部标的走弱时自动转入货币基金（华宝添益）
+  · 波动率惩罚：使用非年化20日波动率，与动量收益同量级
 
 标的池（20只·分类覆盖）：
   宽基(9)：沪深300/上证50/中证800/上证指数/中证500/中证1000/创业板/创业板50/科创50
@@ -30,34 +37,41 @@ from run_monthly_rebalance import get_conn, get_monthly_5th_trading_days, COMMIS
 STAMP_DUTY_RATE_ETF = 0.0       # ETF 免印花税
 INITIAL_CAPITAL = 100000        # 初始总资金
 
+# ── 手册精华参数 ──────────────────────────────────────────
+SWITCH_THRESHOLD = 0.05         # 最小切换阈值：新标的领先5%以上才切换（防抖动）
+CASH_BUFFER_PCT = 0.10          # 现金缓冲：保留10%现金（手册建议10-20%）
+MOMENTUM_WARNING_THRESHOLD = 0.40  # 追高警告：60日涨幅>40%时警惕见顶
+MONEY_FUND_CODE = "511990.SH"   # 货币基金代码（熊市避险）
+
 # ── 标的池定义（真实ETF·扩大版）───────────────────────────────
 #  分类：宽基 / 行业 / 跨境 / 商品债券 / 货币
 ETF_UNIVERSE = [
-    # ── 宽基 ──────────────────────────────────────────────
-    {"code": "510300.SH", "name": "沪深300ETF", "desc": "大盘价值",   "cat": "宽基"},
-    {"code": "510050.SH", "name": "上证50ETF",  "desc": "超大盘蓝筹", "cat": "宽基"},
-    {"code": "515800.SH", "name": "中证800ETF", "desc": "大中盘",     "cat": "宽基"},
-    {"code": "510980.SH", "name": "上证指数ETF","desc": "上证全指",   "cat": "宽基"},
-    {"code": "510500.SH", "name": "中证500ETF", "desc": "中盘成长",   "cat": "宽基"},
-    {"code": "512100.SH", "name": "中证1000ETF","desc": "小盘",       "cat": "宽基"},
-    {"code": "159915.SZ", "name": "创业板ETF",  "desc": "科技成长",   "cat": "宽基"},
-    {"code": "159949.SZ", "name": "创业板50ETF","desc": "创业板龙头", "cat": "宽基"},
-    {"code": "588000.SH", "name": "科创50ETF",  "desc": "科创板",     "cat": "宽基"},
+    # ── 宽基（防守层：大盘价值/蓝筹）──────────────────────
+    {"code": "510300.SH", "name": "沪深300ETF", "desc": "大盘价值",   "cat": "宽基", "layer": "防守"},
+    {"code": "510050.SH", "name": "上证50ETF",  "desc": "超大盘蓝筹", "cat": "宽基", "layer": "防守"},
+    {"code": "515800.SH", "name": "中证800ETF", "desc": "大中盘",     "cat": "宽基", "layer": "防守"},
+    {"code": "510980.SH", "name": "上证指数ETF","desc": "上证全指",   "cat": "宽基", "layer": "防守"},
+    {"code": "510500.SH", "name": "中证500ETF", "desc": "中盘成长",   "cat": "宽基", "layer": "防守"},
+    # ── 宽基（进攻层：高成长/小盘）────────────────────────
+    {"code": "512100.SH", "name": "中证1000ETF","desc": "小盘",       "cat": "宽基", "layer": "进攻"},
+    {"code": "159915.SZ", "name": "创业板ETF",  "desc": "科技成长",   "cat": "宽基", "layer": "进攻"},
+    {"code": "159949.SZ", "name": "创业板50ETF","desc": "创业板龙头", "cat": "宽基", "layer": "进攻"},
+    {"code": "588000.SH", "name": "科创50ETF",  "desc": "科创板",     "cat": "宽基", "layer": "进攻"},
     # ── 行业 ──────────────────────────────────────────────
-    {"code": "512480.SH", "name": "半导体ETF",  "desc": "芯片半导体", "cat": "行业"},
-    {"code": "515030.SH", "name": "新能源车ETF","desc": "新能源",     "cat": "行业"},
-    {"code": "512010.SH", "name": "医药ETF",    "desc": "医药生物",   "cat": "行业"},
-    {"code": "159928.SZ", "name": "消费ETF",    "desc": "大消费",     "cat": "行业"},
-    {"code": "512880.SH", "name": "证券ETF",    "desc": "券商金融",   "cat": "行业"},
+    {"code": "512480.SH", "name": "半导体ETF",  "desc": "芯片半导体", "cat": "行业", "layer": "进攻"},
+    {"code": "515030.SH", "name": "新能源车ETF","desc": "新能源",     "cat": "行业", "layer": "进攻"},
+    {"code": "512010.SH", "name": "医药ETF",    "desc": "医药生物",   "cat": "行业", "layer": "防守"},
+    {"code": "159928.SZ", "name": "消费ETF",    "desc": "大消费",     "cat": "行业", "layer": "防守"},
+    {"code": "512880.SH", "name": "证券ETF",    "desc": "券商金融",   "cat": "行业", "layer": "进攻"},
     # ── 跨境 ──────────────────────────────────────────────
-    {"code": "159920.SZ", "name": "恒生ETF",    "desc": "港股宽基",   "cat": "跨境"},
-    {"code": "513100.SH", "name": "纳指ETF",    "desc": "美股科技",   "cat": "跨境"},
-    # ── 商品/债券 ─────────────────────────────────────────
-    {"code": "518880.SH", "name": "黄金ETF",     "desc": "商品避险",   "cat": "商品"},
-    {"code": "501018.SH", "name": "原油LOF",    "desc": "商品能源",   "cat": "商品"},
-    {"code": "511010.SH", "name": "国债ETF",     "desc": "利率债",     "cat": "债券"},
-    # ── 货币 ──────────────────────────────────────────────
-    {"code": "511990.SH", "name": "华宝添益",    "desc": "货币基金",   "cat": "货币"},
+    {"code": "159920.SZ", "name": "恒生ETF",    "desc": "港股宽基",   "cat": "跨境", "layer": "进攻"},
+    {"code": "513100.SH", "name": "纳指ETF",    "desc": "美股科技",   "cat": "跨境", "layer": "进攻"},
+    # ── 商品/债券（避险层：负相关资产）────────────────────
+    {"code": "518880.SH", "name": "黄金ETF",     "desc": "商品避险",   "cat": "商品", "layer": "避险"},
+    {"code": "501018.SH", "name": "原油LOF",    "desc": "商品能源",   "cat": "商品", "layer": "避险"},
+    {"code": "511010.SH", "name": "国债ETF",     "desc": "利率债",     "cat": "债券", "layer": "避险"},
+    # ── 货币（避险层：熊市保命）──────────────────────────
+    {"code": "511990.SH", "name": "华宝添益",    "desc": "货币基金",   "cat": "货币", "layer": "避险"},
 ]
 
 BENCHMARK_CODE = "510300.SH"   # 基准（沪深300ETF）
@@ -210,14 +224,20 @@ def calc_ma(ts_code, trade_date, period=60):
     return np.mean(closes[:period])
 
 
-def calc_volatility(ts_code, trade_date, window=20):
-    """计算年化波动率"""
+def calc_volatility(ts_code, trade_date, window=20, annualized=True):
+    """计算波动率
+
+    Args:
+        annualized: True=年化波动率（用于报告），False=原始日波动率（用于打分）
+    打分时使用非年化波动率，与ROC收益同量级，避免惩罚项过大。
+    """
     closes = _query_history(ts_code, trade_date, "close", window + 5)
     if closes is None or len(closes) < window + 1:
         return None
     closes = closes[::-1]  # 升序
     returns = np.diff(np.log(closes))
-    return float(np.std(returns) * np.sqrt(252))
+    vol = float(np.std(returns))
+    return vol * np.sqrt(252) if annualized else vol
 
 
 # ── 交易日期 ──────────────────────────────────────────────
@@ -246,6 +266,9 @@ def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
     results = []
     for etf in ETF_UNIVERSE:
         code = etf["code"]
+        # 货币基金不参与打分（作为熊市避险资产单独处理）
+        if code == MONEY_FUND_CODE:
+            continue
         close_price = get_etf_price(code, trade_date)
         if close_price is None:
             continue
@@ -264,13 +287,18 @@ def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
         elif method == "dual":
             roc_short = calc_roc(code, trade_date, roc_period)
             roc_long = calc_roc(code, trade_date, roc_period * 3)
-            vol = calc_volatility(code, trade_date, roc_period)
+            vol = calc_volatility(code, trade_date, roc_period, annualized=False)
             if roc_short is None or roc_long is None or vol is None:
                 continue
             # MA60 过滤：跌破MA60的不参与排名
             if ma60 is not None and close_price < ma60:
                 continue
-            score = roc_short * 0.5 + roc_long * 0.3 - vol * 0.2
+            # 手册推荐权重：w1=0.4(近月动量), w2=0.4(近季动量), w3=0.2(波动惩罚)
+            score = roc_short * 0.4 + roc_long * 0.4 - vol * 0.2
+            # 追高保护：60日涨幅超过阈值时扣分，避免追涨见顶
+            if roc_long > MOMENTUM_WARNING_THRESHOLD:
+                excess = roc_long - MOMENTUM_WARNING_THRESHOLD
+                score -= excess * 0.5
 
         elif method == "ma_filter":
             roc_val = calc_roc(code, trade_date, roc_period)
@@ -291,13 +319,13 @@ def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
     return results
 
 
-def select_targets(scored_list, method="dual"):
+def select_targets(scored_list, method="dual", top_n=2):
     """根据调仓方法从打分列表中选择目标持仓
 
     返回:
         [ (code, name, weight_pct), ... ]
         weight_pct 为分配权重（小数，如 0.5=50%）
-        空列表表示空仓（全部转现金）
+        空列表表示空仓（全部转货币基金避险）
     """
     if not scored_list:
         return []
@@ -306,13 +334,14 @@ def select_targets(scored_list, method="dual"):
         return [(scored_list[0][0], scored_list[0][1], 1.0)]
 
     elif method == "dual":
-        n = min(2, len(scored_list))
+        # 双动量法：选Top N等权持有（手册推荐Top 2-3）
+        n = min(top_n, len(scored_list))
         return [(scored_list[i][0], scored_list[i][1], 1.0 / n) for i in range(n)]
 
     elif method == "ma_filter":
-        # 全部排在 MA60 过滤后，剩下的才买入
-        n = max(1, min(len(scored_list) // 2 or 1, len(scored_list)))
-        return [(c[0], c[1], 1.0 / n) for c in scored_list[:n]]
+        # 均线过滤法：选Top 1-2等权（已在打分时过滤MA60以下的）
+        n = min(2, len(scored_list))
+        return [(scored_list[i][0], scored_list[i][1], 1.0 / n) for i in range(n)]
 
     return []
 
@@ -321,7 +350,9 @@ def select_targets(scored_list, method="dual"):
 
 def run_etf_rotation(start_date="20200101", end_date="20251231",
                      method="dual", roc_period=20, ma_period=60,
-                     capital=INITIAL_CAPITAL, verbose=True):
+                     capital=INITIAL_CAPITAL, verbose=True,
+                     top_n=2, switch_threshold=SWITCH_THRESHOLD,
+                     cash_buffer_pct=CASH_BUFFER_PCT):
     """ETF轮动策略主回测
 
     Args:
@@ -332,6 +363,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         ma_period:  MA 计算周期
         capital:    初始资金
         verbose:    是否打印日志
+        top_n:      双动量法持仓数量（默认2，手册推荐2-3）
+        switch_threshold: 最小切换阈值（默认5%，防抖动）
+        cash_buffer_pct:  现金缓冲比例（默认10%）
 
     Returns:
         dict: 回测结果
@@ -377,51 +411,73 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
             # 用前一天收盘价打分
             scored = score_assets(prev_td, method=method,
                                   roc_period=roc_period, ma_period=ma_period)
-            targets = select_targets(scored, method=method)  # [(code, name, weight), ...]
+            targets = select_targets(scored, method=method, top_n=top_n)
+
+            # ── 最小切换阈值（防抖动）──
+            # 当前持仓得分与新目标接近时，不切换，避免临界来回换手
+            score_lookup = {c: s for c, _, s in scored}
+            target_codes = {c for c, _, _ in targets}
+            protected = set()
+            if switch_threshold > 0 and positions and targets:
+                for code in list(positions.keys()):
+                    if code in target_codes or code not in score_lookup:
+                        continue
+                    current_score = score_lookup[code]
+                    target_scores = [score_lookup.get(c, 0.0) for c, _, _ in targets]
+                    if target_scores:
+                        worst_target = min(target_scores)
+                        if worst_target > 0 and current_score > 0 and \
+                           current_score >= worst_target * (1 - switch_threshold):
+                            protected.add(code)
 
             if verbose:
                 score_str = ", ".join(f"{n}({s:.1%})" for _, n, s in scored[:3])
-                target_str = ", ".join(f"{n}({w:.0%})" for _, n, w in targets) if targets else CASH_NAME
-                print(f"  调仓日 {td}：得分前三={score_str} | 目标={target_str}")
+                if targets:
+                    target_str = ", ".join(f"{n}({w:.0%})" for _, n, w in targets)
+                else:
+                    target_str = f"{CASH_NAME}(避险)"
+                prot_names = [next((e["name"] for e in ETF_UNIVERSE if e["code"] == p), p) for p in protected]
+                prot_str = f" | 保留={','.join(prot_names)}" if protected else ""
+                print(f"  调仓日 {td}：得分前三={score_str} | 目标={target_str}{prot_str}")
 
-            # 获取目标代码集合
-            target_codes = {c for c, _, _ in targets}
-
-            # ── 卖出不在目标中的旧持仓（按开盘价） ──
+            # ── 卖出不在目标中的旧持仓（跳过protected和货币基金）──
             for code in list(positions.keys()):
-                if code not in target_codes:
-                    open_price = get_etf_open(code, td)
-                    if open_price is None or open_price <= 0:
-                        continue
-                    pos = positions[code]
-                    proceeds = pos["shares"] * open_price
-                    fee = calc_etf_fee('sell', open_price, pos["shares"])
-                    cash += proceeds - fee
-                    trades.append({
-                        "date": td, "action": "SELL", "code": code,
-                        "name": next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code),
-                        "price": open_price, "shares": pos["shares"], "reason": "rotation"
-                    })
-                    if verbose:
-                        etf_name = next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code)
-                        print(f"    → 卖出 {etf_name}：{pos['shares']}份 @ {open_price:.3f}")
-                    del positions[code]
+                if code in target_codes or code in protected:
+                    continue
+                # 熊市模式下保留货币基金
+                if not targets and code == MONEY_FUND_CODE:
+                    continue
+                open_price = get_etf_open(code, td)
+                if open_price is None or open_price <= 0:
+                    continue
+                pos = positions[code]
+                proceeds = pos["shares"] * open_price
+                fee = calc_etf_fee('sell', open_price, pos["shares"])
+                cash += proceeds - fee
+                trades.append({
+                    "date": td, "action": "SELL", "code": code,
+                    "name": next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code),
+                    "price": open_price, "shares": pos["shares"], "reason": "rotation"
+                })
+                if verbose:
+                    etf_name = next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code)
+                    print(f"    → 卖出 {etf_name}：{pos['shares']}份 @ {open_price:.3f}")
+                del positions[code]
 
-            # ── 买入新的目标持仓（等权分配） ──
+            # ── 买入新的目标持仓（等权分配，保留现金缓冲）──
             if targets:
-                # 筛选需要买入的（尚未持仓的）
                 new_to_buy = [(c, n, w) for c, n, w in targets if c not in positions]
                 if new_to_buy:
-                    cash_per_target = cash / len(new_to_buy)
+                    investable = cash * (1 - cash_buffer_pct)
+                    cash_per_target = investable / len(new_to_buy)
                     for code, name, weight in new_to_buy:
                         open_price = get_etf_open(code, td)
                         if open_price is None or open_price <= 0:
                             continue
-                        # 分配资金（预留手续费空间，避免费用超出现金）
                         alloc = cash_per_target * weight * len(new_to_buy)
-                        alloc = min(alloc, cash)  # 不超过剩余现金
-                        alloc_after_fee = alloc * 0.998  # 预留0.2%给手续费+滑点
-                        max_shares = int(alloc_after_fee / open_price / 100) * 100  # 取整到100份(1手)
+                        alloc = min(alloc, cash)
+                        alloc_after_fee = alloc * 0.998
+                        max_shares = int(alloc_after_fee / open_price / 100) * 100
                         if max_shares < 100:
                             continue
                         cost = max_shares * open_price
@@ -436,8 +492,28 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                             })
                             if verbose:
                                 print(f"    → 买入 {name}：{max_shares}份 @ {open_price:.3f}")
-
-            # 如果 targets 为空，全部转现金（已实现：现金自然保留）
+            else:
+                # ── 熊市避险：全部走弱时买入货币基金 ──
+                if MONEY_FUND_CODE not in positions:
+                    open_price = get_etf_open(MONEY_FUND_CODE, td)
+                    if open_price and open_price > 0:
+                        investable = cash * (1 - cash_buffer_pct)
+                        alloc_after_fee = investable * 0.998
+                        max_shares = int(alloc_after_fee / open_price / 100) * 100
+                        if max_shares >= 100:
+                            cost = max_shares * open_price
+                            fee = calc_etf_fee('buy', open_price, max_shares)
+                            if cost + fee <= cash:
+                                cash -= cost + fee
+                                positions[MONEY_FUND_CODE] = {"shares": max_shares, "buy_price": open_price}
+                                mf_name = next((e["name"] for e in ETF_UNIVERSE if e["code"] == MONEY_FUND_CODE), CASH_NAME)
+                                trades.append({
+                                    "date": td, "action": "BUY", "code": MONEY_FUND_CODE,
+                                    "name": mf_name, "price": open_price,
+                                    "shares": max_shares, "reason": "bear_market_safe_haven"
+                                })
+                                if verbose:
+                                    print(f"    → 熊市避险：买入 {mf_name}：{max_shares}份 @ {open_price:.3f}")
 
         # ── 每日市值记录（调仓后，反映当日实际持仓的收盘价）──
         total_value = cash
@@ -531,6 +607,11 @@ if __name__ == "__main__":
     parser.add_argument("--roc-period", type=int, default=20, help="ROC计算周期（默认20）")
     parser.add_argument("--ma-period", type=int, default=60, help="MA计算周期（默认60）")
     parser.add_argument("--capital", type=int, default=INITIAL_CAPITAL, help="初始资金（默认100000）")
+    parser.add_argument("--top-n", type=int, default=2, help="双动量法持仓数量（默认2）")
+    parser.add_argument("--switch-threshold", type=float, default=SWITCH_THRESHOLD,
+                        help=f"最小切换阈值（默认{SWITCH_THRESHOLD}，防抖动）")
+    parser.add_argument("--cash-buffer", type=float, default=CASH_BUFFER_PCT,
+                        help=f"现金缓冲比例（默认{CASH_BUFFER_PCT}）")
     parser.add_argument("--quiet", action="store_true", help="静默模式")
     args = parser.parse_args()
 
@@ -542,4 +623,7 @@ if __name__ == "__main__":
         ma_period=args.ma_period,
         capital=args.capital,
         verbose=not args.quiet,
+        top_n=args.top_n,
+        switch_threshold=args.switch_threshold,
+        cash_buffer_pct=args.cash_buffer,
     )

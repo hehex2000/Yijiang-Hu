@@ -27,11 +27,64 @@ from run_monthly_rebalance import (
 )
 from run_grid_backtest import generate_grid_levels
 
+# ── 手续费追踪（用于分析手续费对收益的拖累）──
+# 包装 calc_fee，累计每一笔真实发生的交易成本（佣金+印花税+滑点）。
+_FEE_TRACKER = {"total": 0.0}
+_orig_calc_fee = calc_fee
+def _fee_tracking_calc_fee(buy_or_sell, price, shares):
+    f = _orig_calc_fee(buy_or_sell, price, shares)
+    _FEE_TRACKER["total"] += f
+    return f
+calc_fee = _fee_tracking_calc_fee  # 模块内所有 calc_fee 调用均走此包装
+
 # ── 默认参数 ──
 GRID_PCT = 0.02          # 网格间距 2%
 PER_GRID_CASH = 5000     # 每格交易金额
 INIT_POSITION_PCT = 0.5  # 网格初始仓位 50%
 DEFAULT_GRID_INDEX = "000300.SH"  # 网格参考指数
+
+
+def parse_rebalance_freq(s):
+    """
+    解析 --rebalance-freq 参数，支持：
+      weekly / w / 周 / 每周   → "weekly"（每周调仓一次）
+      1 / monthly / 月 / 每月  → 1（每月调仓一次）
+      3 / quarterly / 季度     → 3（每3个月调仓一次，默认）
+      其他正整数               → 该月数（每 N 个月调仓一次）
+    """
+    s = str(s).strip().lower()
+    if s in ("weekly", "w", "周", "每周"):
+        return "weekly"
+    if s in ("monthly", "m", "月", "每月"):
+        return 1
+    if s in ("quarterly", "q", "季度", "每3个月", "每三个月"):
+        return 3
+    try:
+        v = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"无法解析调仓频率: {s!r}（支持 weekly / 1(每月) / 3(每季度) / 正整数月数）")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"调仓月数必须为正整数: {s!r}")
+    return v
+
+
+def get_weekly_5th_trading_days(trade_dates):
+    """
+    返回每个自然周内的「第5个交易日」(≈周五) 作为周度调仓日。
+    按 ISO 年-周分组；若某周交易日不足5个，取该周最后1个交易日。
+    """
+    import datetime
+    week_map = {}
+    for td in trade_dates:
+        dt = datetime.datetime.strptime(str(td), "%Y%m%d")
+        iso = dt.isocalendar()
+        key = (iso[0], iso[1])
+        week_map.setdefault(key, []).append(td)
+    out = []
+    for key in sorted(week_map.keys()):
+        days = week_map[key]
+        out.append(days[4] if len(days) >= 5 else days[-1])
+    return out
 
 
 def get_grid_position_series(ts_code="000300.SH", start_date="20200102", end_date="20251231",
@@ -195,7 +248,7 @@ def get_dynamic_top_n(position_pct, default_top_n=5):
 
 def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
                                    default_top_n=5, lookback_months=6, stock_pool=None,
-                                   rebalance_freq_months=1, atr_stop_multiple=0,
+                                   rebalance_freq=3, atr_stop_multiple=0,
                                    atr_cooling_days=0, trailing_stop_pct=0,
                                    skip_recent_months=1, trend_filter_ma=0,
                                    grid_pct=GRID_PCT, per_grid_cash=PER_GRID_CASH,
@@ -213,7 +266,8 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     else:
         pool_display = INDEX_DISPLAY_NAME.get(stock_pool, stock_pool)
 
-    freq_label = f"每{rebalance_freq_months}个月" if rebalance_freq_months > 1 else "每月"
+    freq_label = "每周" if rebalance_freq == "weekly" else (
+        f"每{rebalance_freq}个月" if rebalance_freq > 1 else "每月")
 
     # ── 打印策略概要 ──
     grid_display = INDEX_DISPLAY_NAME.get(grid_index, grid_index)
@@ -265,11 +319,16 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
 
     # ── 第2步：动量回测循环（动态top_n）──
     trade_dates = get_trade_dates(start_date, end_date)
-    monthly_rebalance = get_monthly_5th_trading_days(trade_dates)
-    rebalance_set = set(list(monthly_rebalance)[::rebalance_freq_months])
+    if rebalance_freq == "weekly":
+        rebalance_dates = get_weekly_5th_trading_days(trade_dates)
+        rebalance_set = set(rebalance_dates)
+    else:
+        monthly_rebalance = get_monthly_5th_trading_days(trade_dates)
+        rebalance_set = set(list(monthly_rebalance)[::rebalance_freq])
     print(f"交易日总数：{len(trade_dates)}，调仓日：{len(rebalance_set)}次\n")
 
     # 初始化
+    _FEE_TRACKER["total"] = 0.0  # 重置：排除前面网格择时模拟阶段的费用，只统计真实组合交易
     positions = {}
     cash = INIT_CAPITAL
     daily_vals = []
@@ -528,6 +587,12 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     print(f"  最大回撤：{max_dd:.2f}%")
     print(f"  夏普比率：{sharpe:.2f}")
     print(f"  交易次数：{len(trades)}")
+    total_fee = _FEE_TRACKER["total"]
+    fee_pct_capital = total_fee / INIT_CAPITAL * 100
+    gross_return = ((final_value + total_fee) / INIT_CAPITAL - 1) * 100  # 无手续费近似
+    fee_drag = gross_return - total_return
+    print(f"  总手续费：{total_fee:,.2f} 元（占初始资金 {fee_pct_capital:.2f}%）")
+    print(f"  无手续费收益率(近似)：{gross_return:+.2f}%（手续费拖累 {fee_drag:+.2f} 个百分点）")
     win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
     if tot_cnt > 0:
         print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
@@ -539,7 +604,7 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     # 保存结果
     csv_dir = "data/results/momentum_grid_timing"
     os.makedirs(csv_dir, exist_ok=True)
-    freq_suffix = f"_{rebalance_freq_months}m_rebal"
+    freq_suffix = "_weekly_rebal" if rebalance_freq == "weekly" else f"_{rebalance_freq}m_rebal"
     if atr_stop_multiple > 0:
         stop_suffix = f"_atr{atr_stop_multiple}"
     elif trailing_stop_pct > 0:
@@ -575,7 +640,8 @@ if __name__ == "__main__":
     parser.add_argument("--top-n", type=int, default=5, help="默认选股数量（默认5）")
     parser.add_argument("--lookback", type=int, default=12, help="动量回看月数（默认12）")
     parser.add_argument("--stock-pool", type=str, default=None, help="股票池代码（如000300.SH）")
-    parser.add_argument("--rebalance-freq", type=int, default=3, help="调仓频率月数（默认3=季度）")
+    parser.add_argument("--rebalance-freq", type=parse_rebalance_freq, default=3,
+                        help="调仓频率：weekly(每周) / 1(每月) / 3(每季度,默认) / 或正整数月数")
     parser.add_argument("--atr-stop", type=float, default=2.0, help="ATR止损倍数（默认2.0）")
     parser.add_argument("--trailing-stop", type=float, default=0, help="固定比例trailing stop")
     parser.add_argument("--grid-pct", type=float, default=GRID_PCT, help="网格间距（默认0.02=2%%）")
@@ -590,7 +656,7 @@ if __name__ == "__main__":
         default_top_n=args.top_n,
         lookback_months=args.lookback,
         stock_pool=args.stock_pool,
-        rebalance_freq_months=args.rebalance_freq,
+        rebalance_freq=args.rebalance_freq,
         atr_stop_multiple=args.atr_stop,
         trailing_stop_pct=args.trailing_stop,
         trend_filter_ma=args.trend_filter,

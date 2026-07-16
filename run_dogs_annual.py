@@ -24,12 +24,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-from config import DATA, SELECTION, GLOBAL, DOGS_OF_MARKET, BACKTEST
+from config import DATA, SELECTION, GLOBAL, DOGS_OF_MARKET, BACKTEST, VALUE_STRATEGY
 
 DB_PATH = DATA.get("local_db_path", "D:/tu-shareData/astock_daily.db")
-# 每只股票初始资金：默认跟随 config 的 per_stock_capital（与「选股+回测」一致），
-# 也可通过 run_backtest(capital=...) 或 CLI --capital 覆盖
-INIT_CAPITAL = BACKTEST.get("per_stock_capital", 100000)
+# 初始【总】资金：默认跟随 config 的 total_capital（与「选股+回测」一致），
+# 也可通过 run_backtest(capital=...) 或 CLI --capital 覆盖。
+# 注意：此处 capital 表示「总资金」，每只 = 总资金 ÷ 选股数。
+TOTAL_CAPITAL = BACKTEST.get("total_capital", 500000)
 
 
 def ts_code(code):
@@ -142,19 +143,64 @@ def get_stock_pool_index():
     return pool_map.get(pool, "000906.SH")
 
 
-def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_only=False, capital=None):
-    """执行狗股策略年度调仓回测"""
+# 股票名称缓存（避免每年重复查库）
+_NAME_CACHE = {}
+def get_stock_name(ts_code):
+    """从 stock_basic 表查股票名称（带缓存）"""
+    if ts_code in _NAME_CACHE:
+        return _NAME_CACHE[ts_code]
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT name FROM stock_basic WHERE ts_code=?", conn, params=(ts_code,),
+    )
+    conn.close()
+    nm = df.iloc[0]["name"] if (len(df) > 0 and df.iloc[0]["name"]) else ts_code
+    _NAME_CACHE[ts_code] = nm
+    return nm
+
+
+def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_only=False, capital=None, strategy="dogs"):
+    """执行狗股/价值 年度调仓回测
+
+    Args:
+        capital: 初始【总】资金（元）。每只 = 总资金 ÷ 选股数，等权买入。
+        strategy: 子策略 — "dogs"(狗股: 高股息+低PB+均值回归) 或 "value"(价值选股: 破净+ROE质量+自由现金流)
+    """
     if top_n is None:
         top_n = SELECTION.get("top_n", 5)
 
-    # 初始资金：优先用传入 capital，否则跟随 config 的 per_stock_capital（与「选股+回测」一致）
+    # 初始【总】资金：优先用传入 capital（命令行 --capital / bat 菜单设置），
+    # 否则跟随 config 的 total_capital（与「选股+回测」一致）。
+    # 此处 capital 表示「总资金」，每只 = 总资金 ÷ 选股数。
     if capital is None:
-        capital = BACKTEST.get("per_stock_capital", 100000)
-    global INIT_CAPITAL
-    INIT_CAPITAL = capital
+        capital = BACKTEST.get("total_capital", 500000)
+    global TOTAL_CAPITAL
+    TOTAL_CAPITAL = capital
 
+    # 神奇公式提示：30只等权需每只≥3万（100万总），否则单价偏高股买不起→空仓拖累
+    if strategy == "magic" and top_n > 0 and TOTAL_CAPITAL / top_n < 30000:
+        print(f"\n  [提示] 神奇公式建议 N=30 + 总资金≥100万（每只≥3万）。")
+        print(f"        当前每只约 {TOTAL_CAPITAL // top_n:,} 元，单价偏高股票将因"
+              f"买不起被跳过，可能空仓拖累收益。")
+        print(f"        可在主菜单 [3] 设置选股数量/资金，或改用 standalone: "
+              f"run_magic_formula.py（5月调仓版）。\n")
+
+    # 同步选股数量 / 股票池到两个子策略配置
     DOGS_OF_MARKET["top_n"] = top_n
     DOGS_OF_MARKET["stock_pool"] = SELECTION["stock_pool"]
+    VALUE_STRATEGY["top_n"] = top_n
+    VALUE_STRATEGY["stock_pool"] = SELECTION["stock_pool"]
+
+    # 子策略：狗股 / 价值选股 / 神奇公式(Magic Formula)
+    strategy = (strategy or "dogs").lower()
+    if strategy not in ("dogs", "value", "magic"):
+        strategy = "dogs"
+    if strategy == "magic":
+        strategy_name = "神奇公式(Magic Formula·ROC+EY双排名)"
+    elif strategy == "value":
+        strategy_name = "价值选股(破净+ROE+现金流)"
+    else:
+        strategy_name = "狗股策略(高股息+低PB)"
 
     # 获取交易日
     trade_dates = get_trade_dates(start_date, end_date)
@@ -166,8 +212,9 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     yearly_first = get_first_trading_days(trade_dates)
     years = sorted(yearly_first.keys())
     print(f"\n{'='*70}")
-    print(f"  狗股策略年度调仓回测")
+    print(f"  {strategy_name} · 年度调仓回测")
     print(f"  区间: {start_date} ~ {end_date}  |  选股: {top_n} 只")
+    print(f"  总资金: {TOTAL_CAPITAL:,} 元  →  每支约 {TOTAL_CAPITAL // top_n:,} 元")
     print(f"  调仓频率: 每年初 (共 {len(years)} 年)")
     print(f"{'='*70}\n")
 
@@ -176,6 +223,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print()
 
     from src.dogs_of_market_selector import DogsOfMarketSelector
+    from src.value_stock_selector import ValueStockSelector
     from src.data_fetcher import DataFetcher
 
     # 初始化选股器
@@ -187,11 +235,35 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         "use_tushare_backup": False,
     }
     fetcher = DataFetcher(**df_config)
-    selector = DogsOfMarketSelector(DOGS_OF_MARKET, fetcher)
+    if strategy == "value":
+        selector = ValueStockSelector(VALUE_STRATEGY, fetcher)
+    else:
+        selector = DogsOfMarketSelector(DOGS_OF_MARKET, fetcher)
+
+    # 选股执行（按子策略分派；价值选股按选股年份推导报告期并多层回退，
+    # 避免用到「未来」财务数据，同时放宽候选池确保能选出足够股票）
+    def do_select(prev_td):
+        if strategy == "magic":
+            # 神奇公式：复用 run_magic_formula 的选股逻辑（point-in-time 财务+
+            # 市值，剔除 ST/688/BJ/金融/公用）。T-1 日(prev_td)数据选股、T 日开盘执行。
+            from run_magic_formula import select_magic_formula
+            return select_magic_formula(prev_td, top_n=top_n, prev_date=prev_td, verbose=True)
+        if strategy == "value":
+            yr = int(prev_td[:4])
+            # 价值选股条件较严，先放宽候选池(×2)，最后再截断到 top_n
+            VALUE_STRATEGY["top_n"] = max(top_n * 2, top_n + 10)
+            for rp in (f"{yr-1}1231", f"{yr-2}1231", f"{yr-3}1231", "20260331"):
+                VALUE_STRATEGY["report_date"] = rp
+                sel = selector.select_stocks(date=prev_td, top_n=VALUE_STRATEGY["top_n"])
+                if sel is not None and len(sel) > 0:
+                    return sel.head(top_n).reset_index(drop=True)
+            return None
+        else:
+            return selector.select_stocks(date=prev_td)
 
     # 回测状态
     positions = {}       # {ts_code: {"shares": N, "buy_price": P}}
-    cash = INIT_CAPITAL * top_n
+    cash = TOTAL_CAPITAL
     daily_vals = []      # 每日总市值
 
     # 年度收益记录
@@ -243,12 +315,15 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
                 years_done.add(year)
 
             # 选股
-            selected = selector.select_stocks(date=prev_td)
+            selected = do_select(prev_td)
             if selected is None or len(selected) == 0:
                 print(f"  [WARN] {year}年选股失败，保持现有持仓")
                 continue
 
             new_codes = selected["ts_code"].tolist()
+            # 打印本年入选清单（带名称），便于与另一子策略逐年对照
+            sel_names = "、".join(f"{c}({get_stock_name(c)})" for c in new_codes)
+            print(f"  本年入选 {len(new_codes)}/{top_n} 只: {sel_names}")
             new_code_set = set(new_codes)
             old_codes = current_codes()
 
@@ -297,6 +372,9 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
             print(f"  买入 {bought} 只, 持有 {len(old_in_new)} 只, 当前持仓 {len(positions)} 只")
             print(f"  现金: {cash:.2f}")
 
+    # 还原 VALUE_STRATEGY.top_n（do_select 内被临时放大过）
+    VALUE_STRATEGY["top_n"] = top_n
+
     # ──── 回测结束：强制平仓 ────
     print(f"\n  {'─'*60}")
     if positions:
@@ -344,7 +422,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         yg = year_groups[year]
         if idx == 0:
             # 第一年：从年初到年底
-            year_start = INIT_CAPITAL * top_n
+            year_start = TOTAL_CAPITAL
         else:
             year_start = year_groups[year]["first"]
 
@@ -378,7 +456,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
 
     # 总收益（回测全程）
     final_value = daily_vals[-1]["value"]
-    total_return = (final_value / (INIT_CAPITAL * top_n) - 1) * 100
+    total_return = (final_value / TOTAL_CAPITAL - 1) * 100
 
     # 基准总收益
     first_date = daily_vals[0]["date"]
@@ -395,7 +473,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     # 年化收益
     days = len(trade_dates)
     years_span = days / 252
-    annual_return = ((final_value / (INIT_CAPITAL * top_n)) ** (1 / years_span) - 1) * 100 if years_span > 0 else 0
+    annual_return = ((final_value / TOTAL_CAPITAL) ** (1 / years_span) - 1) * 100 if years_span > 0 else 0
 
     # 风控指标
     vals = np.array([d["value"] for d in daily_vals])
@@ -408,8 +486,8 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"\n{'='*70}")
     print(f"  📈 最终汇总")
     print(f"{'='*70}")
-    profit_amount = final_value - INIT_CAPITAL * top_n
-    print(f"  初始资金: {INIT_CAPITAL * top_n:>10,.2f}")
+    profit_amount = final_value - TOTAL_CAPITAL
+    print(f"  初始资金: {TOTAL_CAPITAL:>10,.2f}")
     print(f"  最终资产: {final_value:>10,.2f}")
     print(f"  总盈亏: {profit_amount:>+10,.2f} 元")
     print(f"  总收益率: {total_return:>+9.2f}%")
@@ -450,8 +528,11 @@ if __name__ == "__main__":
     parser.add_argument("--top-n", type=int, default=None)
     parser.add_argument("--capital", type=int, default=None,
                         help="每只股票初始资金（默认跟随 config 的 per_stock_capital）")
+    parser.add_argument("--strategy", type=str, default="dogs",
+                        help="子策略: dogs(狗股) / value(价值选股) / magic(神奇公式)")
     parser.add_argument("--select-only", action="store_true")
     args = parser.parse_args()
 
     run_backtest(args.start_date, args.end_date, top_n=args.top_n,
-                 select_only=args.select_only, capital=args.capital)
+                 select_only=args.select_only, capital=args.capital,
+                 strategy=args.strategy)

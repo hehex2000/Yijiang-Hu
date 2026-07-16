@@ -50,6 +50,11 @@ COMMISSION_RATE = 0.00025  # 佣金率
 COMMISSION_MIN = 5.0       # 最低佣金
 STAMP_DUTY_RATE = 0.001    # 印花税率（卖出收取）
 
+# ── 流动性过滤（保守阈值，跑大盘股时几乎不剔除成分股）────
+# daily.amount 单位为"千元"，故阈值以元传入时需 ×1000 换算
+LIQUIDITY_MIN_AVG_AMOUNT = 50_000_000   # 日均成交额下限（元）：5000万
+LIQUIDITY_LOOKBACK       = 20           # 滚动窗口（交易日）
+
 # ---- 辅助函数 ----
 
 def calc_win_rate(trades):
@@ -100,10 +105,19 @@ STOCK_POOL_INDEX = {
 
 # 指数代码 → 显示名称
 INDEX_DISPLAY_NAME = {
+    "000001.SH": "上证指数",
+    "000016.SH": "上证50",
     "000300.SH": "沪深300",
+    "000688.SH": "科创50",
+    "000698.SH": "科创100",
+    "000852.SH": "中证1000",
     "000905.SH": "中证500",
     "000906.SH": "中证800",
-    "000852.SH": "中证1000",
+    "000985.SH": "中证全指",
+    "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指",
+    "399673.SZ": "创业板50",
+    "932000.SH": "中证2000",
     None:         "全A股",
 }
 
@@ -273,14 +287,19 @@ def get_trade_dates(start_date, end_date):
 
 
 def get_monthly_5th_trading_days(trade_dates):
-    """每月第5个交易日"""
+    """每月第5个交易日（按时间升序返回，保证跨进程可复现）
+
+    注意：必须返回**有序 list**。历史上这里用 set 返回，
+    调用方 list(...)[::N] 采样时受 PYTHONHASHSEED 影响，
+    集合转 list 的顺序每个进程都不同 → 调仓日程漂移 → 回测结果不可复现。
+    """
     df = pd.DataFrame({"trade_date": trade_dates})
     df["ym"] = df["trade_date"].astype(str).str[:6]
-    _days = set()
+    _days = []
     for _, g in df.groupby("ym"):
         dates = g["trade_date"].tolist()
-        _days.add(dates[4] if len(dates) >= 5 else dates[-1])
-    return _days
+        _days.append(dates[4] if len(dates) >= 5 else dates[-1])
+    return sorted(_days)
 
 
 # ============================================================
@@ -321,15 +340,15 @@ def get_index_constituents(index_code=None, trade_date=None):
         # 取调仓日当天或之前最近的成分股快照
         rows = pd.read_sql_query("""
             SELECT ts_code FROM index_constituent
-            WHERE index_code = ? AND trade_date <= ?
+            WHERE index_code = ? AND ts_code NOT LIKE '688%' AND trade_date <= ?
             AND trade_date = (
                 SELECT MAX(trade_date) FROM index_constituent
-                WHERE index_code = ? AND trade_date <= ?
+                WHERE index_code = ? AND ts_code NOT LIKE '688%' AND trade_date <= ?
             )
         """, conn, params=(index_code, trade_date, index_code, trade_date))
     else:
         rows = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = ?",
+            "SELECT ts_code FROM index_constituent WHERE index_code = ? AND ts_code NOT LIKE '688%'",
             conn, params=(index_code,)
         )
     conn.close()
@@ -429,64 +448,24 @@ def calc_volatility(ts_code, trade_date, window=VOL_WINDOW):
 
 def select_stocks(trade_date, top_n=None):
     """
-    价值选股：
+    价值选股（统一逻辑，来自 src.value_stock_selector.select_value_stocks）：
     - PB < 1.0（破净）
     - ROE > 8%
     - 流动比率 >= 1.2
-    - 股票池成分股（从配置读取）
-    - PE > 0 且 < 30
+    - 0 < PE_TTM < 30
+    - 股票池成分股（时点快照），按 PB 升序取 top_n
+    说明：ROE/流动比率 从 fina_indicator 取真实财报数据，修正此前
+    daily_basic 无此列导致两条件被静默跳过的 bug。
     """
     if top_n is None:
         top_n = get_top_n()
-    index_code = get_stock_pool_index()
-    zz_set = get_index_constituents(index_code)  # None 表示全A股
-    conn = get_conn()
-
-    actual_date = trade_date
-    while True:
-        cnt = pd.read_sql_query(
-            "SELECT COUNT(*) AS n FROM daily_basic WHERE trade_date = ?",
-            conn, params=(actual_date,)
-        ).iloc[0]['n']
-        if cnt > 0:
-            break
-        prev = pd.read_sql_query(
-            "SELECT MAX(trade_date) AS max_date FROM daily_basic WHERE trade_date < ?",
-            conn, params=(actual_date,)
-        )
-        actual_date = prev.iloc[0, 0]
-        if actual_date is None:
-            conn.close()
-            return pd.DataFrame()
-
-    df = pd.read_sql_query("""
-        SELECT DISTINCT ts_code, pe_ttm, pb, close, total_mv
-        FROM daily_basic
-        WHERE trade_date = ?
-          AND pe_ttm > 0 AND pe_ttm < 30
-          AND pb > 0 AND pb < 1.0
-          AND total_mv > 0
-    """, conn, params=(actual_date,))
-    conn.close()
-    
-    if df.empty:
-        return df
-    
-    # 股票池过滤（None表示全A股，不过滤）
-    if zz_set is not None:
-        df = df[df['ts_code'].isin(zz_set)]
-        if df.empty:
-            return df
-    
-    # 过滤 ROE > 8% 且 流动比率 >= 1.2
-    if 'roe' in df.columns:
-        df = df[df['roe'].notna() & (df['roe'] > 8)]
-    if 'current_ratio' in df.columns:
-        df = df[df['current_ratio'].notna() & (df['current_ratio'] >= 1.2)]
-
-    result = df.sort_values('pb', ascending=True).head(top_n)
-    print(f"  [选股] 筛选后{len(df)}只，取前{top_n}只，实际返回{len(result)}只")
-    return result[['ts_code']]
+    try:
+        from config import SELECTION as _SEL
+        pool = _SEL.get("stock_pool", "zz800")
+    except Exception:
+        pool = "zz800"
+    from src.value_stock_selector import select_value_stocks as _shared
+    return _shared(trade_date, top_n, pool)
 
 
 def select_dividend_low_vol_stocks(trade_date, top_n=None):
@@ -706,7 +685,8 @@ def select_momentum_stocks(trade_date, lookback_months=6, top_n=5, index_code=No
                 SELECT MAX(trade_date) FROM daily WHERE trade_date <= ?
             )
         """, conn, params=(trade_date,))
-        stock_set = set(rows['ts_code'].tolist())
+        # 屏蔽科创板(688)与北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
+        stock_set = {c for c in rows['ts_code'].tolist() if not c.startswith('688') and not c.endswith('.BJ')}
 
     # ===== 3. 排除ST股票 =====
     st_codes = pd.read_sql_query(
@@ -729,6 +709,7 @@ def select_momentum_stocks(trade_date, lookback_months=6, top_n=5, index_code=No
         SELECT ts_code, trade_date, close
         FROM daily
         WHERE trade_date >= ? AND trade_date <= ?
+        ORDER BY ts_code, trade_date
     """, conn2, params=(start_date_str, end_date_str))
     conn2.close()
 
@@ -1761,6 +1742,43 @@ def compare_momentum_periods(start_date="20200101", end_date="20251231",
 #  短期逆转效应策略（新增）
 # ══════════════════════════════════════════
 
+def prefilter_by_liquidity(conn, codes, trade_date,
+                           min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT,
+                           lookback=LIQUIDITY_LOOKBACK):
+    """
+    流动性预过滤：剔除 trade_date 往前 lookback 个交易日日均成交额低于阈值的股票。
+    daily.amount 单位为千元 → avg_amt * 1000 = 元。
+    Args: codes: set/list of ts_code（如 000001.SZ）
+    Returns: 通过过滤的 ts_code 集合
+    """
+    if not codes:
+        return set()
+    try:
+        win = pd.read_sql_query(
+            "SELECT trade_date FROM daily WHERE trade_date <= ? "
+            "ORDER BY trade_date DESC LIMIT ?",
+            conn, params=(trade_date, lookback))
+        if len(win) == 0:
+            return set(codes)
+        win_start = win['trade_date'].min()
+        ph = ",".join("?" * len(codes))
+        amt = pd.read_sql_query(
+            f"SELECT ts_code, AVG(amount) AS avg_amt FROM daily "
+            f"WHERE ts_code IN ({ph}) AND trade_date >= ? AND trade_date <= ? "
+            f"GROUP BY ts_code",
+            conn, params=list(codes) + [win_start, trade_date])
+        avg_map = dict(zip(amt['ts_code'], amt['avg_amt']))
+    except Exception as e:
+        print(f"  [WARN] 流动性查询失败，跳过过滤: {e}")
+        return set(codes)
+    kept = {c for c in codes if (avg_map.get(c) is not None
+                                 and avg_map[c] * 1000 >= min_avg_amount)}
+    dropped = len(codes) - len(kept)
+    print(f"  [流动性] 日均成交额≥{min_avg_amount/1e4:.0f}万({lookback}日) "
+          f"过滤：保留 {len(kept)} 只 / 剔除 {dropped} 只")
+    return kept
+
+
 def select_reversal_stocks(trade_date, lookback_days=5, top_n=5, index_code=None):
     """
     短期逆转选股：按过去N日收益率从低到高排名，取跌幅最大的top_n只
@@ -1780,7 +1798,8 @@ def select_reversal_stocks(trade_date, lookback_days=5, top_n=5, index_code=None
             SELECT DISTINCT d.ts_code FROM daily d
             WHERE d.trade_date = (SELECT MAX(trade_date) FROM daily WHERE trade_date <= ?)
         """, conn, params=(trade_date,))
-        stock_set = set(rows['ts_code'].tolist())
+        # 屏蔽科创板(688)与北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
+        stock_set = {c for c in rows['ts_code'].tolist() if not c.startswith('688') and not c.endswith('.BJ')}
 
     st_codes = pd.read_sql_query(
         "SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%' OR name LIKE '%*%'", conn)
@@ -1796,6 +1815,10 @@ def select_reversal_stocks(trade_date, lookback_days=5, top_n=5, index_code=None
     cutoff = (dt - timedelta(days=60)).strftime("%Y%m%d")
     new_ipo = pd.read_sql_query("SELECT ts_code FROM stock_basic WHERE list_date > ?", conn, params=(cutoff,))
     candidates -= set(new_ipo['ts_code'].tolist()) if len(new_ipo) > 0 else set()
+
+    # 流动性过滤（保守阈值，跑大盘股时几乎不剔除成分股）
+    candidates = prefilter_by_liquidity(conn, candidates, trade_date)
+
     conn.close()
 
     print(f"  [逆转] {len(stock_set)}只 → 过滤后 {len(candidates)}只")

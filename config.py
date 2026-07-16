@@ -12,14 +12,14 @@
 
 GLOBAL = {
     # 回测时间范围
-    "backtest_start": "20220102",
-    "backtest_end": "20241231",
+    "backtest_start": "20260503",
+    "backtest_end": "20260715",
 
     # 选股日期（自动使用回测开始日前一交易日，此处仅作fallback）
     "selection_date": "20260102",
 
-    # 股票池: "hs300" | "zz500" | "zz800" | "all"
-    "stock_pool": "hs300",
+    # 股票池: "hs300" | "zz500" | "zz800" | "zz1000" | "all"
+    "stock_pool": "all",
 
     # 选股数量
     "top_n": 5,
@@ -61,7 +61,7 @@ SELECTION = {
     # 从数据库查询 BACKTEST["start_date"] 前最近交易日并覆盖此值。
     "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
 
-    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    # 股票池: "hs300" | "zz500" | "zz800" | "zz1000" | "all"
     "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 选股数量
@@ -140,6 +140,11 @@ BACKTEST = {
     # 注意：多股回测时「总投入 = per_stock_capital × 股票数」
     # 此处 20000 → 5 支股票合计 100,000（总投入 10 万、每支 2 万）
     "per_stock_capital": 20000,
+
+    # 选股族回测「总初始资金」（run_backtest.py --source 系列，由 run_backtest.bat 设置）
+    # 每支资金 = total_capital // 选股数量（向下取整到整百股）
+    # 默认 100,000 → 5 支股票每支 20,000（与上方 per_stock_capital×top_n 一致）
+    "total_capital": 200000,
 
     # 月度调仓「总资金」（独立于上面的每支资金；仅 run_monthly_rebalance 使用）
     "monthly_rebalance_capital": 100000,
@@ -322,6 +327,20 @@ STRATEGIES = {
         "trail_mult": 3.0,
         "position_mode": "half",     # "half"=半仓,"full"=全仓
     },
+    # ── 网格择时策略（固定中枢+趋势保护版）──
+    # 核心改进：固定中枢（避免下跌市中网格下移接飞刀）+ MA50趋势过滤
+    "grid_timing": {
+        "enabled": True,
+        "name": "网格择时策略（固定中枢+3%间距+MA50保护）",
+        # ── 网格参数（固定中枢，定期60天更新）──
+        "grid_pct": 0.03,              # 每档3%（个股波动大）
+        "grid_levels": 4,              # 上下各4档
+        "center_update_days": 60,      # 中枢更新周期（60天）
+        # ── 仓位管理（保留40%现金）──
+        "invest_ratio": 0.6,           # 60%资金用于网格
+        # ── 风控参数 ──
+        "total_stop_loss": 0.08,       # 总止损8%（从峰值计算回撤）
+    },
     "turtle": {
         "enabled": False,  # ← 禁用简化版，使用完整版
         "name": "海龟策略（双周期+ATR动态风控）",
@@ -493,7 +512,7 @@ VALUE_STRATEGY = {
     # 财务数据报告期（格式: "YYYYMMDD"，如 "20260331" 表示2026年一季报）
     "report_date": "20260331",  # 最新报告期（数据库已更新到2026-03-31）
 
-    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    # 股票池: "hs300" | "zz500" | "zz800" | "zz1000" | "all"
     "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 市值阈值（分位数，0.5 = 中位数）
@@ -533,7 +552,7 @@ DIVIDEND_LOW_VOL = {
     # 【自动计算】由 run_backtest.py 在执行时自动设为回测开始日前一交易日
     "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
 
-    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    # 股票池: "hs300" | "zz500" | "zz800" | "zz1000" | "all"
     "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 选股数量（0 = 按条件筛选，不限制数量）
@@ -568,7 +587,7 @@ DOGS_OF_MARKET = {
     # 【自动计算】由 run_backtest.py 在执行时自动设为回测开始日前一交易日
     "date": GLOBAL["selection_date"],  # ← 从GLOBAL读取
 
-    # 股票池: "hs300" | "zz500" | "zz800" | "all"
+    # 股票池: "hs300" | "zz500" | "zz800" | "zz1000" | "all"
     "stock_pool": GLOBAL["stock_pool"],  # ← 从GLOBAL读取
 
     # 选股数量

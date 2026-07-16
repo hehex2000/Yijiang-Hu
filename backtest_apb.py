@@ -103,6 +103,7 @@ def load_stock_universe(db_path, start_year=2017, end_year=2022):
     # 3. 剔除 ST 和 B 股（代码后缀 .SZ/.SH，名称不含 'S'）
     stocks = stocks[~stocks['name'].str.contains('S', na=False)]
     stocks = stocks[stocks['ts_code'].str[-3:] != '.BJ']
+    stocks = stocks[~stocks['ts_code'].str.startswith('688')]  # 屏蔽科创板(688)：投资门槛对散户不友好
     
     print(f"股票池：{len(stocks)} 只股票")
     return stocks

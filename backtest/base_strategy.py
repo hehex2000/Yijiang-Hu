@@ -5,8 +5,8 @@ import pandas as pd
 import sqlite3
 from pathlib import Path
 
-# 数据库路径（共享）
-DB_PATH = str(Path(__file__).parent.parent / "data" / "stock_db.db")
+# 数据库路径（共享）—— 统一指向平台唯一主库（2026-07-08 修正：原 data/stock_db.db 不存在）
+DB_PATH = r"D:\tu-shareData\astock_daily.db"
 
 
 class BaseStrategy:
@@ -140,13 +140,20 @@ class BaseStrategy:
             DataFrame with columns: trade_date, open, high, low, close, volume, adj_open, adj_close
         """
         conn = sqlite3.connect(DB_PATH)
+        # 主库 daily 表无 adj_open/adj_close 列，用 adj_factor 现场前复权补出
         df = pd.read_sql(
             """
-            SELECT trade_date, open, high, low, close, volume,
-                   adj_open, adj_close
-            FROM daily
-            WHERE ts_code = ? AND trade_date BETWEEN ? AND ?
-            ORDER BY trade_date
+            SELECT d.trade_date, d.open, d.high, d.low, d.close, d.vol,
+                   d.close * f.adj_factor / m.maxf AS adj_close,
+                   d.open  * f.adj_factor / m.maxf AS adj_open
+            FROM daily d
+            LEFT JOIN adj_factor f
+                   ON d.ts_code = f.ts_code AND d.trade_date = f.trade_date
+            LEFT JOIN (SELECT ts_code, MAX(adj_factor) AS maxf
+                       FROM adj_factor GROUP BY ts_code) m
+                   ON d.ts_code = m.ts_code
+            WHERE d.ts_code = ? AND d.trade_date BETWEEN ? AND ?
+            ORDER BY d.trade_date
             """,
             conn,
             params=(ts_code, start_date, end_date),

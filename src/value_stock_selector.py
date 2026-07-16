@@ -11,6 +11,197 @@ from typing import Optional, Dict, List
 from loguru import logger
 
 
+# ════════════════════════════════════════════════════════════════
+#  统一价值选股逻辑（破净价值）
+#  供 [1] 选股+回测（ValueStockSelector）与 [6] 月度调仓（run_monthly_rebalance）
+#  共用同一份实现，消除重复逻辑与口径分歧。
+# ════════════════════════════════════════════════════════════════
+_VSEL_POOL_INDEX = {
+    "hs300": "000300.SH",
+    "zz500": "000905.SH",
+    "zz800": "000906.SH",
+    "zz1000": "000852.SH",
+}
+_VSEL_DB_PATH = None
+
+
+def _vsel_db_path():
+    global _VSEL_DB_PATH
+    if _VSEL_DB_PATH is None:
+        try:
+            from config import DATA
+            p = DATA.get("local_db_path")
+        except Exception:
+            p = None
+        if not p:
+            p = "D:/tu-shareData/astock_daily.db"
+        _VSEL_DB_PATH = p
+    return _VSEL_DB_PATH
+
+
+def _vsel_conn():
+    return sqlite3.connect(_vsel_db_path())
+
+
+def _vsel_pool_ts_set(pool, conn, trade_date):
+    """返回股票池 ts_code 集合（时点快照）；None 表示全A股不过滤。"""
+    if pool in ("all", None):
+        return None
+    idx = _VSEL_POOL_INDEX.get(pool)
+    if not idx:
+        return None
+    # 时点快照：取 <= trade_date 最近一期，避免前视/生存偏差
+    snap = pd.read_sql_query(
+        "SELECT MAX(CAST(trade_date AS INTEGER)) AS d FROM index_constituent "
+        "WHERE index_code=? AND CAST(trade_date AS INTEGER)<=CAST(? AS INTEGER)",
+        conn, params=(idx, trade_date),
+    )
+    sd = snap.iloc[0, 0]
+    if sd is not None:
+        df = pd.read_sql_query(
+            "SELECT ts_code FROM index_constituent "
+            "WHERE index_code=? AND ts_code NOT LIKE '688%' AND CAST(trade_date AS INTEGER)=CAST(? AS INTEGER)",
+            conn, params=(idx, int(sd)),   # int() 避免 numpy 类型绑定失败
+        )
+        return set(df["ts_code"].tolist())
+    # 退化：无快照则取全部历史成分股
+    df = pd.read_sql_query(
+        "SELECT ts_code FROM index_constituent WHERE index_code=? AND ts_code NOT LIKE '688%'", conn, params=(idx,)
+    )
+    return set(df["ts_code"].tolist())
+
+
+def select_value_stocks(trade_date, top_n=5, stock_pool="zz800"):
+    """
+    统一价值选股（破净价值）逻辑，[1] 选股+回测 与 [6] 月度调仓 共用：
+
+        1. 0 < PE_TTM < 30
+        2. 0 < PB < 1.0（破净）
+        3. ROE > 8%（fina_indicator 最新可得财报，ann_date<=trade_date 防前视）
+        4. 流动比率 >= 1.2（同上）
+        5. 股票池成分股（时点快照过滤）
+        6. 按 PB 升序取前 top_n 只
+
+    返回 DataFrame：ts_code, code(6位), name, pb, pe_ttm, roe, current_ratio, selection_date
+    """
+    conn = _vsel_conn()
+
+    # daily_basic 可用性回退：若当日无数据，向前取最近交易日
+    actual_date = trade_date
+    while True:
+        cnt = pd.read_sql_query(
+            "SELECT COUNT(*) AS n FROM daily_basic WHERE trade_date = ?",
+            conn, params=(actual_date,),
+        ).iloc[0, 0]
+        if cnt > 0:
+            break
+        prev = pd.read_sql_query(
+            "SELECT MAX(trade_date) AS d FROM daily_basic WHERE trade_date < ?",
+            conn, params=(actual_date,),
+        )
+        if prev.iloc[0, 0] is None:
+            conn.close()
+            return pd.DataFrame(columns=["ts_code", "code", "name", "pb", "pe_ttm",
+                                         "roe", "current_ratio", "selection_date"])
+        actual_date = str(prev.iloc[0, 0])
+
+    # ---- 估值初筛 ----
+    df = pd.read_sql_query(
+        """
+        SELECT ts_code, pe_ttm, pb, total_mv
+        FROM daily_basic
+        WHERE trade_date = ?
+          AND pe_ttm > 0 AND pe_ttm < 30
+          AND pb > 0 AND pb < 1.0
+          AND total_mv > 0
+        """,
+        conn, params=(actual_date,),
+    )
+    if df.empty:
+        conn.close()
+        return pd.DataFrame(columns=["ts_code", "code", "name", "pb", "pe_ttm",
+                                     "roe", "current_ratio", "selection_date"])
+
+    # ---- 股票池过滤（时点快照）----
+    pool_set = _vsel_pool_ts_set(stock_pool, conn, actual_date)
+    if pool_set is not None:
+        df = df[df["ts_code"].isin(pool_set)]
+    # 全局剔除科创板(688)与北交所(.BJ后缀)，对散户更友好
+    df = df[~df["ts_code"].str.startswith("688") & ~df["ts_code"].str.endswith(".BJ")]
+    if df.empty:
+        conn.close()
+        return pd.DataFrame(columns=["ts_code", "code", "name", "pb", "pe_ttm",
+                                     "roe", "current_ratio", "selection_date"])
+
+    # ---- ROE>8% 且 流动比率>=1.2（fina_indicator 最新可得财报）----
+    cand = df["ts_code"].tolist()
+    placeholders = ",".join("?" * len(cand))
+    fin = pd.read_sql_query(
+        f"""
+        SELECT f.ts_code, f.roe, f.current_ratio
+        FROM fina_indicator f
+        INNER JOIN (
+            SELECT ts_code, MAX(end_date) AS mx
+            FROM fina_indicator
+            WHERE ts_code IN ({placeholders})
+              AND end_date <= ?
+              AND (ann_date IS NULL OR ann_date <= ?)
+            GROUP BY ts_code
+        ) m ON f.ts_code = m.ts_code AND f.end_date = m.mx
+        """,
+        conn, params=cand + [actual_date, actual_date],
+    )
+    conn.close()
+
+    # ---- 质量门槛（fina_indicator 最新可得财报，防前视）----
+    # 分级回退：避免某些时段（如 2018 初）无股票同时满足
+    # ROE>8% 与 流动比率>=1.2 时整个选股落空、回测无法运行。
+    #   Tier1: ROE>8% 且 流动比率>=1.2   （用户首选口径，质量最高）
+    #   Tier2: ROE>8% 或  流动比率>=1.2 （至少满足一项质量门槛）
+    #   Tier3: 仅 破净+低PE               （价值兜底，保证有标的可选）
+    # 注：fina_indicator 部分历史期次 roe/current_ratio 为 NULL，
+    #     视为“未通过该门槛”，自然落入更低 Tier。
+    if fin.empty:
+        df["roe"] = float("nan")
+        df["current_ratio"] = float("nan")
+    else:
+        df = df.merge(fin[["ts_code", "roe", "current_ratio"]], on="ts_code", how="left")
+
+    t1 = df[(df["roe"] > 8) & (df["current_ratio"] >= 1.2)]
+    t2 = df[(df["roe"] > 8) | (df["current_ratio"] >= 1.2)]
+    if not t1.empty:
+        chosen, tier = t1, 1
+    elif not t2.empty:
+        chosen, tier = t2, 2
+    else:
+        chosen, tier = df, 3
+    logger.info(f"[价值选股] 质量门槛分级 Tier{tier} "
+                f"(双条件 {len(t1)} / 单条件 {len(t2)} / 兜底 {len(df)}) @ {actual_date}")
+
+    # ---- 按 PB 升序取 top_n ----
+    if top_n and top_n > 0:
+        chosen = chosen.sort_values("pb", ascending=True).head(top_n)
+    else:
+        chosen = chosen.sort_values("pb", ascending=True)
+    df = chosen
+
+    # ---- 补全名称与 6 位代码 ----
+    conn = _vsel_conn()
+    names = {}
+    for tc in df["ts_code"].tolist():
+        r = pd.read_sql_query(
+            "SELECT name FROM stock_basic WHERE ts_code = ? LIMIT 1",
+            conn, params=(tc,),
+        )
+        names[tc] = r.iloc[0, 0] if len(r) > 0 else tc
+    conn.close()
+    df["name"] = df["ts_code"].map(names)
+    df["code"] = df["ts_code"].str.extract(r"(\d{6})", expand=False)
+    df.insert(0, "selection_date", trade_date)
+    return df[["ts_code", "code", "name", "pb", "pe_ttm", "roe",
+               "current_ratio", "selection_date"]]
+
+
 class ValueStockSelector:
     """价值投资选股器"""
     
@@ -117,6 +308,8 @@ class ValueStockSelector:
         self._zz1000_cache = set(df["ts_code"].str[:6].tolist()) if len(df) > 0 else set()
         logger.info(f"  [中证1000] 获取到 {len(self._zz1000_cache)} 只成分股")
         return self._zz1000_cache
+
+    # [已移除] _get_kcb_cyb_constituents：科创板+创业板(高风险) 股票池已按需求删除
 
     def get_market_benchmarks(self, date: str) -> Dict[str, float]:
         """
@@ -562,118 +755,17 @@ class ValueStockSelector:
 
         return result
     
-    def select_stocks(self, date: str = None, 
+    def select_stocks(self, date: str = None,
                      top_n: int = None) -> pd.DataFrame:
         """
-        执行选股（主流程）
-        
-        Args:
-            date: 选股日期（默认使用配置值）
-            top_n: 选股数量（默认使用配置值）
-            
-        Returns:
-            筛选后的股票DataFrame
+        执行选股（主流程）。
+
+        现统一委托给模块级 select_value_stocks（破净价值逻辑），
+        使 [1] 选股+回测 与 [6] 月度调仓 共用同一份价值选股逻辑。
         """
-        # 使用参数或配置值
         date = date or self.date
-        top_n = top_n or self.top_n
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("价值投资策略 - 选股系统")
-        logger.info("=" * 60)
-        logger.info(f"选股日期: {date}")
-        logger.info(f"股票池: {self.stock_pool}")
-        logger.info(f"选股数量: {top_n if top_n > 0 else '不限制 (按条件筛选)'}")
-        logger.info("=" * 60 + "\n")
-        
-        # ===== Step 1: 获取股票池 =====
-        logger.info("[Step 1] 获取股票池...")
-        # ===== Step 1: 获取股票池（直接从本地数据库，不依赖 data_fetcher）=====
-        logger.info("[Step 1] 获取股票池...")
-        if self.stock_pool == "hs300":
-            constituents = self._get_hs300_constituents()
-            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
-            logger.info(f"  [沪深300] 获取到 {len(stock_pool_df)} 只成分股")
-        elif self.stock_pool == "zz500":
-            constituents = self._get_zz500_constituents()
-            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
-            logger.info(f"  [中证500] 获取到 {len(stock_pool_df)} 只成分股")
-        elif self.stock_pool == "zz800":
-            constituents = self._get_zz800_constituents()
-            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
-            logger.info(f"  [中证800] 获取到 {len(stock_pool_df)} 只成分股")
-        elif self.stock_pool == "zz1000":
-            constituents = self._get_zz1000_constituents()
-            stock_pool_df = pd.DataFrame({"code": [c[:6] for c in constituents]})
-            logger.info(f"  [中证1000] 获取到 {len(stock_pool_df)} 只成分股")
-        elif self.stock_pool == "all":
-            # 全A股模式：从数据库 stock_basic 表获取所有A股
-            import sqlite3
-            conn = sqlite3.connect(self.data_fetcher.local_db_path)
-            stock_pool_df = pd.read_sql_query(
-                "SELECT ts_code, name FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' ORDER BY ts_code",
-                conn,
-            )
-            conn.close()
-            # 提取6位代码（去掉交易所后缀 .SZ/.SH/.BJ）
-            stock_pool_df['code'] = stock_pool_df['ts_code'].str.extract(r'(\d{6})', expand=False)
-            stock_pool_df = stock_pool_df[['code', 'name']].dropna(subset=['code'])
-            logger.info(f"  [全A股] 获取到 {len(stock_pool_df)} 只股票")
-        else:
-            logger.error(f"未知的股票池: {self.stock_pool}")
-            return pd.DataFrame()
-        
-        if stock_pool_df is None or len(stock_pool_df) == 0:
-            logger.error(f"无法获取 {self.stock_pool} 成分股！")
-            return pd.DataFrame()
-        
-        stock_codes = stock_pool_df['code'].tolist()
-        logger.info(f"✓ 获取到 {len(stock_codes)} 只 {self.stock_pool.upper()} 成分股\n")
-        
-        # ===== Step 2: 获取市场基准值（全A股）=====
-        benchmarks = self.get_market_benchmarks(date)
-        
-        # ===== Step 3: 获取股票财务数据 =====
-        financial_df = self.fetch_stock_data(stock_codes, date)
-        
-        if financial_df is None or len(financial_df) == 0:
-            logger.error("无法获取股票财务数据，选股失败！")
-            return pd.DataFrame()
-        
-        # ===== Step 4: 应用选股条件 =====
-        selected_df = self.apply_selection_criteria(financial_df, benchmarks, date)
-        
-        # ===== Step 5: 限制选股数量（如果需要）=====
-        if top_n > 0 and len(selected_df) > top_n:
-            logger.info(f"\n限制选股数量: {len(selected_df)} -> {top_n}")
-            selected_df = selected_df.head(top_n)
-        
-        # ===== Step 6: 添加选股日期列 =====
-        if len(selected_df) > 0:
-            selected_df.insert(0, 'selection_date', date)
-        
-        logger.info("\n" + "=" * 60)
-        logger.info(f"[选股完成] 共找到 {len(selected_df)} 只符合条件的股票")
-        logger.info("=" * 60 + "\n")
-
-        # 统一列名：确保 code 列为6位数字格式（与 dividend_low_vol_selector.py 一致）
-        if "ts_code" in selected_df.columns and "code" not in selected_df.columns:
-            selected_df["code"] = selected_df["ts_code"].str.extract(r"(\d{6})", expand=False)
-
-        # 补全 name 列（与 dividend_low_vol_selector 行为一致）
-        if "name" not in selected_df.columns and "ts_code" in selected_df.columns:
-            import sqlite3
-            name_map = {}
-            with sqlite3.connect(self.data_fetcher.local_db_path) as conn:
-                for ts_code in selected_df["ts_code"].unique():
-                    r = pd.read_sql_query(
-                        "SELECT name FROM stock_basic WHERE ts_code = ? LIMIT 1",
-                        conn, params=(ts_code,),
-                    )
-                    name_map[ts_code] = r.iloc[0, 0] if len(r) > 0 else ts_code
-            selected_df["name"] = selected_df["ts_code"].map(name_map)
-
-        return selected_df
+        top_n = top_n if top_n is not None else self.top_n
+        return select_value_stocks(date, top_n, self.stock_pool)
     
     def export_to_csv(self, df: pd.DataFrame, 
                       filename: Optional[str] = None,

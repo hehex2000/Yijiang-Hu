@@ -78,36 +78,112 @@ def calc_win_rate_from_trades(trade_records):
     return wr, win, total
 
 
+# ============================================================
+#  统一交易成本模型（佣金 + 印花税 + 滑点）
+#  口径与 run_monthly_rebalance.calc_fee 对齐，供所有回测函数复用
+# ============================================================
+COMMISSION_RATE_RB = 0.00025   # 佣金率
+COMMISSION_MIN_RB  = 5.0        # 最低佣金（元）
+STAMP_DUTY_RATE_RB = 0.001      # 印花税率（仅卖出收取）
+SLIPPAGE_RATE_RB   = 0.001      # 滑点率（买卖均含，模拟冲击成本）
+
+# ── 流动性过滤（保守阈值，主要跑大盘股时几乎不剔除成分股）────
+# daily.amount 单位为"千元"，故阈值以元传入时需 ×1000 换算
+LIQUIDITY_MIN_AVG_AMOUNT = 50_000_000   # 选股日往前 LOOKBACK 日，日均成交额下限（元）：5000万
+LIQUIDITY_LOOKBACK       = 20           # 滚动窗口（交易日）
+
+def calc_fee_rb(buy_or_sell, price, shares, stamp_duty=STAMP_DUTY_RATE_RB):
+    """计算单笔交易的总成本（元）。ETF/配对等免印花税可传 stamp_duty=0。"""
+    amount = price * shares
+    commission = max(amount * COMMISSION_RATE_RB, COMMISSION_MIN_RB)
+    slippage = amount * SLIPPAGE_RATE_RB
+    if buy_or_sell == "buy":
+        return commission + slippage
+    return commission + stamp_duty * amount + slippage
+
+
+def prefilter_by_liquidity(conn, pool_df, as_of_date_fmt,
+                           min_avg_amount=LIQUIDITY_MIN_AVG_AMOUNT,
+                           lookback=LIQUIDITY_LOOKBACK):
+    """
+    流动性预过滤：剔除选股日往前 lookback 个交易日，日均成交额低于阈值的股票。
+    阈值默认 5000万（保守）。沪深300/中证500 成分股几乎不会被剔除，
+    仅挡掉真正的小盘/僵尸股，避免回测里"想买买不进、想卖卖不出"的流动性幻觉。
+    daily.amount 单位为千元 → avg_amt * 1000 = 元。
+
+    Args:
+        conn: sqlite3 连接（指向唯一数据库 astock_daily.db）
+        pool_df: 含 'code' 列（6位）的 DataFrame
+        as_of_date_fmt: 选股日 YYYYMMDD
+    Returns:
+        过滤后的 DataFrame（保留达标股票）
+    """
+    if pool_df is None or len(pool_df) == 0:
+        return pool_df
+    try:
+        win = pd.read_sql_query(
+            "SELECT trade_date FROM daily WHERE trade_date <= ? "
+            "ORDER BY trade_date DESC LIMIT ?",
+            conn, params=(as_of_date_fmt, lookback))
+        if len(win) == 0:
+            return pool_df
+        win_start = win['trade_date'].min()
+        codes = [ts_code(c) for c in pool_df['code']]
+        ph = ",".join("?" * len(codes))
+        amt = pd.read_sql_query(
+            f"SELECT ts_code, AVG(amount) AS avg_amt FROM daily "
+            f"WHERE ts_code IN ({ph}) AND trade_date >= ? AND trade_date <= ? "
+            f"GROUP BY ts_code",
+            conn, params=codes + [win_start, as_of_date_fmt])
+        avg_map = dict(zip(amt['ts_code'], amt['avg_amt']))
+    except Exception as e:
+        print(f"  [WARN] 流动性查询失败，跳过过滤: {e}")
+        return pool_df
+
+    keep, dropped = [], 0
+    for _, row in pool_df.iterrows():
+        t = ts_code(row['code'])
+        avg_yuan = avg_map.get(t)
+        if avg_yuan is None or avg_yuan * 1000 < min_avg_amount:
+            dropped += 1
+            continue
+        keep.append(row)
+    out = pd.DataFrame(keep).reset_index(drop=True) if keep else pool_df.iloc[0:0]
+    print(f"  [流动性] 日均成交额≥{min_avg_amount/1e4:.0f}万({lookback}日) "
+          f"过滤：保留 {len(out)} 只 / 剔除 {dropped} 只")
+    return out
+
+
 def load_strategy_plugins():
     """
     自动扫描 backtest/*.py，发现所有 BaseStrategy 子类
-    
+
     使用方法：
     1. 在 backtest/ 创建新文件（如 my_strategy.py）
     2. 定义 class MyStrategy(BaseStrategy):
     3. 实现 run(self, df, start_idx=0) 方法
     4. 在 config.py 添加 STRATEGIES["my_strategy"] = {...}
     5. 运行 run_backtest.py（自动发现，无需修改此文件！）
-    
+
     Returns:
         dict: {config_key: strategy_class}
     """
     import importlib.util
     from pathlib import Path
-    
+
     plugins = {}
     backtest_dir = Path(__file__).parent / "backtest"
-    
+
     if not backtest_dir.exists():
         print("  [WARN] backtest/ 目录不存在")
         return plugins
-    
+
     for py_file in backtest_dir.glob("*.py"):
         if py_file.name.startswith("_") or py_file.name == "base_strategy.py":
             continue  # 跳过私有文件和基类
-            
+
         module_name = py_file.stem  # e.g., "rsi_trend_plugin"
-        
+
         try:
             # 动态导入模块
             spec = importlib.util.spec_from_file_location(module_name, py_file)
@@ -115,23 +191,23 @@ def load_strategy_plugins():
                 continue
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            
+
             # 找到所有 BaseStrategy 子类
             from backtest.base_strategy import BaseStrategy
-            
+
             for attr_name in dir(module):
                 attr = getattr(module, attr_name)
-                if (isinstance(attr, type) and 
-                    issubclass(attr, BaseStrategy) and 
-                    attr != BaseStrategy):
+                if (isinstance(attr, type) and
+                        issubclass(attr, BaseStrategy) and
+                        attr != BaseStrategy):
                     # 配置键名 = 文件名（去掉 _plugin 后缀）
                     config_key = module_name.replace("_plugin", "")
                     plugins[config_key] = attr
                     break  # 每个文件一个策略类
-                    
+
         except Exception as e:
             print(f"  [WARN] 无法加载策略插件 {py_file.name}: {e}")
-    
+
     return plugins
 
 
@@ -239,6 +315,78 @@ def calculate_max_drawdown(portfolio_values):
     return max_dd
 
 
+def _norm_date(d):
+    """把各种日期格式（int 20220104 / str '2022-01-04' / Timestamp）归一化为 YYYY-MM-DD"""
+    if d is None:
+        return None
+    s = str(d).strip().split(" ")[0]  # 去掉可能的时分秒
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return s
+
+
+def max_drawdown_with_dates(values, dates=None, start_idx=0):
+    """
+    计算最大回撤，并返回其发生的时间区间（峰值日 → 谷值日）。
+    values : 权益曲线（按时间顺序）
+    dates  : 与 values 对齐的日期列表（可选；缺省则无法定位时间点）
+    start_idx : 实际回测起点在 values 中的下标。权益曲线常包含回测开始前
+               的「回溯期」平曲线（value=初始资金），其起点会被误当成峰值日，
+               导致回撤区间早于回测开始日。传入 start_idx 后，峰值/谷值只在
+               回测窗口内求解，回撤区间必然落在 [start_idx, 末尾] 之内。
+    返回 (max_dd%, peak_date, trough_date)
+    注意：峰值日必须早于谷值日。若全局最高点出现在谷值之后，
+    记录的是「谷值时刻对应的运行峰值」而非更晚的全局最高点。
+    """
+    if not values or len(values) < 2:
+        return 0.0, None, None
+    # 回测窗口起点（防御越界）
+    if start_idx < 0 or start_idx >= len(values) - 1:
+        start_idx = 0
+    peak = values[start_idx]
+    peak_idx = start_idx
+    max_dd = 0.0
+    trough_idx = start_idx
+    peak_idx_at_trough = start_idx
+    for i in range(start_idx, len(values)):
+        val = values[i]
+        if val > peak:
+            peak = val
+            peak_idx = i
+        dd = (peak - val) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+            trough_idx = i
+            peak_idx_at_trough = peak_idx  # 记录谷值时刻对应的峰值位置（必 ≤ trough_idx）
+    pk = dates[peak_idx_at_trough] if (dates and peak_idx_at_trough < len(dates)) else None
+    tr = dates[trough_idx] if (dates and trough_idx < len(dates)) else None
+    return max_dd, pk, tr
+
+
+def _dd_period_str(dd_period):
+    """把 (peak_date, trough_date) 格式化为 'YYYY-MM~YYYY-MM'，无数据返回 '--'"""
+    pk, tr = (dd_period or (None, None))
+    pk = _norm_date(pk)
+    tr = _norm_date(tr)
+    if pk and tr:
+        return f"{pk}~{tr}"
+    return pk or tr or "--"
+
+
+def _aggregate_dd_years(results):
+    """统计各股票最大回撤峰值所在年份分布，返回 {年份: 数量}（按年份升序）"""
+    counts = {}
+    for r in results:
+        period = r.get("dd_period")
+        if not period or period[0] is None:
+            continue
+        y = str(period[0])[:4]
+        if y.isdigit():
+            counts[y] = counts.get(y, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def backtest_buy_hold(df, capital, cfg, start_idx=0):
     """
     买入持有（模拟普通股民操作：买入后一直持有，可启用ATR动态止损）
@@ -265,7 +413,7 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
     if shares == 0:
         return 0.0, 0, 0.0
     
-    cash = capital - shares * p0 * 1.0002  # 买入成本（含手续费）
+    cash = capital - shares * p0 - calc_fee_rb("buy", p0, shares)  # 买入成本（佣金+滑点）
     
     # 检查是否启用ATR止损
     use_atr_stop = cfg.get("use_atr_stop", False)
@@ -292,11 +440,13 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
         
         # 追踪止损
         portfolio_values = []
+        dates = []
         exit_idx = n - 1  # 默认持有到最后
         
         for i in range(n):
             if i < start_idx:
                 portfolio_values.append(capital)  # 未买入前，保持现金
+                dates.append(df.iloc[i]["trade_date"])
             else:
                 # 检查是否触发止损（从 start_idx+1 开始）
                 if i > start_idx and entry_atr > 0:
@@ -309,35 +459,40 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
                         break
                 
                 portfolio_values.append(cash + shares * close[i])
+                dates.append(df.iloc[i]["trade_date"])
         
         # 如果止损触发，后续日期保持现金（卖出后）
         if exit_idx < n - 1:
             sell_price = close[exit_idx]
-            cash_after_sell = cash + shares * sell_price * 0.99955  # 扣除手续费
+            cash_after_sell = cash + shares * sell_price - calc_fee_rb("sell", sell_price, shares)  # 卖出成本（佣金+印花税+滑点）
             for i in range(exit_idx + 1, n):
                 portfolio_values.append(cash_after_sell)
+                dates.append(df.iloc[i]["trade_date"])
         
         # 计算最终收益
         final_value = portfolio_values[-1]
         ret = (final_value / capital - 1) * 100
-        max_dd = calculate_max_drawdown(portfolio_values)
-        
-        return ret, 1, max_dd
+        max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+
+        return ret, 1, max_dd, (pk, tr)
     
     else:
         # 原始逻辑：一直持有
         portfolio_values = []
+        dates = []
         for i in range(n):
             if i < start_idx:
                 portfolio_values.append(capital)  # 未买入前，保持现金
+                dates.append(df.iloc[i]["trade_date"])
             else:
                 portfolio_values.append(cash + shares * close[i])
+                dates.append(df.iloc[i]["trade_date"])
         
-        final = portfolio_values[-1]
+        final = portfolio_values[-1] - calc_fee_rb("sell", close[n - 1], shares)  # 期末按收盘价卖出，扣除卖出成本
         ret = (final / capital - 1) * 100
-        max_dd = calculate_max_drawdown(portfolio_values)
-        
-        return ret, 0, max_dd
+        max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+
+        return ret, 0, max_dd, (pk, tr)
 
 
 def backtest_rsi(df, capital, cfg, start_idx=0):
@@ -359,12 +514,14 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
     rsi = rsi.values
 
     cash, pos, cost = capital, 0, 0.0
-    trades = 0
+    trade_records = []
     portfolio_values = []
+    dates = []
     
     for i in range(n):
         if i < start_idx:
             portfolio_values.append(capital)
+            dates.append(df.iloc[i]["trade_date"])
             continue
         p = close[i]
         prev_rsi = rsi[i-1] if i > 0 else 50
@@ -374,21 +531,23 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
             pos = int(amt / p / 100) * 100
             if pos > 0:
                 cash -= pos * p * 1.0002
-                cost, trades = p, trades + 1
+                cost = p
+                trade_records.append({"action": "BUY", "price": p, "shares": pos})
         elif pos > 0:
             if prev_rsi > ovb or (p > cost * (1+tp)) or (p < cost * (1-sl)):
                 cash += pos * p * 0.9988
+                trade_records.append({"action": "SELL", "price": p, "shares": pos})
                 pos, cost = 0, 0.0
-                trades += 1
         
         portfolio_values.append(cash + pos * p)
+        dates.append(df.iloc[i]["trade_date"])
     
     # 循环结束后计算最终收益率和最大回撤
     final = portfolio_values[-1] if portfolio_values else capital
     ret = (final / capital - 1) * 100
-    max_dd = calculate_max_drawdown(portfolio_values)
-    
-    return ret, trades, max_dd
+    max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+
+    return ret, trade_records, max_dd, (pk, tr)
 
 
 def backtest_macd_kdj(df, capital, cfg, start_idx=0):
@@ -414,12 +573,14 @@ def backtest_macd_kdj(df, capital, cfg, start_idx=0):
     k_vals, d_vals = k.values, d.values
 
     cash, pos, cost = capital, 0, 0.0
-    trades = 0
+    trade_records = []
     portfolio_values = []
+    dates = []
     
     for i in range(n):
         if i < start_idx:
             portfolio_values.append(capital)
+            dates.append(df.iloc[i]["trade_date"])
             continue
         p = close[i]
         if pos == 0 and i >= 34:
@@ -430,22 +591,24 @@ def backtest_macd_kdj(df, capital, cfg, start_idx=0):
                 pos = int(amt / p / 100) * 100
                 if pos > 0:
                     cash -= pos * p * 1.0002
-                    cost, trades = p, trades + 1
+                    cost = p
+                    trade_records.append({"action": "BUY", "price": p, "shares": pos})
         elif pos > 0 and i >= 34:
             macd_dead = (hist[i-1] >= 0 > hist[i]) or (dif.iloc[i] < dea.iloc[i] and dif.iloc[i-1] >= dea.iloc[i-1])
             kdj_high = j_vals[i] > 80
             if macd_dead or kdj_high or p > cost * (1+tp) or p < cost * (1-sl):
                 cash += pos * p * 0.9988
+                trade_records.append({"action": "SELL", "price": p, "shares": pos})
                 pos, cost = 0, 0.0
-                trades += 1
         
         portfolio_values.append(cash + pos * p)
+        dates.append(df.iloc[i]["trade_date"])
     
     final = portfolio_values[-1] if portfolio_values else capital
     ret = (final / capital - 1) * 100
-    max_dd = calculate_max_drawdown(portfolio_values)
-    
-    return ret, trades, max_dd
+    max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+
+    return ret, trade_records, max_dd, (pk, tr)
 
 
 def backtest_bollinger(df, capital, cfg, start_idx=0):
@@ -463,12 +626,14 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
     lower = (mid - std_n * std).values
 
     cash, pos, cost = capital, 0, 0.0
-    trades = 0
+    trade_records = []
     portfolio_values = []
+    dates = []
     
     for i in range(n):
         if i < start_idx:
             portfolio_values.append(capital)
+            dates.append(df.iloc[i]["trade_date"])
             continue
         p = close[i]
         if i >= period and pos == 0 and p <= lower[i] > 0:
@@ -476,19 +641,21 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
             pos = int(amt / p / 100) * 100
             if pos > 0:
                 cash -= pos * p * 1.0002
-                cost, trades = p, trades + 1
+                cost = p
+                trade_records.append({"action": "BUY", "price": p, "shares": pos})
         elif pos > 0 and i >= period:
             if p >= upper[i] or p > cost * (1+tp) or p < cost * (1-sl):
                 cash += pos * p * 0.9988
+                trade_records.append({"action": "SELL", "price": p, "shares": pos})
                 pos, cost = 0, 0.0
-                trades += 1
         portfolio_values.append(cash + pos * p)
+        dates.append(df.iloc[i]["trade_date"])
     
     final = portfolio_values[-1] if portfolio_values else capital
     ret = (final / capital - 1) * 100
-    max_dd = calculate_max_drawdown(portfolio_values)
-    
-    return ret, trades, max_dd
+    max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+
+    return ret, trade_records, max_dd, (pk, tr)
 
 
 def backtest_turtle(df, capital, cfg, start_idx=0):
@@ -539,14 +706,14 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
     req_cols = ["open", "high", "low", "close"]
     for c in req_cols:
         if c not in df.columns:
-            return None, 0
+            return None, [], 0.0
     close = df["close"].values
     high = df["high"].values
     low = df["low"].values
     n = len(close)
     min_n = max(long_period, atr_period, short_exit, long_exit) + 1
     if n < min_n:
-        return None, 0
+        return None, [], 0.0
 
     # ── 成交量过滤（A股本土化）──────────────────────────
     volume_ok = np.ones(n, dtype=bool)
@@ -620,28 +787,32 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
     s2_highest = 0.0
     s2_stop_price = 0.0
 
-    trades = 0
+    trade_records = []
     portfolio_values = []  # 记录每日总资产（用于计算收益）
+    dates = []  # 与 portfolio_values 对齐的交易日（用于定位回撤区间）
 
     # 计算策略实际起始位置（跳过回溯期）
     loop_start = max(start_idx, long_period, atr_period, long_exit)
     if loop_start >= n:
-        return 0.0, 0
+        return 0.0, [], 0.0
 
     for i in range(n):
         # 跳过回溯期（只记录资产，不执行交易逻辑）
         if i < loop_start:
             portfolio_values.append(cash + s1_pos * close[i] + s2_pos * close[i])
+            dates.append(df.iloc[i]["trade_date"])
             continue
 
         p = close[i]
         if p <= 0:
             portfolio_values.append(cash + s1_pos * p + s2_pos * p)
+            dates.append(df.iloc[i]["trade_date"])
             continue
 
         atr_i = atr[i] if i >= atr_period else atr[atr_period] if atr_period < n else 0
         if atr_i <= 0:
             portfolio_values.append(cash + s1_pos * p + s2_pos * p)
+            dates.append(df.iloc[i]["trade_date"])
             continue
 
         # ── 风控：单日亏损上限检查 ──────────────────────
@@ -654,12 +825,12 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                 # 触发单日亏损上限，强制平仓
                 if s1_pos > 0:
                     cash += s1_pos * p * sell_cost
+                    trade_records.append({"action": "SELL", "price": p, "shares": s1_pos})
                     s1_pos = 0; s1_adds = 0
-                    trades += 1
                 if s2_pos > 0:
                     cash += s2_pos * p * sell_cost
+                    trade_records.append({"action": "SELL", "price": p, "shares": s2_pos})
                     s2_pos = 0; s2_adds = 0
-                    trades += 1
 
         # ── 系统1（短期）────────────────────────────────
         if use_short:
@@ -682,7 +853,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                             s1_adds = 1
                             s1_highest = p
                             s1_stop_price = p - stop_atr_mult * atr_i
-                            trades += 1
+                            trade_records.append({"action": "BUY", "price": p, "shares": unit_shares})
 
             # 加仓：价格向有利方向变动 0.5×ATR
             elif s1_pos > 0 and s1_adds < max_adds:
@@ -704,7 +875,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                         s1_last_add_price = p
                         s1_adds += 1
                         s1_highest = max(s1_highest, p)
-                        trades += 1
+                        trade_records.append({"action": "BUY", "price": p, "shares": add_shares})
 
             # 止损：跌破止损价 或 跌破10日低点
             if s1_pos > 0:
@@ -714,8 +885,8 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                 s1_stop_price = max(s1_stop_price, trail_stop)
                 if p <= s1_stop_price or (i >= short_exit and p < s1_exit[i]):
                     cash += s1_pos * p * sell_cost
+                    trade_records.append({"action": "SELL", "price": p, "shares": s1_pos})
                     s1_pos = 0; s1_adds = 0; s1_stop_price = 0
-                    trades += 1
 
         # ── 系统2（长期）────────────────────────────────
         if use_long:
@@ -736,7 +907,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                             s2_adds = 1
                             s2_highest = p
                             s2_stop_price = p - stop_atr_mult * atr_i
-                            trades += 1
+                            trade_records.append({"action": "BUY", "price": p, "shares": unit_shares})
 
             elif s2_pos > 0 and s2_adds < max_adds:
                 add_threshold = s2_last_add_price + add_step_atr * atr_i
@@ -756,7 +927,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                         s2_last_add_price = p
                         s2_adds += 1
                         s2_highest = max(s2_highest, p)
-                        trades += 1
+                        trade_records.append({"action": "BUY", "price": p, "shares": add_shares})
 
             if s2_pos > 0:
                 s2_highest = max(s2_highest, p)
@@ -764,12 +935,13 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                 s2_stop_price = max(s2_stop_price, trail_stop)
                 if p <= s2_stop_price or (i >= long_exit and p < s2_exit[i]):
                     cash += s2_pos * p * sell_cost
+                    trade_records.append({"action": "SELL", "price": p, "shares": s2_pos})
                     s2_pos = 0; s2_adds = 0; s2_stop_price = 0
-                    trades += 1
 
         # 记录当日总资产
         total_val = cash + s1_pos * p + s2_pos * p
         portfolio_values.append(total_val)
+        dates.append(df.iloc[i]["trade_date"])
         if total_val > max_capital:
             max_capital = total_val
 
@@ -782,8 +954,8 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
 
     final = cash
     ret = (final / capital - 1) * 100
-    max_dd = calculate_max_drawdown(portfolio_values)
-    return ret, trades, max_dd
+    max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
+    return ret, trade_records, max_dd, (pk, tr)
 
 
 # ════════════════════════════════════════════════════════
@@ -830,7 +1002,7 @@ def backtest_rsi_trend(df, capital, cfg, start_idx=0):
     daily_values = result.get("daily_values", [])
 
     if not daily_values:
-        return 0.0, len(trades), 0.0
+        return 0.0, trades, 0.0
 
     # 计算最终资产
     final_value = daily_values[-1]["portfolio_value"] if daily_values else capital
@@ -840,7 +1012,7 @@ def backtest_rsi_trend(df, capital, cfg, start_idx=0):
     portfolio_values = [v["portfolio_value"] for v in daily_values]
     max_dd = calculate_max_drawdown(portfolio_values)
 
-    return ret, len(trades), max_dd
+    return ret, trades, max_dd
 
 
 def _get_all_stocks_from_db():
@@ -853,21 +1025,31 @@ def _get_all_stocks_from_db():
     import sqlite3
     conn = sqlite3.connect(DATA["local_db_path"])
     try:
-        df = pd.read_sql_query(
+        # 存活股（当前上市）
+        alive = pd.read_sql_query(
             "SELECT ts_code, name, COALESCE(industry, '未知') AS industry "
-            "FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' ORDER BY ts_code",
+            "FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' AND ts_code NOT LIKE '688%'",
             conn,
         )
+        # 退市股（在 daily 有历史成交，但已不在 stock_basic）→ 纳入以消除幸存者偏差
+        delisted = pd.read_sql_query(
+            "SELECT DISTINCT d.ts_code, COALESCE(sb.name, d.ts_code) AS name, '未知' AS industry "
+            "FROM daily d LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code "
+            "WHERE sb.ts_code IS NULL AND d.ts_code NOT LIKE '%.BJ' AND d.ts_code NOT LIKE '688%'",
+            conn,
+        )
+        df = pd.concat([alive, delisted], ignore_index=True)
+        df = df.drop_duplicates(subset=["ts_code"]).sort_values("ts_code").reset_index(drop=True)
         # 添加 code 列（6位数字代码，与 get_hs300_components 返回格式一致）
         df['code'] = df['ts_code'].str.extract(r'(\d{6})', expand=False)
-        print(f"  ✓ 从 stock_basic 获取 {len(df)} 只 A 股")
+        print(f"  ✓ 从 stock_basic 获取 {len(alive)} 只 + 退市股 {len(delisted)} 只 = {len(df)} 只 A 股（含退市，修正幸存者偏差）")
         return df
     except Exception as e:
         print(f"  [ERR] 获取全市场股票失败: {e}，降级使用中证800+中证500并集")
         df = pd.read_sql_query(
             "SELECT DISTINCT d.ts_code, COALESCE(sb.name, d.ts_code) AS name, '未知' AS industry "
             "FROM index_constituent d LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code "
-            "WHERE d.index_code IN ('000300.SH','000905.SH') "
+            "WHERE d.index_code IN ('000300.SH','000905.SH') AND d.ts_code NOT LIKE '688%' "
             "AND d.trade_date = (SELECT MAX(trade_date) FROM index_constituent)",
             conn,
         )
@@ -906,80 +1088,87 @@ def _get_prev_trading_day(date_str):
         return date_str
 
 
-def _get_index_constituents_from_db(index_code: str) -> pd.DataFrame:
+def _get_index_constituents_from_db(index_code: str, as_of_date: str = None) -> pd.DataFrame:
     """
-    直接从本地DB查询指数成分股（自动使用最新日期）
-    返回: DataFrame with columns ['code', 'name']
+    直接从本地DB查询指数成分股。
+    as_of_date: YYYYMMDD，返回该日期（含）之前最新快照的成分股；
+                为 None 时返回全局最新快照（保留旧行为，含幸存者偏差）。
+    传入 as_of_date 可消除幸存者偏差（含曾成分但已退市的股票）。
     """
     try:
         conn = sqlite3.connect(DB_PATH)
-        
-        # 先找该指数最新日期
-        cur = conn.execute(
-            "SELECT MAX(trade_date) FROM index_constituent WHERE index_code=?",
-            (index_code,)
-        )
-        row = cur.fetchone()
-        
-        if not row or not row[0]:
+
+        if as_of_date:
+            snap = pd.read_sql_query(
+                "SELECT MAX(REPLACE(trade_date,'-','')) AS d FROM index_constituent "
+                "WHERE index_code=? AND REPLACE(trade_date,'-','') <= ?",
+                conn, params=(index_code, str(as_of_date)))
+            query_date = str(snap.iloc[0]['d']) if len(snap) and snap.iloc[0]['d'] else None
+            # ── 数据边界保护 ──────────────────────────────────────────────
+            # 本地成分快照有左边界：例如沪深300最早仅 20160129、中证500最早 20150130。
+            # 当回测起点很早(选股日早于成分数据起始)时，上面查不到快照会直接返回空池→崩溃。
+            # 此时回退到该指数「最早可用快照」，让长周期回测能跑起来；
+            # 下游 list_date 过滤会剔除选股日之后才 IPO 的新股，部分抵消前视偏差。
+            if not query_date:
+                earliest = pd.read_sql_query(
+                    "SELECT MIN(REPLACE(trade_date,'-','')) AS d FROM index_constituent "
+                    "WHERE index_code=?",
+                    conn, params=(index_code,))
+                query_date = str(earliest.iloc[0]['d']) if len(earliest) and earliest.iloc[0]['d'] else None
+                if query_date:
+                    print(f"  [WARN] 指数 {index_code} 在 {as_of_date} 及之前无成分快照，"
+                          f"回退到最早可用快照 {query_date}（轻微前视·仅用于长周期回测，"
+                          f"已用上市日期过滤部分抵消）")
+        else:
+            cur = conn.execute(
+                "SELECT MAX(trade_date) FROM index_constituent WHERE index_code=?",
+                (index_code,))
+            row = cur.fetchone()
+            query_date = str(row[0]) if row and row[0] else None
+
+        if not query_date:
             conn.close()
             logger.warning(f"未找到指数 {index_code} 的任何数据")
             return pd.DataFrame(columns=['code', 'name'])
-        
-        query_date = str(row[0])  # 保持数据库原格式（YYYY-MM-DD 或 YYYYMMDD）
-        
-        # 查询成分股（用 REPLACE 兼容两种日期格式）
+
+        # 查询该快照日成分股（用 REPLACE 兼容两种日期格式）
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code=? AND REPLACE(trade_date, '-', '')=?",
+            "SELECT ts_code FROM index_constituent WHERE index_code=? AND REPLACE(trade_date, '-', '')=? AND ts_code NOT LIKE '688%'",
             conn,
-            params=(index_code, query_date.replace("-", ""))
+            params=(index_code, query_date)
         )
-        
-        if len(df) == 0:
-            # 尝试不使用trade_date过滤
-            df = pd.read_sql_query(
-                "SELECT ts_code FROM index_constituent WHERE index_code=?",
-                conn,
-                params=(index_code,)
-            )
-        
+
         if len(df) > 0:
             # 提取6位数字代码（去掉交易所后缀）
             df['code'] = df['ts_code'].str.extract(r'(\d{6})', expand=False)
-            
-            # 暂时不获取股票名称（避免错误）
             df['name'] = ''
-            
             conn.close()
-            
             result = df[['code', 'name']].reset_index(drop=True)
-            logger.info(f"从本地DB获取 {index_code} 成分股: {len(result)} 只 (日期:{query_date})")
+            logger.info(f"从本地DB获取 {index_code} 成分股: {len(result)} 只 (快照日期:{query_date})")
             return result
         else:
             logger.warning(f"查询指数 {index_code} 返回0行")
-        
-        conn.close()
+            conn.close()
     except Exception as e:
         logger.warning(f"查询指数成分股失败 ({index_code}): {e}")
-    
     # 查询失败，返回空DataFrame
     return pd.DataFrame(columns=['code', 'name'])
 
 
-def _get_hs300_from_db() -> pd.DataFrame:
-    """直接从本地DB查询沪深300成分股"""
-    return _get_index_constituents_from_db('000300.SH')
+def _get_hs300_from_db(as_of_date=None) -> pd.DataFrame:
+    """直接从本地DB查询沪深300成分股（as_of_date 可消除幸存者偏差）"""
+    return _get_index_constituents_from_db('000300.SH', as_of_date)
 
 
-def _get_zz500_from_db() -> pd.DataFrame:
-    """直接从本地DB查询中证500成分股"""
-    return _get_index_constituents_from_db('000905.SH')
+def _get_zz500_from_db(as_of_date=None) -> pd.DataFrame:
+    """直接从本地DB查询中证500成分股（as_of_date 可消除幸存者偏差）"""
+    return _get_index_constituents_from_db('000905.SH', as_of_date)
 
 
-def _get_zz800_from_db() -> pd.DataFrame:
+def _get_zz800_from_db(as_of_date=None) -> pd.DataFrame:
     """直接从本地DB查询中证800成分股（沪深300+中证500）"""
-    hs300 = _get_index_constituents_from_db('000300.SH')
-    zz500 = _get_index_constituents_from_db('000905.SH')
+    hs300 = _get_index_constituents_from_db('000300.SH', as_of_date)
+    zz500 = _get_index_constituents_from_db('000905.SH', as_of_date)
     # 合并去重
     combined = pd.concat([hs300, zz500], ignore_index=True)
     combined = combined.drop_duplicates(subset=['code']).reset_index(drop=True)
@@ -987,9 +1176,12 @@ def _get_zz800_from_db() -> pd.DataFrame:
     return combined
 
 
-def _get_zz1000_from_db() -> pd.DataFrame:
-    """直接从本地DB查询中证1000成分股"""
-    return _get_index_constituents_from_db('000852.SH')
+def _get_zz1000_from_db(as_of_date=None) -> pd.DataFrame:
+    """直接从本地DB查询中证1000成分股（as_of_date 可消除幸存者偏差）"""
+    return _get_index_constituents_from_db('000852.SH', as_of_date)
+
+
+# [已移除] _get_kcb_cyb_from_db：科创板+创业板(高风险) 股票池已按需求删除（对散户不友好）
 
 
 def run_selection():
@@ -1000,6 +1192,10 @@ def run_selection():
     prev_day = _get_prev_trading_day(backtest_start)
     SELECTION["date"] = prev_day
     print(f"  选股日自动计算: 回测开始 {backtest_start} → 前交易日 {prev_day}")
+
+    # 选股日统一格式 YYYYMMDD（供指数成分股"历史时点快照"查询，消除幸存者偏差）
+    sel_date = SELECTION["date"]
+    selection_date_fmt = sel_date.replace("-", "") if (len(sel_date) == 10 and "-" in sel_date) else sel_date
     
     from src.data_fetcher import DataFetcher
     from src.factor_calculator import FactorCalculator
@@ -1036,10 +1232,10 @@ def run_selection():
 
     # 根据 stock_pool 配置动态选择股票池
     pool_map = {
-        "hs300": _get_hs300_from_db,
-        "zz500": _get_zz500_from_db,
-        "zz800": _get_zz800_from_db,
-        "zz1000": _get_zz1000_from_db,
+        "hs300": lambda: _get_hs300_from_db(selection_date_fmt),
+        "zz500": lambda: _get_zz500_from_db(selection_date_fmt),
+        "zz800": lambda: _get_zz800_from_db(selection_date_fmt),
+        "zz1000": lambda: _get_zz1000_from_db(selection_date_fmt),
         "all":   lambda: _get_all_stocks_from_db(),
     }
     get_pool = pool_map.get(SELECTION["stock_pool"], fetcher.get_hs300_components)
@@ -1080,8 +1276,8 @@ def run_selection():
                 ).fetchone()
                 
                 if result is None:
-                    # 找不到上市日期，跳过这只股票
-                    skip_count += 1
+                    # 退市股不在 stock_basic（无 list_date），但历史上已上市 → 保留（修正幸存者偏差）
+                    filtered_pool.append(row)
                     continue
                 
                 list_date = result[0]
@@ -1122,6 +1318,14 @@ def run_selection():
         print(f"  [WARN] 警告: 股票池数量异常！配置={SELECTION['stock_pool']}, 预期≤{expected_max}, 实际={len(pool)}")
         print(f"  [WARN] 可能误用了全市场数据，请检查 get_zz800_components 实现")
     print(f"  股票池 [{SELECTION['stock_pool']}]: {len(pool)} 只")
+
+    # ── 流动性预过滤（保守阈值，主要跑大盘股时几乎不剔除成分股）────
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        pool = prefilter_by_liquidity(conn, pool, selection_date_fmt)
+        conn.close()
+    except Exception as e:
+        print(f"  [WARN] 流动性过滤异常，沿用原股票池: {e}")
 
     # 防御：确保 pool 有 code 列
     if pool.empty or "code" not in pool.columns:
@@ -1448,7 +1652,14 @@ def run_dogs_of_market_selection():
 
 def run_backtest(stocks):
     """对股票列表执行所有已启用的策略"""
-    capital = BACKTEST["per_stock_capital"]
+    # 由「总初始资金 / 选股数量」推导每支资金（向下取整到整百股）
+    _top_n = max(int(SELECTION.get("top_n", 5)), 1)
+    _total_capital = int(BACKTEST.get("total_capital", BACKTEST["per_stock_capital"] * _top_n))
+    if _total_capital < 100000:
+        _total_capital = 100000
+    capital = int(_total_capital // _top_n // 100) * 100
+    if capital < 100:
+        capital = 100
     start, end = BACKTEST["start_date"], BACKTEST["end_date"]
 
     # 自动根据股票池设置基准指数
@@ -1469,6 +1680,7 @@ def run_backtest(stocks):
         "000905.SH": "中证500",
         "000906.SH": "中证800",
         "000852.SH": "中证1000",
+        "399006.SZ": "创业板指",
     }
     benchmark_name = _BENCHMARK_NAME.get(benchmark, benchmark)
 
@@ -1537,12 +1749,7 @@ def run_backtest(stocks):
         print(f"  [WARN] 警告: 有效股票只有 {valid_count}/{target_n} 只，候选已用尽！")
     print(f"  有效股票: {valid_count}/{target_n}  [递补完成]")
 
-    # ═══ 加载策略插件（自动发现 backtest/*.py）═══
-    print(f"\n  正在加载策略插件...")
-    plugins = load_strategy_plugins()
-    print(f"  已发现 {len(plugins)} 个策略插件: {', '.join(plugins.keys())}")
-
-    # ═─ 硬编码策略函数（向后兼容，逐步迁移到插件）───
+    # ═─ 内置策略函数（实盘有效，已对齐成本模型；原插件加载器已移除）───
     strategy_funcs = {
         "buy_hold": (backtest_buy_hold, 0),
         "rsi": (backtest_rsi, 0),
@@ -1552,25 +1759,46 @@ def run_backtest(stocks):
         "rsi_trend": (backtest_rsi_trend, 0),
     }
 
+    # ═══ 加载策略插件（自动发现 backtest/*.py 中的 BaseStrategy 子类）═══
+    plugins = load_strategy_plugins()
+    if plugins:
+        print(f"  已发现 {len(plugins)} 个策略插件: {', '.join(plugins.keys())}")
+
     enabled = [(k, v) for k, v in STRATEGIES.items() if v.get("enabled")]
     print(f"\n{'='*100}")
-    print(f"  回测阶段 — {start} → {end} | 基准{benchmark}: {idx_ret:+.2f}% | 资金{capital/10000:.0f}万/只")
+    print(f"  回测阶段 — {start} → {end} | 基准{benchmark}: {idx_ret:+.2f}% | 总资金{_total_capital/10000:.0f}万 ÷ {_top_n}只 = 每支{capital/10000:.0f}万")
     print(f"  启用策略: {', '.join([s['name'] for _, s in enabled])}")
     print(f"{'='*100}")
 
     all_summaries = {}
 
+    # ── 回测区间年数（用于年化收益率）──
+    try:
+        _sd = datetime.strptime(start, "%Y%m%d")
+        _ed = datetime.strptime(end, "%Y%m%d")
+    except ValueError:
+        _sd = datetime.strptime(start, "%Y-%m-%d")
+        _ed = datetime.strptime(end, "%Y-%m-%d")
+    _years = max((_ed - _sd).days / 365.25, 1e-9)
+
+    def _annualized(ret_pct, years):
+        """把总收益率(百分比)按区间年数年化"""
+        base = 1.0 + ret_pct / 100.0
+        if base <= 0 or years <= 0:
+            return -100.0 if base <= 0 else ret_pct
+        return (base ** (1.0 / years) - 1.0) * 100.0
+
     for skey, scfg in enabled:
         sname = scfg["name"]
         print(f"\n{'─'*100}")
         print(f"  【{sname}】")
-        print(f"  {'代码':<8} {'名称':<8} {'初始本金':>9} {'期末资产':>9} {'盈亏金额':>9} {'收益率':>8} {'超额':>8} {'交易':>6} {'最大回撤':>10} {'胜率':>6}")
+        print(f"  {'代码':<8} {'名称':<8} {'初始本金':>9} {'期末资产':>9} {'盈亏金额':>9} {'收益率':>8} {'超额':>8} {'交易':>6} {'最大回撤':>10} {'回撤区间':>24} {'胜率':>6}")
         print(f"  {'─'*80}")
 
         results = []
         for code, (name, df, start_idx) in stock_data.items():
             try:
-                # ── 优先使用插件（类方式）───
+                # ── 优先使用插件（类方式，自动发现 backtest/*_plugin.py）───
                 if skey in plugins:
                     strategy_class = plugins[skey]
                     strategy = strategy_class(capital, scfg)
@@ -1583,19 +1811,31 @@ def run_backtest(stocks):
                     daily_values = result.get("daily_values", [])
                     if daily_values:
                         portfolio_values = [v["portfolio_value"] for v in daily_values]
-                        max_dd = calculate_max_drawdown(portfolio_values)
+                        dates = [v.get("date") for v in daily_values]
+                        max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates)
                     else:
-                        max_dd = 0.0
-                    
-                # ── 回退到硬编码函数（兼容旧策略）───
+                        max_dd, pk, tr = 0.0, None, None
+                    dd_period = (pk, tr)
+                # ── 回退到内置函数（兼容旧策略）───
                 elif skey in strategy_funcs:
                     func = strategy_funcs[skey][0]
-                    ret, trades, max_dd = func(df, capital, scfg, start_idx)
-                    # 买入持有：只有1次买卖，盈利=100%胜率，亏损=0%胜率
+                    out = func(df, capital, scfg, start_idx)
+                    # 兼容旧3元组 (ret, trades, max_dd) 与新4元组 (..., (peak, trough))
+                    if len(out) == 4:
+                        _r, _t, _dd, _period = out
+                    else:
+                        _r, _t, _dd = out
+                        _period = (None, None)
                     if skey == "buy_hold":
+                        # 买入持有：只有1次买卖，盈利=100%胜率，亏损=0%胜率
+                        ret, trades, max_dd, dd_period = _r, _t, _dd, _period
                         win_rate = 100.0 if ret > 0 else 0.0
                     else:
-                        win_rate = 0.0  # 其他内置函数暂不支持胜率
+                        # 其余内置函数返回 (ret, trade_records, max_dd[, dd_period])，
+                        # 用 calc_win_rate_from_trades 计算胜率（与插件策略一致）
+                        ret, trade_records, max_dd, dd_period = _r, _t, _dd, _period
+                        trades = len(trade_records)
+                        win_rate, win_cnt, total_trades = calc_win_rate_from_trades(trade_records)
                 else:
                     print(f"  [ERR] 未找到策略: {skey}")
                     continue
@@ -1609,8 +1849,8 @@ def run_backtest(stocks):
                 # 计算盈亏金额
                 final_val = capital * (1 + ret / 100)
                 profit = final_val - capital
-                print(f"  {code:<8} {name:<8} {capital:>9,} {final_val:>9,.0f} {profit:>+9,.0f} {ret:>+7.2f}% {exc:>+7.2f}% {trades:>6} {max_dd:>6.2f}% {win_rate:>6.1f}%")
-                results.append({"ret": ret, "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd, "profit": profit, "final_val": final_val, "win_rate": win_rate})
+                print(f"  {code:<8} {name:<8} {capital:>9,} {final_val:>9,.0f} {profit:>+9,.0f} {ret:>+7.2f}% {exc:>+7.2f}% {trades:>6} {max_dd:>6.2f}% {_dd_period_str(dd_period):<24} {win_rate:>6.1f}%")
+                results.append({"ret": ret, "ann_ret": _annualized(ret, _years), "exc": exc, "vs_bh": vs_bh, "trades": trades, "beat": ret > idx_ret, "max_dd": max_dd, "dd_period": dd_period, "profit": profit, "final_val": final_val, "win_rate": win_rate})
             except Exception as e:
                 print(f"  {code:<8} {name:<8} {'ERR':>8} ({e})")
 
@@ -1620,6 +1860,7 @@ def run_backtest(stocks):
             n_better_bh = 0 if skey == "buy_hold" else sum(1 for r in results if r["vs_bh"] > 0)
             s = all_summaries[sname] = {
                 "mean": np.mean(rets), "median": np.median(rets),
+                "annual_mean": np.mean([r["ann_ret"] for r in results]),
                 "best": np.max(rets), "worst": np.min(rets),
                 "n_pos": sum(1 for r in rets if r > 0),
                 "n_beat": sum(1 for r in results if r["beat"]),
@@ -1628,6 +1869,7 @@ def run_backtest(stocks):
                 "trades_mean": np.mean([r["trades"] for r in results]),
                 "max_dd_mean": np.mean([r["max_dd"] for r in results]),
                 "win_rate_mean": np.mean([r["win_rate"] for r in results]),
+                "dd_year_counts": _aggregate_dd_years(results),
             }
             # 买入持有不显示"优于BH"
             if skey == "buy_hold":
@@ -1639,27 +1881,31 @@ def run_backtest(stocks):
                   f"正收益{s['n_pos']}/{len(results)} 跑赢{s['n_beat']}/{len(results)} "
                   f"{better_bh_str} 均交易{s['trades_mean']:.1f}次 "
                   f"均最大回撤{s['max_dd_mean']:.2f}% 胜率{s['win_rate_mean']:.1f}%")
+            if s.get("dd_year_counts"):
+                yr_desc = " ".join(f"{y}年({c})" for y, c in s["dd_year_counts"].items())
+                print(f"  最大回撤高发期: {yr_desc}")
             # 资金汇总
             total_initial = capital * len(results)
             total_final = sum(r["final_val"] for r in results)
             total_profit = sum(r["profit"] for r in results)
             total_ret = (total_final / total_initial - 1) * 100 if total_initial > 0 else 0
-            print(f"  资金汇总: 总投入{total_initial:>9,.0f}  总资产{total_final:>9,.0f}  "
-                  f"总盈亏{total_profit:>+9,.0f}  总收益率{total_ret:+.2f}%")
+            print(f"  资金汇总: 总投入{total_initial:>9,.0f} (=每支{capital:,.0f}元 × {len(results)}只)  总资产{total_final:>9,.0f}  "
+                  f"总盈亏{total_profit:>+9,.0f}  总收益率{total_ret:+.2f}%  年化收益率均值{s['annual_mean']:+.2f}%")
 
     # ══ 总表 ══
     print(f"\n\n{'='*100}")
     print(f"  【策略对比总表】")
     print(f"{'='*100}")
-    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'均最大回撤':>12} {'胜率':>6} {'最佳':>10} {'最差':>10}")
+    print(f"  {'策略':<16} {'均值':>8} {'中位数':>8} {'正收益':>8} {'跑赢指数':>8} {'优于BH':>8} {'均交易':>6} {'均最大回撤':>12} {'胜率':>6} {'最佳':>10} {'最差':>10} {'回撤高发期':>22}")
     print(f"  {'─'*90}")
     for skey, scfg in enabled:
         s = all_summaries.get(scfg["name"], {})
         if s:
             better_bh_display = f"{s['n_better_bh']}/{s['n']}" if skey != "buy_hold" else "N/A"
+            yr_desc = " ".join(f"{y}({c})" for y, c in s.get("dd_year_counts", {}).items()) if s.get("dd_year_counts") else "--"
             print(f"  {scfg['name']:<16} {s['mean']:>+7.2f}% {s['median']:>+7.2f}% "
                   f"{s['n_pos']}/{s['n']:>4}  {s['n_beat']}/{s['n']:>4}  {better_bh_display:>6}  "
-                  f"{s['trades_mean']:>5.1f}  {s['max_dd_mean']:>11.2f}%  {s['win_rate_mean']:>5.1f}%  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%")
+                  f"{s['trades_mean']:>5.1f}  {s['max_dd_mean']:>11.2f}%  {s['win_rate_mean']:>5.1f}%  {s['best']:>+9.2f}% {s['worst']:>+9.2f}%  {yr_desc:>20}")
     bh_mean = np.mean(list(bh_results.values()))
     print(f"  {'─'*90}")
     print(f"  {'买入持有(等权)':<16} {bh_mean:>+7.2f}%")
@@ -1680,6 +1926,7 @@ def run_backtest(stocks):
                     "平均交易次数": round(s["trades_mean"], 1),
                     "均最大回撤%": round(s["max_dd_mean"], 2),
                     "胜率%": round(s["win_rate_mean"], 2),
+                    "最大回撤高发期": " ".join(f"{y}({c})" for y, c in s.get("dd_year_counts", {}).items()) if s.get("dd_year_counts") else "--",
                     "最佳%": round(s["best"], 2), "最差%": round(s["worst"], 2),
                 })
         rows.append({"策略": "买入持有(等权)", "均值收益%": round(bh_mean, 2)})
@@ -1715,9 +1962,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", "-s",
         type=str,
-        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance"],
+        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance", "sc_rotation", "weekly"],
         default=None,
-        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓)"
+        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓) / sc_rotation(小市值轮动) / weekly(周度四因子·高股息+高波动·周度调仓)"
     )
     parser.add_argument(
         "--start-date", type=str, default=None,
@@ -1730,6 +1977,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top-n", type=int, default=None,
         help="选股数量，覆盖 config.py 的 SELECTION['top_n']"
+    )
+    parser.add_argument(
+        "--capital", type=int, default=None,
+        help="选股族回测总初始资金（元），覆盖 config.py 的 BACKTEST['total_capital']；"
+             "每支资金 = 总资金 // 选股数量（向下取整到整百股）"
     )
     parser.add_argument(
         "--file", "-f",
@@ -1760,7 +2012,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--stock-pool", type=str, default=None,
-        help="股票池: hs300 | zz500 | zz800 | all"
+        help="股票池: hs300 | zz500 | zz800 | zz1000 | all"
     )
     parser.add_argument(
         "--benchmark", type=str, default=None,
@@ -1770,6 +2022,53 @@ if __name__ == "__main__":
         "--selection-method", type=str, default="value",
         choices=["value", "div_low_vol", "momentum"],
         help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨)"
+    )
+    parser.add_argument(
+        "--dogs-strategy", type=str, default="dogs",
+        choices=["dogs", "value", "magic"],
+        help="年度调仓的子策略: dogs(狗股·高股息+低PB) / value(价值选股·破净+ROE+现金流) / magic(神奇公式·ROC+EY双排名)"
+    )
+    parser.add_argument(
+        "--hold-count", type=int, default=None,
+        help="小市值轮动持仓只数(流通市值最小N只)，覆盖默认7"
+    )
+    parser.add_argument(
+        "--empty-jan-apr", action="store_true",
+        help="小市值轮动: 1月/4月空仓(年报/一季报窗口)"
+    )
+    parser.add_argument(
+        "--stop-loss", action="store_true",
+        help="小市值轮动: 开启三层止损(单票-12% / 中证2000单日-6.6% / 昨涨停今炸板)"
+    )
+    parser.add_argument(
+        "--sc-fundamental", action="store_true",
+        help="小市值轮动: 开启基本面过滤(最近年报 净利润>0 且 营收>5亿)"
+    )
+    parser.add_argument(
+        "--exclude-delisted", action="store_true",
+        help="小市值轮动: 剔除已退市股(INNER JOIN), 用于幸存者偏差对照"
+    )
+    parser.add_argument(
+        "--min-avg-amount-k", type=float, default=None,
+        help="小市值轮动: 流动性门槛(日均成交额,千元), 默认30000(=3000万)"
+    )
+    parser.add_argument(
+        "--sc-mode", type=str, default="single",
+        choices=["single", "compare", "sensitivity"],
+        help="小市值轮动运行模式: single(单次) / compare(含退市vs剔除退市对照) / sensitivity(持仓数×流动性网格)"
+    )
+    parser.add_argument(
+        "--hold-grid", default="5,7,10,15",
+        help="小市值轮动 sensitivity 模式: 持仓数网格(逗号分隔)"
+    )
+    parser.add_argument(
+        "--liq-grid", default="30000,50000,80000,100000",
+        help="小市值轮动 sensitivity 模式: 流动性门槛网格(千元)"
+    )
+    parser.add_argument(
+        "--sc-pool-mode", type=str, default="zz2000",
+        choices=["cyb", "zz2000", "zz1000"],
+        help="小市值轮动选股宇宙: cyb(纯创业板) / zz2000(中证2000风格·含微盘尾) / zz1000(中证1000风格·剔除微盘尾)"
     )
     args = parser.parse_args()
 
@@ -1793,6 +2092,12 @@ if __name__ == "__main__":
     if args.top_n is not None:
         SELECTION["top_n"] = args.top_n
         print(f"  [参数] 选股数量: {args.top_n}")
+    if args.capital is not None:
+        if args.capital < 100000:
+            print(f"  [警告] 总初始资金 {args.capital} 低于最小限制 100000，已强制使用 100000")
+            args.capital = 100000
+        BACKTEST["total_capital"] = args.capital
+        print(f"  [参数] 总初始资金: {args.capital}")
 
 
     # 列出可用 CSV 文件
@@ -1927,18 +2232,27 @@ if __name__ == "__main__":
         sys.exit(0)
         
     elif args.source == "dogs_annual":
-        # 狗股策略年度调仓回测
-        print(f"\n  狗股策略年度调仓回测模式...")
+        # 狗股/价值 年度调仓回测
+        dogs_strat = args.dogs_strategy or "dogs"
+        if dogs_strat == "magic":
+            dogs_strat_name = "神奇公式(Magic Formula·ROC+EY双排名)"
+        elif dogs_strat == "value":
+            dogs_strat_name = "价值选股(破净+ROE+现金流)"
+        else:
+            dogs_strat_name = "狗股策略(高股息+低PB)"
+        print(f"\n  {dogs_strat_name} · 年度调仓回测模式...")
         print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
         print(f"  选股数量: {SELECTION.get('top_n', 5)}")
+        print(f"  总资金: {BACKTEST.get('total_capital', 500000):,} 元 (将均分到每只)")
         print(f"  {'='*60}")
-        
+
         from run_dogs_annual import run_backtest as run_dogs_annual_bt
         run_dogs_annual_bt(
             start_date=BACKTEST["start_date"],
             end_date=BACKTEST["end_date"],
             top_n=SELECTION.get("top_n", 5),
-            capital=BACKTEST["per_stock_capital"],
+            capital=BACKTEST["total_capital"],
+            strategy=dogs_strat,
         )
         sys.exit(0)
         
@@ -1980,6 +2294,70 @@ if __name__ == "__main__":
             )
         sys.exit(0)
         
+    elif args.source == "sc_rotation":
+        # 小市值轮动回测（全市场最小流通市值·中证2000风格宇宙）
+        from backtest_small_cap_rotation import (
+            run_backtest as sc_run,
+            run_survivor_bias_comparison,
+            run_sensitivity,
+        )
+        _capital = args.capital if args.capital is not None else BACKTEST.get("total_capital", 500000)
+        _hold = args.hold_count if args.hold_count is not None else 7
+        _mode = args.sc_mode
+        print(f"\n  小市值轮动策略 · 回测")
+        print(f"  区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}  | 持仓: {_hold} 只")
+        print(f"  总资金: {_capital:,} 元")
+        print(f"  空仓1/4月: {'开' if args.empty_jan_apr else '关'}  | 三层止损: {'开' if args.stop_loss else '关'}")
+        print(f"  模式: {_mode}  | 选股宇宙: {args.sc_pool_mode}")
+        print(f"  {'='*60}")
+        if _mode == "compare":
+            run_survivor_bias_comparison(
+                BACKTEST["start_date"], BACKTEST["end_date"], hold_count=_hold,
+                capital=_capital, empty_jan_apr=args.empty_jan_apr,
+                enable_stop_loss=args.stop_loss, fundamental_filter=args.sc_fundamental,
+                pool_mode=args.sc_pool_mode,
+            )
+        elif _mode == "sensitivity":
+            run_sensitivity(
+                BACKTEST["start_date"], BACKTEST["end_date"], capital=_capital,
+                empty_jan_apr=args.empty_jan_apr, enable_stop_loss=args.stop_loss,
+                fundamental_filter=args.sc_fundamental,
+                hold_grid=[int(x) for x in args.hold_grid.split(",")],
+                liq_grid=[float(x) for x in args.liq_grid.split(",")],
+                pool_mode=args.sc_pool_mode,
+            )
+        else:
+            sc_run(
+                BACKTEST["start_date"], BACKTEST["end_date"], hold_count=_hold,
+                capital=_capital, empty_jan_apr=args.empty_jan_apr,
+                enable_stop_loss=args.stop_loss, fundamental_filter=args.sc_fundamental,
+                exclude_delisted=args.exclude_delisted, min_avg_amount_k=args.min_avg_amount_k,
+                pool_mode=args.sc_pool_mode,
+            )
+        sys.exit(0)
+
+    elif args.source == "weekly":
+        # 周度四因子选股回测（高股息+高波动·周度调仓）
+        from run_weekly_highdiv_vol import (
+            run_backtest as run_weekly_bt,
+            DIV_PCT, TURN_PCT, DEBT_PCT, SIZE_PCT,
+        )
+        _wcap = args.capital if args.capital is not None else BACKTEST.get("total_capital", 500000)
+        _wtop = SELECTION.get("top_n", 10)
+        print(f"\n  周度四因子选股回测（高股息+高波动·周度调仓）")
+        print(f"  区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}  | 持仓: {_wtop} 只")
+        print(f"  总资金: {_wcap:,} 元")
+        print(f"  因子阈值(默认): 股息前{DIV_PCT}% 换手前{TURN_PCT}% "
+              f"负债最低{DEBT_PCT}% 市值最低{SIZE_PCT}%")
+        print(f"  {'='*60}")
+        run_weekly_bt(
+            start_date=BACKTEST["start_date"],
+            end_date=BACKTEST["end_date"],
+            top_n=_wtop,
+            capital=_wcap,
+        )
+        sys.exit(0)
+
     elif args.source == "csv":
         # 自动匹配最新的选股 CSV 文件（只匹配 selection/ 子目录）
         if args.auto or not args.file:

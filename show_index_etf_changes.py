@@ -3,12 +3,13 @@
 指数 / ETF 涨跌一览（回测周期表现）
 ====================================
 
-统计主要宽基 / 风格指数在回测区间的涨跌情况（长期买入 ETF 视角）：
+统计主要宽基 / 风格指数在回测区间的涨跌情况：
     - 以对应 ETF 为展示标的（现价 = 当前买入价）；
-    - 若有对应指数，用指数干净收益路径校正 ETF 长期涨跌（ETF 现价 × 指数区间涨跌），
-      消除 ETF 份额拆分与 etf_daily 数据偏差；
-    - 无对应指数时，回退到 ETF 自身 pct_chg 复权序列；
-    - 该指数完全无 ETF 时，兜底用指数本身。
+    - 「指数涨跌」：用指数干净收益路径校正 ETF 长期涨跌（ETF 现价 × 指数区间涨跌），
+      消除 ETF 份额拆分与 etf_daily 数据偏差；此为指数价格口径（不含股息）；
+    - 「ETF总回报」：ETF 前复权（价格+股息），即买入持有 ETF 的真实收益；
+    - 无对应指数时，回退到 ETF 自身 pct_chg 复权序列（此时两列一致）；
+    - 该指数完全无 ETF 时，兜底用指数本身（ETF总回报列为 --）。
 
 用法:
     python show_index_etf_changes.py START END [--no-html]
@@ -122,8 +123,30 @@ def _latest_etf_close(conn, code, end):
     return row[0] if row else None
 
 
+def _etf_total_return(conn, code, start, end):
+    """ETF 前复权总回报（价格+股息），即买入持有 ETF 的真实收益。无数据返回 None。"""
+    rows = conn.execute(
+        "SELECT CAST(trade_date AS TEXT), close FROM etf_daily "
+        "WHERE ts_code = ? AND CAST(trade_date AS TEXT) >= ? "
+        "AND CAST(trade_date AS TEXT) <= ? ORDER BY trade_date",
+        (code, start, end)).fetchall()
+    af = conn.execute(
+        "SELECT CAST(trade_date AS TEXT), adj_factor FROM etf_adj_factor "
+        "WHERE ts_code = ? AND CAST(trade_date AS TEXT) >= ? "
+        "AND CAST(trade_date AS TEXT) <= ? ORDER BY trade_date",
+        (code, start, end)).fetchall()
+    if len(rows) < 2 or len(af) < 2:
+        return None
+    f0, f1 = af[0][1], af[-1][1]
+    if not f1:
+        return None
+    first_unadj, last_unadj = rows[0][1], rows[-1][1]
+    adj_first = first_unadj * f0 / f1
+    return last_unadj / adj_first - 1.0
+
+
 def _pack(name, code, kind, ref, start_dt, start_close, end_dt, end_close,
-          pct, amplitude, max_dd, ann, n_days):
+          pct, amplitude, max_dd, ann, n_days, etf_total=None):
     return {
         "name": name,
         "code": code,
@@ -134,6 +157,7 @@ def _pack(name, code, kind, ref, start_dt, start_close, end_dt, end_close,
         "end_dt": end_dt,
         "end_close": end_close,
         "pct": pct,
+        "etf_total": etf_total,
         "amplitude": amplitude,
         "max_dd": max_dd,
         "ann": ann,
@@ -193,9 +217,10 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         years = len(adj) / TRADING_DAYS
         ann = ((end_ratio) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
 
+        etf_total = _etf_total_return(conn, etf_code, start, end)
         return _pack(name, etf_code, "ETF(指数校正)", index_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(adj), ann, len(adj))
+                     pct, amplitude, _max_drawdown(adj), ann, len(adj), etf_total)
 
     # ── 情形 B：有 ETF 但无对应指数 → ETF 自身 pct_chg 复权序列 ──
     if etf_avail:
@@ -226,7 +251,7 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         ann = ((end_close / start_close) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
         return _pack(name, etf_code, "ETF", etf_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(adj), ann, n)
+                     pct, amplitude, _max_drawdown(adj), ann, n, pct / 100.0)
 
     # ── 情形 C：无 ETF（etf_code 为空）→ 纯指数兜底 ──
     if idx_avail:
@@ -245,7 +270,7 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         ann = ((end_close / start_close) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
         return _pack(name, index_code, "指数", index_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(closes), ann, len(closes))
+                     pct, amplitude, _max_drawdown(closes), ann, len(closes), None)
 
     return None
 
@@ -266,12 +291,12 @@ def print_console(results, start, end):
 
     print()
     print("=" * 82)
-    print(f"  指数 / ETF 涨跌一览（长期买入 ETF 视角）   区间: {start} ~ {end}")
-    print("  以 ETF 为标的(现价=当前买入价)；长期涨跌用对应指数收益路径校正")
-    print("  （ETF现价 × 指数区间涨跌，消除 ETF 份额拆分与数据偏差）；无指数时回退 ETF 复权")
+    print(f"  指数 / ETF 涨跌一览    区间: {start} ~ {end}")
+    print("  展示标的为 ETF(现价=当前买入价)；「指数涨跌」用对应指数收益路径校正(消除ETF拆分伪影)，为指数价格口径(不含股息)")
+    print("  「ETF总回报」= ETF前复权(价格+股息)即买入持有ETF的真实收益；二者对照可见跟踪差与股息贡献")
     print("=" * 82)
-    print(f"  {'指数':<16}{'标的':<11}{'类型':<14}"
-          f"{'起(复权)→现价':<22}{'区间涨跌':>9}{'振幅':>8}{'最大回撤':>9}{'年化':>8}")
+    print(f"  {'#':<3}{'指数':<14}{'标的':<11}{'类型':<14}"
+          f"{'起→现价':<20}{'指数涨跌':>9}{'ETF总回报':>10}{'振幅':>8}{'最大回撤':>9}{'年化':>8}")
     print("-" * 82)
     for i, r in enumerate(results, 1):
         arrow = "▲" if r["pct"] >= 0 else "▼"
@@ -279,9 +304,11 @@ def print_console(results, start, end):
         pct_str = _color(f"{r['pct']:+7.2f}%", r["pct"], tty)
         kind_disp = (f"ETF↔{r['ref']}" if r["kind"] == "ETF(指数校正)"
                      else r["kind"])
+        etf_total_str = f"{(r['etf_total'] * 100):+7.2f}%" if r.get("etf_total") is not None else "  --  "
         line = (f"  {i:>2}.{r['name']:<13}{r['code']:<11}{kind_disp:<14}"
                 f"{r['start_close']:>9.2f}→{r['end_close']:>9.2f} "
-                f"{arrow_colored}{pct_str:>7}{r['amplitude']:>7.1f}%"
+                f"{arrow_colored}{pct_str:>7}{etf_total_str:>10}"
+                f"{r['amplitude']:>7.1f}%"
                 f"{r['max_dd']:>8.1f}%{r['ann']:>7.1f}%")
         print(line)
     print("-" * 78)
@@ -316,6 +343,12 @@ def write_html(results, start, end, out_path):
             tag = f'<span class="tag" title="基准指数 {r["ref"]}">ETF·校正</span>'
         else:
             tag = f'<span class="tag">{r["kind"]}</span>'
+        if r.get("etf_total") is not None:
+            _et = r["etf_total"]
+            _cls = "up" if _et >= 0 else "down"
+            etf_total_disp = f'<span class="{_cls}">{_et * 100:+.2f}%</span>'
+        else:
+            etf_total_disp = '<span class="muted">--</span>'
         rows.append(f"""
         <tr>
           <td class="name">{r['name']}</td>
@@ -326,6 +359,7 @@ def write_html(results, start, end, out_path):
           <td>{r['end_dt']}</td>
           <td class="num">{r['end_close']:.2f}</td>
           <td class="num pct">{sign}{r['pct']:.2f}%</td>
+          <td class="num">{etf_total_disp}</td>
           <td class="chart">{_bar_html(r['pct'])}<span class="chv">{sign}{r['pct']:.2f}%</span></td>
           <td class="num">{r['amplitude']:.1f}%</td>
           <td class="num">{r['max_dd']:.1f}%</td>
@@ -361,11 +395,12 @@ def write_html(results, start, end, out_path):
   .bar-pos,.bar-neg {{ height:14px; border-radius:3px; display:inline-block;
            vertical-align:middle; }}
   .chv {{ font-size:12px; margin-left:6px; color:#555; }}
+  .muted {{ color:#aaa; }}
   tr:hover {{ background:#fafcff; }}
 </style></head>
 <body>
   <h1>指数 / ETF 涨跌一览</h1>
-  <div class="meta">回测区间 {start} ~ {end} ｜ 以 ETF 为标的（现价=当前买入价），长期涨跌用对应指数收益路径校正（ETF 现价 × 指数区间涨跌，消除 ETF 份额拆分与数据偏差）；无对应指数时回退 ETF 复权序列 ｜ 红涨绿跌</div>
+  <div class="meta">回测区间 {start} ~ {end} ｜ 以 ETF 为标的（现价=当前买入价）；「指数涨跌」用对应指数收益路径校正(消除ETF拆分伪影, 指数价格口径不含股息)；「ETF总回报」= ETF前复权(价格+股息)即买入持有ETF真实收益 ｜ 红涨绿跌</div>
   <div class="summary">
     <div class="card"><div class="k">覆盖指数</div><div class="v">{len(results)}</div></div>
     <div class="card"><div class="k">上涨 / 下跌</div>
@@ -376,7 +411,7 @@ def write_html(results, start, end, out_path):
   <table>
     <thead><tr>
       <th>指数</th><th>标的(ETF)</th><th>类型</th><th>起始日</th><th>起始(复权)</th>
-      <th>结束日</th><th>现价(ETF)</th><th>区间涨跌</th><th>涨跌分布</th>
+      <th>结束日</th><th>现价(ETF)</th><th>指数涨跌</th><th>ETF总回报</th><th>涨跌分布</th>
       <th>振幅</th><th>最大回撤</th><th>年化</th>
     </tr></thead>
     <tbody>{''.join(rows)}</tbody>
