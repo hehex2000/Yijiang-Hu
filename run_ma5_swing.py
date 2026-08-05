@@ -74,6 +74,27 @@ _DATA_LO = None   # 数据窗口下界(含)；None=全历史（独立诊断用�
 _DATA_HI = None
 _CONN = None       # 复用的数据库连接（避免逐票开连接）
 
+_TRADES = []       # 逐笔成交明细（诊断用）；run_backtest 启动时清空
+
+
+def _log_trade(date, action, code, price, shares, fee, cash_after,
+               reason="", buy_date="", buy_price=None, hold_days=None):
+    """记录一笔成交到 _TRADES（仅诊断，不影响回测逻辑）。"""
+    pnl = None; ret = None
+    if action == "SELL" and buy_price:
+        pnl = (price - buy_price) * shares - fee
+        ret = price / buy_price - 1
+    _TRADES.append(dict(
+        date=date, action=action, code=code, reason=reason,
+        price=round(price, 4), shares=int(shares),
+        amount=round(price * shares, 2), fee=round(fee, 2),
+        cash_after=round(cash_after, 2),
+        buy_date=buy_date,
+        buy_price=(round(buy_price, 4) if buy_price else None),
+        hold_days=hold_days,
+        pnl=(round(pnl, 2) if pnl is not None else None),
+        ret_pct=(round(ret * 100, 2) if ret is not None else None)))
+
 def _get_conn():
     global _CONN
     if _CONN is None:
@@ -241,7 +262,8 @@ def _is_st(code, name_cache):
 # ───────────────────────────── 主回测 ─────────────────────────────
 def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                  zero_cost=False, **kw):
-    global P_BODY, P_VOL, P_LIMITUP, _DATA_LO, _DATA_HI
+    global P_BODY, P_VOL, P_LIMITUP, _DATA_LO, _DATA_HI, _TRADES
+    _TRADES = []   # 清空逐笔明细
     P = default_params()
     P.update(kw)
     P_BODY = P["body_min"]; P_VOL = P["vol_mult"]; P_LIMITUP = P["limit_up_as_body"]
@@ -301,6 +323,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
     # 待执行订单（昨日收盘决策 → 今日开盘执行）
     pend_buys = []       # list of code（按放量倍数排序后填充）
     pend_sells = {}      # code -> 'full' or ratio(float)
+    pend_reason = {}     # code -> 卖出原因标签（逐笔诊断用，与 pend_sells 同步维护）
 
     # 成本审计
     aud = dict(n_buy=0, n_sell=0, n_reduce=0, comm=0.0, stamp=0.0, slip=0.0,
@@ -330,6 +353,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             hfq_open = d["ho"][i]
             raw_open = hfq_open / d["fac"][i]   # 修复#5：手续费/盈亏按真实价口径
             pos = positions[code]
+            buy_px = pos["buy_open_raw"]; buy_dt = pos["buy_date"]
             if kind == "full":
                 sh = pos["shares"]
             else:
@@ -363,17 +387,26 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             else:
                 pos["shares"] -= sh
                 aud["n_reduce"] += 1
+            reason = pend_reason.pop(code, ("清仓" if kind == "full" else f"减仓{int(kind*100)}%"))
+            _log_trade(td, "SELL", code, raw_open, sh, fee, cash,
+                       reason=reason, buy_date=buy_dt, buy_price=buy_px,
+                       hold_days=_hold_len(buy_dt, td, trade_dates))
         # 仅清除已实际成交的卖出；跌停封死导致未成交的意图保留到下一交易日开盘重试，
         # 修复“清仓信号恰逢跌停→意图被清空→次日反弹站回MA5→counter归零→止损丢失”的漏洞。
         pend_sells = {c: k for c, k in pend_sells.items() if c not in executed}
+        pend_reason = {c: r for c, r in pend_reason.items() if c not in executed}
 
         # 买入（按放量倍数降序 + code 字典序，容量受限）
         def _buy_key(c):
+            # 修复未来函数：原代码用 vol[ii]（今日=执行日全天量，开盘时未知）排序候选，
+            # 系统性优先买入当天会放量的票（=当天会涨的 runner），构成前视偏差。
+            # 改用信号日(T=ii-1，已在 T 收盘合法可得)的相对放量排序。
             ii = data[c]["idx_of"].get(td)
-            if ii is None or ii >= data[c]["n"]:
+            if ii is None or ii >= data[c]["n"] or ii < 1:
                 return (0.0, c)          # 当日无数据 → 排末尾，循环内会被跳过
-            mv = max(data[c]["ma20vol_excl"][ii], 1e-9)
-            return (-data[c]["vol"][ii] / mv, c)
+            j = ii - 1                   # 信号日（T 收盘已知）
+            mv = max(data[c]["ma20vol_excl"][j], 1e-9)
+            return (-data[c]["vol"][j] / mv, c)
         pend_buys.sort(key=_buy_key)
         for code in pend_buys:
             if len(positions) >= P["max_pos"]:
@@ -408,6 +441,8 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             cash -= cost
             positions[code] = dict(shares=sh, buy_open_raw=raw_open,
                                    buy_date=td, tp_done=False, counter=0, buy_gi=gi)
+            _log_trade(td, "BUY", code, raw_open, sh, fee, cash,
+                       reason="入场", buy_date=td, buy_price=raw_open)
             if not zero_cost:
                 bd = rmb.calc_fee_breakdown("buy", raw_open, sh, trade_date=int(td))
                 aud["comm"] += bd["commission"]; aud["slip"] += bd["slippage"]
@@ -425,13 +460,14 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 if P["exit_mode"] == "fixedN":
                     # 固定持有 N 交易日后清仓（无纪律、无止盈、无回撤响应）
                     if gi - pos["buy_gi"] >= P["hold_days"]:
-                        pend_sells[code] = "full"
+                        pend_sells[code] = "full"; pend_reason[code] = f"fixedN到期{P['hold_days']}日"
                     continue
                 if P["exit_mode"] == "reversal":
                     # 持有至收破 MA5（thesis 失效）或触顶 max_hold_days
                     broke = (d["ma5"][i] > 0) and (d["hc"][i] < d["ma5"][i])
                     if broke or (gi - pos["buy_gi"] >= P["max_hold_days"]):
                         pend_sells[code] = "full"
+                        pend_reason[code] = "收破MA5" if broke else f"触顶{P['max_hold_days']}日"
                     continue
                 # full：规则3 止盈 + 规则4+5 A 方案（五句话纪律）
                 below = d["hc"][i] < d["ma5"][i]
@@ -440,14 +476,14 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 # 规则3 止盈
                 dev = d["hc"][i] / d["ma5"][i] - 1 if d["ma5"][i] > 0 else 0
                 if (not pos["tp_done"]) and dev >= P["dev_tp"]:
-                    pend_sells.setdefault(code, P["tp_ratio"])
+                    pend_sells.setdefault(code, P["tp_ratio"]); pend_reason[code] = "规则3止盈"
                     pos["tp_done"] = True
                     continue  # 当日只触发止盈，不叠加减仓
                 # 规则4+5 A 方案
                 if c >= P["exit_days"]:
-                    pend_sells[code] = "full"
+                    pend_sells[code] = "full"; pend_reason[code] = f"规则5清仓(c={c})"
                 elif c == 1:
-                    pend_sells.setdefault(code, P["cut_ratio"])
+                    pend_sells.setdefault(code, P["cut_ratio"]); pend_reason[code] = "规则4减仓(c=1)"
                 # c==2 不动
                 continue
             # 空仓：买入候选（过滤 ST/成交额/已黑名单）
@@ -506,6 +542,10 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
         else:
             fee = rmb.calc_fee("sell", raw_close, sh, trade_date=int(last_td))
         cash += sh * raw_close - fee
+        _log_trade(last_td, "SELL", code, raw_close, sh, fee, cash,
+                   reason="末日清算", buy_date=positions[code]["buy_date"],
+                   buy_price=positions[code]["buy_open_raw"],
+                   hold_days=_hold_len(positions[code]["buy_date"], last_td, trade_dates))
         if not zero_cost:
             bd = rmb.calc_fee_breakdown("sell", raw_close, sh, trade_date=int(last_td))
             aud["comm"] += bd["commission"]; aud["stamp"] += bd["stamp_duty"]
@@ -606,6 +646,11 @@ def _report(daily_vals, trade_dates, capital, bench, pool, P, aud, zero_cost, N)
     os.makedirs(out_dir, exist_ok=True)
     csv = f"{out_dir}/ma5_{pool}_{P['exit_mode']}_{trade_dates[0]}_{trade_dates[-1]}{'_zero' if zero_cost else ''}.csv"
     pd.DataFrame(daily_vals).to_csv(csv, index=False)
+    # 逐笔成交明细 CSV（诊断用：每笔买卖的日期/代码/价格/数量/费用/盈亏/持有天数/原因）
+    if _TRADES:
+        tcsv = f"{out_dir}/trades_{pool}_{P['exit_mode']}_{trade_dates[0]}_{trade_dates[-1]}{'_zero' if zero_cost else ''}.csv"
+        pd.DataFrame(_TRADES).to_csv(tcsv, index=False)
+        print(f"  逐笔明细 → {tcsv}")
     print(f"\n  日净值 → {csv}\n")
     return {"total": total, "annual": ann, "mdd": mdd, "sharpe": sharpe,
             "bench": b_total, "cost": cost_total}
