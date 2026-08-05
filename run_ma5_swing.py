@@ -51,6 +51,7 @@ def default_params():
         hold_days=10,           # fixedN：持有交易日数
         max_hold_days=60,       # reversal：最长持有（防无限）
         reserve=0.02,           # 单笔买入留 2% 现金缓冲
+        exec_price="open",      # 成交价：open=次日开盘(默认) / close=当日收盘(2026-07-06盘后新规)
         verbose=False,
     )
 
@@ -350,7 +351,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 continue
             if d["is_limit_down_open"][i]:
                 continue  # 跌停封死 → 卖出意图保留，下一交易日开盘重试
-            hfq_open = d["ho"][i]
+            hfq_open = d["ho"][i] if P["exec_price"] == "open" else d["hc"][i]
             raw_open = hfq_open / d["fac"][i]   # 修复#5：手续费/盈亏按真实价口径
             pos = positions[code]
             buy_px = pos["buy_open_raw"]; buy_dt = pos["buy_date"]
@@ -398,13 +399,15 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
 
         # 买入（按放量倍数降序 + code 字典序，容量受限）
         def _buy_key(c):
-            # 修复未来函数：原代码用 vol[ii]（今日=执行日全天量，开盘时未知）排序候选，
-            # 系统性优先买入当天会放量的票（=当天会涨的 runner），构成前视偏差。
-            # 改用信号日(T=ii-1，已在 T 收盘合法可得)的相对放量排序。
+            # 排序用的"最新合法可知"成交量由执行时刻决定：
+            #   open  执行 → 当日全天量未知，用信号日 T=ii-1（已修，无前视）
+            #   close 执行 → 当日全天量收盘时已知，用 ii（合法，对应2026-07-06盘后新规）
             ii = data[c]["idx_of"].get(td)
-            if ii is None or ii >= data[c]["n"] or ii < 1:
+            if ii is None or ii >= data[c]["n"]:
                 return (0.0, c)          # 当日无数据 → 排末尾，循环内会被跳过
-            j = ii - 1                   # 信号日（T 收盘已知）
+            j = ii if P["exec_price"] == "close" else (ii - 1)
+            if j < 0:
+                return (0.0, c)
             mv = max(data[c]["ma20vol_excl"][j], 1e-9)
             return (-data[c]["vol"][j] / mv, c)
         pend_buys.sort(key=_buy_key)
@@ -423,7 +426,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 continue
             if d["is_limit_up_open"][i]:
                 continue  # 一字涨停买不进 → 放弃该笔
-            hfq_open = d["ho"][i]
+            hfq_open = d["ho"][i] if P["exec_price"] == "open" else d["hc"][i]
             raw_open = hfq_open / d["fac"][i]   # 修复#5
             if raw_open <= 0:
                 continue
@@ -685,6 +688,8 @@ def main():
     ap.add_argument("--blacklist-days", type=int, default=20)
     ap.add_argument("--no-blacklist", action="store_true")
     ap.add_argument("--zero-cost", action="store_true")
+    ap.add_argument("--exec-price", default="open", choices=["open", "close"],
+                    help="成交价：open=次日开盘(默认) / close=当日收盘(2026-07-06盘后新规)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     run_backtest(
@@ -696,6 +701,7 @@ def main():
         cut_ratio=args.cut_ratio, exit_days=args.exit_days, amount_min=args.amount_min,
         exit_mode=args.exit_mode, hold_days=args.hold_days, max_hold_days=args.max_hold_days,
         blacklist_days=args.blacklist_days, blacklist_on=not args.no_blacklist,
+        exec_price=args.exec_price,
         verbose=args.verbose,
     )
 
