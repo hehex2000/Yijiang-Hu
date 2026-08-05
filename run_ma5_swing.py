@@ -46,6 +46,10 @@ def default_params():
         blacklist_days=20,      # 决策3：清仓起 N 交易日不再入选
         blacklist_on=True,      # 决策3：黑名单默认开
         limit_up_as_body=True,  # 一字涨停 pct_chg≥9.8% 算作放量阳线兜底
+        # ── 退出模式（纪律隔离消融用，默认 full=五句话纪律）──
+        exit_mode="full",       # full=五句话 / fixedN=固定持有N日 / reversal=收破MA5止
+        hold_days=10,           # fixedN：持有交易日数
+        max_hold_days=60,       # reversal：最长持有（防无限）
         reserve=0.02,           # 单笔买入留 2% 现金缓冲
         verbose=False,
     )
@@ -316,7 +320,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 continue
             cash -= cost
             positions[code] = dict(shares=sh, buy_open_hfq=hfq_open,
-                                   buy_date=td, tp_done=False, counter=0)
+                                   buy_date=td, tp_done=False, counter=0, buy_gi=gi)
             if not zero_cost:
                 bd = rmb.calc_fee_breakdown("buy", hfq_open, sh, trade_date=int(td))
                 aud["comm"] += bd["commission"]; aud["slip"] += bd["slippage"]
@@ -328,9 +332,21 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             i = d["idx_of"].get(td)
             if i is None or i < warm_min or i >= d["n"]:
                 continue
-            # 持仓：更新 counter + 退出决策
+            # 持仓：按 exit_mode 执行退出决策（入场/成本/黑名单均不变，仅退出规则不同）
             if code in positions:
                 pos = positions[code]
+                if P["exit_mode"] == "fixedN":
+                    # 固定持有 N 交易日后清仓（无纪律、无止盈、无回撤响应）
+                    if gi - pos["buy_gi"] >= P["hold_days"]:
+                        pend_sells[code] = "full"
+                    continue
+                if P["exit_mode"] == "reversal":
+                    # 持有至收破 MA5（thesis 失效）或触顶 max_hold_days
+                    broke = (d["ma5"][i] > 0) and (d["hc"][i] < d["ma5"][i])
+                    if broke or (gi - pos["buy_gi"] >= P["max_hold_days"]):
+                        pend_sells[code] = "full"
+                    continue
+                # full：规则3 止盈 + 规则4+5 A 方案（五句话纪律）
                 below = d["hc"][i] < d["ma5"][i]
                 pos["counter"] = pos["counter"] + 1 if below else 0
                 c = pos["counter"]
@@ -444,8 +460,11 @@ def _report(daily_vals, trade_dates, capital, bench, pool, P, aud, zero_cost, N)
     b0 = reg.index_close(bench, dates[0]); b1 = reg.index_close(bench, dates[-1])
     b_total = (b1 / b0 - 1) if (b0 and b1) else 0
 
+    _MODE_LABEL = {"full": "五句话纪律", "fixedN": f"固定持有{P['hold_days']}日",
+                   "reversal": "收破MA5止"}
+    mode_label = _MODE_LABEL.get(P["exit_mode"], P["exit_mode"])
     print(f"\n{'='*72}")
-    print(f"  5日均线「五句话」短线纪律策略  {'[零成本对照]' if zero_cost else '[完整成本]'}")
+    print(f"  5日均线短线策略 [退出模式={mode_label}]  {'[零成本对照]' if zero_cost else '[完整成本]'}")
     print(f"  池={pool}  区间={trade_dates[0]}~{trade_dates[-1]}  初始={capital:,.0f}  "
           f"max_pos={P['max_pos']}  黑名单={'开(%d日)'%P['blacklist_days'] if P['blacklist_on'] else '关'}")
     print(f"{'='*72}")
@@ -491,7 +510,7 @@ def _report(daily_vals, trade_dates, capital, bench, pool, P, aud, zero_cost, N)
 
     out_dir = "data/results/ma5_swing"
     os.makedirs(out_dir, exist_ok=True)
-    csv = f"{out_dir}/ma5_{pool}_{trade_dates[0]}_{trade_dates[-1]}{'_zero' if zero_cost else ''}.csv"
+    csv = f"{out_dir}/ma5_{pool}_{P['exit_mode']}_{trade_dates[0]}_{trade_dates[-1]}{'_zero' if zero_cost else ''}.csv"
     pd.DataFrame(daily_vals).to_csv(csv, index=False)
     print(f"\n  日净值 → {csv}\n")
     return {"total": total, "annual": ann, "mdd": mdd, "sharpe": sharpe,
@@ -516,6 +535,13 @@ def main():
     ap.add_argument("--tp-ratio", type=float, default=0.5)
     ap.add_argument("--cut-ratio", type=float, default=0.5)
     ap.add_argument("--exit-days", type=int, default=3)
+    ap.add_argument("--exit-mode", default="full",
+                    choices=["full", "fixedN", "reversal"],
+                    help="消融：full=五句话纪律 / fixedN=固定持有N日 / reversal=收破MA5止")
+    ap.add_argument("--hold-days", type=int, default=10,
+                    help="fixedN 模式持有交易日数")
+    ap.add_argument("--max-hold-days", type=int, default=60,
+                    help="reversal 模式最长持有交易日数")
     ap.add_argument("--amount-min", type=float, default=50000.0)
     ap.add_argument("--blacklist-days", type=int, default=20)
     ap.add_argument("--no-blacklist", action="store_true")
@@ -529,6 +555,7 @@ def main():
         lookback=args.lookback, touch_tol=args.touch_tol, entry_dev_max=args.entry_dev_max,
         signal_valid=args.signal_valid, dev_tp=args.dev_tp, tp_ratio=args.tp_ratio,
         cut_ratio=args.cut_ratio, exit_days=args.exit_days, amount_min=args.amount_min,
+        exit_mode=args.exit_mode, hold_days=args.hold_days, max_hold_days=args.max_hold_days,
         blacklist_days=args.blacklist_days, blacklist_on=not args.no_blacklist,
         verbose=args.verbose,
     )
