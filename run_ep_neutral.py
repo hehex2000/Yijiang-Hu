@@ -36,6 +36,7 @@ from run_monthly_rebalance import (
     get_monthly_5th_trading_days, obv_accumulation_filter,
     INIT_CAPITAL, COMMISSION_RATE, COMMISSION_MIN, STAMP_DUTY_RATE,
     SLIPPAGE_RATE, INDEX_DISPLAY_NAME, compute_reality_discounts,
+    set_trade_date_ctx, reset_fee_ctx,
 )
 
 # ════════════════════════════════════════════════════════════
@@ -160,6 +161,7 @@ def _ensure_day(td):
 
 def _px(code, td, which="close"):
     """取 code 在 td 的 open/close/high/low；缺失则向前（更早交易日）回找已缓存的价。"""
+    set_trade_date_ctx(td)   # 登记成交日 → calc_fee 自动用对当期印花税率（2023-08-28 起千0.5）
     day = _ensure_day(td)
     rec = day.get(code)
     if rec is not None:
@@ -400,6 +402,7 @@ def run_backtest(start_date="20100101", end_date="20260715",
     LIMIT_ON = limit_on
     import run_monthly_rebalance as _rm
     _rm.SLIPPAGE_RATE = slippage   # 让 calc_fee 使用当前滑点
+    reset_fee_ctx()                # 清空印花税率上下文，避免多次运行串味
     print("=" * 72)
     print("  纯行业中性 EP（Earnings Yield = 1/PE_TTM）月度选股策略回测")
     print("=" * 72)
@@ -417,7 +420,7 @@ def run_backtest(start_date="20100101", end_date="20260715",
     print(f"  成交价假设：{ex} | 涨跌停约束：{'开(涨停买不进/跌停卖不出)' if LIMIT_ON else '关'} "
           f"| T+1：月度调仓天然满足")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
-          f"印花税千{STAMP_DUTY_RATE*1e3:.0f} 滑点{slippage*100:.2f}%")
+          f"印花税千1→千0.5(2023-08-28起) 滑点{slippage*100:.2f}%")
     print(f"  初始资金：{_CAPITAL:,.0f}\n")
 
     trade_dates = get_trade_dates(start_date, end_date)

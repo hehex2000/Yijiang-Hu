@@ -384,7 +384,7 @@ def run_backtest(start_date="20140101", end_date="20260715",
     print(f"  剔除：ST / 688 / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  财务口径：ann_date（公告日）取最新年报")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
-          f"印花税千{STAMP_DUTY_RATE*1e3:.0f} 滑点{SLIPPAGE_RATE*100:.1f}%")
+          f"印花税千1→千0.5(2023-08-28起) 滑点{SLIPPAGE_RATE*100:.1f}%")
     print(f"  初始资金：{_CAPITAL:,.0f}（30只等权需足额部署，否则现金拖累）\n")
 
     trade_dates = get_trade_dates(start_date, end_date)

@@ -17,7 +17,7 @@
 
 回测口径（2026-07-08 统一对齐）：
     - 前复权（adj_factor，最新因子归一）
-    - 成本：佣金万2.5（最低5元）+ 印花税千1（仅卖）+ 滑点千1（买卖）
+    - 成本：佣金万2.5（最低5元）+ 印花税千1→千0.5(2023-08-28起,仅卖)+ 滑点千1（买卖）
     - 幸存者偏差：股票池取自行情库实际交易代码（含已退市），退市股无法
       卖出按归零（全额亏损）计入，不再静默剔除美化收益
     - 强制 1 手超分配 bug 已修（资金不足 1 手则跳过该股）
@@ -43,6 +43,9 @@ import os
 import argparse
 import importlib.util
 import traceback
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 印花税率复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5）
+from run_monthly_rebalance import stamp_duty_rate
 
 # 解决中文乱码
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Times New Roman']
@@ -64,7 +67,7 @@ INITIAL_CASH = 100000           # 初始资金（元，10万）
 # 交易成本参数（与 run_backtest 统一口径：佣金+印花+滑点）
 COMMISSION_RATE = 0.00025       # 佣金：万分之2.5
 MIN_COMMISSION = 5.0            # 单笔最低佣金：5元
-STAMP_DUTY_RATE = 0.001         # 印花税：千分之一（仅卖出）
+STAMP_DUTY_RATE = 0.001         # 历史常量（已改用 stamp_duty_rate 分段：2023-08-28 起千1→千0.5，仅卖出）
 SLIPPAGE_RATE = 0.001           # 滑点：千分之一（买卖双向，模拟冲击成本）
 
 # 流动性过滤（单位：元；<=0 关闭）
@@ -276,7 +279,7 @@ def monthly_loop(monthly_factor, factor_col, direction, raw_data, stocks_univers
 
     capital_per_stock = INITIAL_CASH / TOP_N
     print(f"  成本: 每股资金={capital_per_stock:,.0f}元, 佣金万2.5(最低5元), "
-          f"印花千1(仅卖), 滑点千1(买卖)")
+          f"印花千1→千0.5(2023-08-28起,仅卖), 滑点千1(买卖)")
 
     records, long_stocks, short_stocks = [], [], []
     valid_codes = set(stocks_universe['ts_code'])
@@ -406,7 +409,7 @@ def _simulate_portfolio(stock_list, capital, next_year, next_month,
         else:
             sell_amount = shares * sell_price
         sell_comm = max(sell_amount * COMMISSION_RATE, MIN_COMMISSION)
-        stamp = sell_amount * STAMP_DUTY_RATE
+        stamp = sell_amount * stamp_duty_rate(int(f"{next_year}{next_month:02d}28"))  # 月末卖出→分段印花税率
         slip_sell = sell_amount * SLIPPAGE_RATE
 
         total_cost += buy_comm + sell_comm + stamp + slip_buy + slip_sell
@@ -504,7 +507,7 @@ IR 值          : {metrics['ir']:8.3f}
 四、口径备注
 {'-'*78}
   - 股票池：行情库实际交易代码（含退市），退市按归零计入
-  - 成本：佣金万2.5(最低5元)+印花千1(仅卖)+滑点千1(买卖)
+  - 成本：佣金万2.5(最低5元)+印花千1→千0.5(2023-08-28起,仅卖)+滑点千1(买卖)
   - 过滤：ST/*ST、北交所、±9.8%涨跌停、流动性(日均成交额≥{LIQUIDITY_MIN_AVG_AMOUNT/1e8:.1f}亿)
   - 复权：前复权(adj_factor)
 """

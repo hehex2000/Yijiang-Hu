@@ -29,6 +29,9 @@ from config import (
     VALUE_STRATEGY, DIVIDEND_LOW_VOL, DOGS_OF_MARKET,
 )
 
+# 印花税率：复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5），保证全平台一致
+from run_monthly_rebalance import stamp_duty_rate
+
 DB_PATH = DATA["local_db_path"]
 
 
@@ -92,13 +95,16 @@ SLIPPAGE_RATE_RB   = 0.001      # 滑点率（买卖均含，模拟冲击成本�
 LIQUIDITY_MIN_AVG_AMOUNT = 50_000_000   # 选股日往前 LOOKBACK 日，日均成交额下限（元）：5000万
 LIQUIDITY_LOOKBACK       = 20           # 滚动窗口（交易日）
 
-def calc_fee_rb(buy_or_sell, price, shares, stamp_duty=STAMP_DUTY_RATE_RB):
-    """计算单笔交易的总成本（元）。ETF/配对等免印花税可传 stamp_duty=0。"""
+def calc_fee_rb(buy_or_sell, price, shares, trade_date=None, stamp_duty=None):
+    """计算单笔交易的总成本（元）。ETF/配对等免印花税可传 stamp_duty=0。
+    stamp_duty 省略时按成交日分段印花税率（2023-08-28 起千1→千0.5）。"""
     amount = price * shares
     commission = max(amount * COMMISSION_RATE_RB, COMMISSION_MIN_RB)
     slippage = amount * SLIPPAGE_RATE_RB
     if buy_or_sell == "buy":
         return commission + slippage
+    if stamp_duty is None:
+        stamp_duty = stamp_duty_rate(trade_date)
     return commission + stamp_duty * amount + slippage
 
 
@@ -464,7 +470,7 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
     if shares == 0:
         return 0.0, 0, 0.0
     
-    cash = capital - shares * p0 - calc_fee_rb("buy", p0, shares)  # 买入成本（佣金+滑点）
+    cash = capital - shares * p0 - calc_fee_rb("buy", p0, shares, trade_date=df.iloc[start_idx]["trade_date"])  # 买入成本（佣金+滑点）
     
     # 检查是否启用ATR止损
     use_atr_stop = cfg.get("use_atr_stop", False)
@@ -515,7 +521,7 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
         # 如果止损触发，后续日期保持现金（卖出后）
         if exit_idx < n - 1:
             sell_price = close[exit_idx]
-            cash_after_sell = cash + shares * sell_price - calc_fee_rb("sell", sell_price, shares)  # 卖出成本（佣金+印花税+滑点）
+            cash_after_sell = cash + shares * sell_price - calc_fee_rb("sell", sell_price, shares, trade_date=df.iloc[exit_idx]["trade_date"])  # 卖出成本（佣金+印花税+滑点）
             for i in range(exit_idx + 1, n):
                 portfolio_values.append(cash_after_sell)
                 dates.append(df.iloc[i]["trade_date"])
@@ -539,7 +545,7 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
                 portfolio_values.append(cash + shares * close[i])
                 dates.append(df.iloc[i]["trade_date"])
         
-        final = portfolio_values[-1] - calc_fee_rb("sell", close[n - 1], shares)  # 期末按收盘价卖出，扣除卖出成本
+        final = portfolio_values[-1] - calc_fee_rb("sell", close[n - 1], shares, trade_date=df.iloc[n - 1]["trade_date"])  # 期末按收盘价卖出，扣除卖出成本
         ret = (final / capital - 1) * 100
         max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
 
@@ -2009,8 +2015,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--selection-method", type=str, default="value",
-        choices=["value", "div_low_vol", "momentum", "div_low_vol_quality"],
-        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨) / div_low_vol_quality(红利低波质量复合·季度调仓)"
+        choices=["value", "div_low_vol", "momentum", "div_low_vol_quality", "div_growth"],
+        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨) / div_low_vol_quality(红利低波质量复合·季度调仓) / div_growth(高股息+基本面成长)"
     )
     parser.add_argument(
         "--dlvq-mode", type=str, default="official_compact",

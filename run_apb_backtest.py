@@ -11,7 +11,7 @@ APB5D 买卖压力因子回测（修正版）
 改进说明：
   - 使用 adj_factor 做前复权
   - 涨跌停过滤 ±9.8%
-  - 佣金万2.5(最低5元) + 印花税千1
+  - 佣金万2.5(最低5元) + 印花税千1→千0.5(23-08起)
 """
 
 import sys, os, sqlite3, time, argparse, json
@@ -21,6 +21,10 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 复用共享引擎的「分段印花税率」与「成交日上下文」，保证与全平台口径一致
+# （2023-08-28 起由千1 减半至千0.5；印花税仅卖方收）
+from run_monthly_rebalance import stamp_duty_rate, set_trade_date_ctx, reset_fee_ctx
 
 DB_PATH = r"D:\tu-shareData\astock_daily.db"
 INIT_CAPITAL = 500000
@@ -54,7 +58,7 @@ def calc_fee_buy(price, shares):
 def calc_fee_sell(price, shares):
     amount = price * shares
     fee = max(amount * 0.00025, 5.0)
-    return fee + amount * 0.001
+    return fee + amount * stamp_duty_rate()   # 分段印花税率（2023-08-28 起千0.5）
 
 def get_stock_basic():
     conn = get_conn()
@@ -125,12 +129,13 @@ def calc_apb5d_fast(df, window=5):
 # ── 回测主函数 ──────────────────────────────────────────
 
 def run_apb_backtest(start_date="20180101", end_date="20220107", top_n=DEFAULT_TOP_N):
+    reset_fee_ctx()   # 清空印花税率上下文，避免多次运行串味
     print(f"\n{'='*70}")
     print(f"  APB5D × 跨日VWAPvsTWAP × 月度调仓")
     print(f"{'='*70}")
     print(f"  区间: {start_date} ~ {end_date}")
     print(f"  选股: {top_n} 只（买最小APB5D = 买压最大）")
-    print(f"  资金: {INIT_CAPITAL:,.0f} | 佣金万2.5+印花税千1")
+    print(f"  资金: {INIT_CAPITAL:,.0f} | 佣金万2.5+印花税千1→千0.5(23-08起)")
     print(f"  基准: 沪深300\n")
 
     trade_dates = get_trade_dates(start_date, end_date)
@@ -185,9 +190,11 @@ def run_apb_backtest(start_date="20180101", end_date="20220107", top_n=DEFAULT_T
         price_lookup[('open', code, td)] = row['open'] * ratio
 
     def get_price(code, td):
+        set_trade_date_ctx(td)   # 登记成交日 → stamp_duty_rate() 自动用对当期税率
         return price_lookup.get((code, td))
 
     def get_open_price(code, td):
+        set_trade_date_ctx(td)   # 登记成交日 → stamp_duty_rate() 自动用对当期税率
         return price_lookup.get(('open', code, td))
 
     # 涨跌停过滤：获取每月最后一天的pct_chg

@@ -294,7 +294,7 @@ def run_backtest(start_date="20120401", end_date="20260715", top_n=TOP_N,
     print(f"  成交价假设：{ex} | 涨跌停约束：{'开(涨停买不进/跌停卖不出)' if LIMIT_ON else '关'} "
           f"| T+1：{'季度' if rebalance=='quarterly' else '月度'}调仓天然满足")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
-          f"印花税千{STAMP_DUTY_RATE*1e3:.0f} 滑点{slippage*100:.2f}%")
+          f"印花税千1→千0.5(2023-08-28起) 滑点{slippage*100:.2f}%")
     print(f"  初始资金：{_CAPITAL:,.0f}\n")
 
     trade_dates = get_trade_dates(start_date, end_date)

@@ -57,7 +57,62 @@ PB_SELL_THRESHOLD = 1.2    # 止盈 PB 阈值
 BEAR_REDUCE = 0.50          # MACD死叉减仓比例 50%
 COMMISSION_RATE = 0.00025  # 佣金率
 COMMISSION_MIN = 5.0       # 最低佣金
-STAMP_DUTY_RATE = 0.001    # 印花税率（卖出收取）
+STAMP_DUTY_RATE = 0.001    # 印花税率（卖出收取）· 2023-08-28 前的旧税率
+# ── 印花税历史分段（2023-08-28 起证券交易印花税由 0.1% 减半至 0.05%）──
+STAMP_DUTY_RATE_OLD  = 0.001    # 2023-08-27 及以前
+STAMP_DUTY_RATE_NEW  = 0.0005   # 2023-08-28 起
+STAMP_DUTY_CUT_DATE  = 20230828
+
+
+### ── 成交日上下文（让全平台策略自动用上真实历史税率）────────────
+# 设计：所有交易流程必然是「先取价(get_price/get_open_price) → 紧接着算费(calc_fee)」，
+# 因此取价函数会自动把当前成交日登记到上下文，calc_fee 无需显式传日期即可用对税率。
+# 优先级：calc_fee 显式 trade_date > 上下文日期 > 兜底旧税率(并计数告警)。
+_CTX_TRADE_DATE = None
+_CTX_MISS_COUNT = 0          # 无任何日期信息的计费次数（审计用）
+_CTX_WARNED = False
+
+
+def set_trade_date_ctx(trade_date):
+    """显式登记当前成交日（新策略可主动调用；老策略靠取价函数自动登记）。"""
+    global _CTX_TRADE_DATE
+    if trade_date is not None:
+        _CTX_TRADE_DATE = int(trade_date)
+
+
+def get_trade_date_ctx():
+    return _CTX_TRADE_DATE
+
+
+def reset_fee_ctx():
+    """回测开始前清空上下文与审计计数。"""
+    global _CTX_TRADE_DATE, _CTX_MISS_COUNT, _CTX_WARNED
+    _CTX_TRADE_DATE = None
+    _CTX_MISS_COUNT = 0
+    _CTX_WARNED = False
+
+
+def fee_ctx_audit():
+    """返回 {"last_date":..., "miss_count":...}，供报告核对税率口径是否全程生效。"""
+    return {"last_date": _CTX_TRADE_DATE, "miss_count": _CTX_MISS_COUNT}
+
+
+def stamp_duty_rate(trade_date=None):
+    """按成交日返回真实印花税率（2023-08-28 起 0.1% → 0.05%）。
+
+    trade_date 为空时回退到成交日上下文；上下文也为空则用旧税率并记一次 miss。
+    """
+    global _CTX_MISS_COUNT, _CTX_WARNED
+    td = trade_date if trade_date is not None else _CTX_TRADE_DATE
+    if td is None:
+        _CTX_MISS_COUNT += 1
+        if not _CTX_WARNED:
+            _CTX_WARNED = True
+            print("  ⚠️ [费用] 计费时无成交日上下文，印花税暂按旧税率 0.1%；"
+                  "如为新写策略请调用 set_trade_date_ctx(td)")
+        return STAMP_DUTY_RATE_OLD
+    td = int(td)
+    return STAMP_DUTY_RATE_NEW if td >= STAMP_DUTY_CUT_DATE else STAMP_DUTY_RATE_OLD
 
 # ── 流动性过滤（保守阈值，跑大盘股时几乎不剔除成分股）────
 # daily.amount 单位为"千元"，故阈值以元传入时需 ×1000 换算
@@ -160,16 +215,34 @@ def get_stock_name(ts_code):
     return ts_code
 
 
-def calc_fee(buy_or_sell, price, shares):
-    """计算含滑点的总交易成本"""
+def calc_fee(buy_or_sell, price, shares, trade_date=None):
+    """计算含滑点的总交易成本
+
+    印花税按成交日历史分段：2023-08-27 及以前 0.1%，2023-08-28 起 0.05%。
+    trade_date 不传时自动回退到成交日上下文（由 get_price/get_open_price 登记），
+    因此全平台既有策略无需改调用即可用上真实税率。
+    """
     amount = price * shares
     commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
     slippage = amount * SLIPPAGE_RATE  # 买/卖均含滑点
     if buy_or_sell == 'buy':
         return commission + slippage
     else:
-        stamp_duty = amount * STAMP_DUTY_RATE
+        stamp_duty = amount * stamp_duty_rate(trade_date)
         return commission + stamp_duty + slippage
+
+
+def calc_fee_breakdown(buy_or_sell, price, shares, trade_date=None):
+    """同 calc_fee，但返回分项 dict，供成本审计报告使用。
+
+    return: {"commission":x, "slippage":x, "stamp_duty":x, "total":x}
+    """
+    amount = price * shares
+    commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
+    slippage = amount * SLIPPAGE_RATE
+    duty = amount * stamp_duty_rate(trade_date) if buy_or_sell != 'buy' else 0.0
+    return {"commission": commission, "slippage": slippage,
+            "stamp_duty": duty, "total": commission + slippage + duty}
 
 
 # ============================================================
@@ -178,6 +251,7 @@ def calc_fee(buy_or_sell, price, shares):
 
 def get_price(ts_code, trade_date):
     """获取不复权收盘价（实际使用价格）"""
+    set_trade_date_ctx(trade_date)   # 登记成交日 → calc_fee 自动用对当期印花税率
     if ts_code in ("000906.SH",):
         conn = get_conn()
         row = pd.read_sql_query(
@@ -231,6 +305,7 @@ def get_open_price(ts_code, trade_date):
     2026-07-06前：开盘价（正常盘中交易）
     2026-07-06后：收盘价（盘后30分钟定价交易，非未来函数）
     """
+    set_trade_date_ctx(trade_date)   # 登记成交日 → calc_fee 自动用对当期印花税率
     td = int(trade_date) if isinstance(trade_date, str) else trade_date
     if td >= 20260706:
         # 盘后定价交易 → 使用当日收盘价
@@ -292,6 +367,32 @@ def _get_ohlc(ts_code, trade_date):
             c = float(r["close"]) if pd.notna(r["close"]) else None
             d[str(r["ts_code"])] = (h, l, c)
         _DAY_OHLC[trade_date] = d
+    return d.get(ts_code)
+
+
+# ════════════════════════════════════════════════════════════
+#  按交易日批量涨跌幅缓存（仅 div_growth「涨停跑路」日规则启用时填充）
+# ════════════════════════════════════════════════════════════
+_DAY_PCT = {}
+_PCT_CONN = None  # 复用连接：get_price 每次开连接 ~100ms，日规则每天全市场取数不能重复开
+
+def _get_day_pct(ts_code, trade_date):
+    """返回 code 在 trade_date 的涨跌幅%（(close-pre_close)/pre_close×100），
+    当日无行情（停牌）返回 None。批量取当日所有股票并缓存，每天仅 1 次查询。"""
+    global _PCT_CONN
+    d = _DAY_PCT.get(trade_date)
+    if d is None:
+        if _PCT_CONN is None:
+            _PCT_CONN = get_conn()
+        df = pd.read_sql_query(
+            "SELECT ts_code, close, pre_close FROM daily WHERE trade_date = ?",
+            _PCT_CONN, params=(trade_date,))
+        d = {}
+        for _, r in df.iterrows():
+            pc = float(r["pre_close"]) if pd.notna(r["pre_close"]) and r["pre_close"] else None
+            cl = float(r["close"]) if pd.notna(r["close"]) else None
+            d[str(r["ts_code"])] = (cl - pc) / pc * 100 if (pc and cl) else None
+        _DAY_PCT[trade_date] = d
     return d.get(ts_code)
 
 
@@ -679,6 +780,145 @@ def select_dividend_low_vol_stocks(trade_date, top_n=None,
     name_str = ', '.join([f"{c}({get_stock_name(c)})" for c in codes])
     print(f"  最终选出：{name_str}")
     return result[['ts_code']]
+
+
+# ============================================================
+#  高股息 + 基本面成长 双因子选股（B站视频策略 · 全A池）
+#  对应 run_dividend_growth_monthly.py 的 select_picks 逻辑：
+#   筛1 股息率排名 : dv_ttm(全A) 取前 top_pct（视频为"三年总分红/市值"，TTM代理）
+#   筛2 基本面五关 : PE∈(0,pe_max] | PEG∈[peg_min,peg_max] | ROE>roe_min
+#                   | 营收同比>rev_min | 净利同比>np_min
+#                   （fina_indicator 最新报告，ann_date≤trade_date 防未来函数）
+#   筛3 交易层     : 剔除停牌/昨涨停 → 取股息率前 top_n
+# ============================================================
+_A_SHARE_RE = None
+
+def select_dividend_growth_stocks(trade_date, top_n=None,
+                                  top_pct=0.10, pe_max=20.0,
+                                  peg_min=0.08, peg_max=2.0,
+                                  roe_min=3.0, rev_min=5.0, np_min=11.0):
+    """高股息+基本面成长双因子选股（返回含 ts_code 的 DataFrame）。"""
+    global _A_SHARE_RE
+    if _A_SHARE_RE is None:
+        import re as _re
+        _A_SHARE_RE = _re.compile(r"^(60|00|30|68)\d{4}\.(SH|SZ)$")
+    if top_n is None:
+        top_n = get_top_n()
+
+    conn = get_conn()
+    # daily_basic 个别交易日整日缺失 → 回退最近可用日
+    actual_date = trade_date
+    while True:
+        cnt = pd.read_sql_query(
+            "SELECT COUNT(*) AS n FROM daily_basic WHERE trade_date = ?",
+            conn, params=(actual_date,)).iloc[0]["n"]
+        if cnt > 0:
+            break
+        prev = pd.read_sql_query(
+            "SELECT MAX(trade_date) AS m FROM daily_basic WHERE trade_date < ?",
+            conn, params=(actual_date,))
+        actual_date = prev.iloc[0, 0]
+        if actual_date is None:
+            conn.close()
+            return pd.DataFrame()
+    d_int = int(str(actual_date))
+
+    df = pd.read_sql_query(
+        "SELECT ts_code, dv_ttm, pe_ttm FROM daily_basic WHERE trade_date = ?",
+        conn, params=(actual_date,))
+    if df.empty:
+        conn.close()
+        return pd.DataFrame()
+    df = df[(df["dv_ttm"] > 0) & (df["pe_ttm"] > 0)].copy()
+    df = df[df["ts_code"].str.match(_A_SHARE_RE)]
+    if df.empty:
+        conn.close()
+        return pd.DataFrame()
+
+    # 剔除 ST（证券简称含 ST）
+    ph = ",".join("?" for _ in df["ts_code"].tolist())
+    st = pd.read_sql_query(
+        f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({ph})",
+        conn, params=df["ts_code"].tolist())
+    st = st[~st["name"].str.contains("ST", case=False, na=False)]
+    df = df[df["ts_code"].isin(st["ts_code"])]
+    if df.empty:
+        conn.close()
+        return pd.DataFrame()
+
+    # ── 筛1：股息率前 top_pct ──
+    n_top = max(int(round(len(df) * top_pct)), 1)
+    df = df.sort_values("dv_ttm", ascending=False).head(n_top).copy()
+
+    # ── 筛2：基本面五关（最新财报 ann_date ≤ 选股日）──
+    fina = pd.read_sql_query(
+        "SELECT ts_code, ann_date, roe, netprofit_yoy, tr_yoy FROM fina_indicator "
+        "WHERE ann_date IS NOT NULL AND CAST(ann_date AS INTEGER) > 0 "
+        "AND CAST(ann_date AS INTEGER) <= ?",
+        conn, params=(d_int,))
+    conn.close()
+    if not fina.empty:
+        fina = fina.sort_values("ann_date").drop_duplicates("ts_code", keep="last")
+        # ⚠️ .values 迭代产出 numpy.ndarray（isinstance(tuple) 为 False）→ 必须转 tuple
+        fmap = dict(zip(fina["ts_code"], map(tuple, fina[["roe", "netprofit_yoy", "tr_yoy"]].values)))
+    else:
+        fmap = {}
+    f = df["ts_code"].map(fmap)
+    roe = f.map(lambda x: x[0] if isinstance(x, tuple) else float("nan"))
+    np_yoy = f.map(lambda x: x[1] if isinstance(x, tuple) else float("nan"))
+    tr_yoy = f.map(lambda x: x[2] if isinstance(x, tuple) else float("nan"))
+    peg = df["pe_ttm"] / np_yoy
+    m = (
+        (df["pe_ttm"] > 0) & (df["pe_ttm"] <= pe_max) &
+        (peg >= peg_min) & (peg <= peg_max) &
+        (roe > roe_min) & (tr_yoy > rev_min) & (np_yoy > np_min)
+    )
+    df = df[m]
+    if df.empty:
+        return pd.DataFrame()
+
+    # ── 筛3：交易层（T-1 停牌 / 昨涨停）──
+    conn2 = get_conn()
+    drow = pd.read_sql_query(
+        "SELECT ts_code, close, pre_close FROM daily WHERE trade_date = ?",
+        conn2, params=(actual_date,))
+    conn2.close()
+    pmap = {}
+    for _, r in drow.iterrows():
+        pc = float(r["pre_close"]) if pd.notna(r["pre_close"]) and r["pre_close"] else None
+        cl = float(r["close"]) if pd.notna(r["close"]) else None
+        pmap[str(r["ts_code"])] = (cl - pc) / pc * 100 if (pc and cl) else None
+
+    def _lim(code):
+        if code.startswith("688"):
+            return 19.9
+        if code.startswith("300"):
+            return 19.9 if d_int >= 20200824 else 9.9
+        return 9.9
+
+    keep = []
+    for c in df["ts_code"]:
+        p = pmap.get(c)
+        if p is None:          # T-1 无行情 → 停牌
+            continue
+        if p >= _lim(c) - 0.1:  # 昨涨停
+            continue
+        keep.append(c)
+    df = df[df["ts_code"].isin(keep)]
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.sort_values("dv_ttm", ascending=False).head(top_n).copy()
+    df["name"] = df["ts_code"].map(dict(zip(st["ts_code"], st["name"])))
+    df["roe"] = roe.reindex(df.index).round(2)
+    df["np_yoy"] = np_yoy.reindex(df.index).round(1)
+    df["tr_yoy"] = tr_yoy.reindex(df.index).round(1)
+    df["peg"] = peg.reindex(df.index).round(3)
+    df["score"] = df["dv_ttm"]
+    codes = df["ts_code"].tolist()
+    name_str = ', '.join([f"{c}({df.loc[df['ts_code']==c,'name'].iloc[0]})" for c in codes])
+    print(f"  最终选出（高股息+成长）：{name_str}")
+    return df.reset_index(drop=True)
 
 
 # ============================================================
@@ -1196,6 +1436,9 @@ def select_by_method(method, trade_date, top_n=None, lookback_months=None,
                                               require_ocf_cover=require_ocf_cover,
                                               div_growth_min=div_growth_min,
                                               macd_filter_mode=macd_filter_mode)
+    elif method == "div_growth":
+        # 高股息+基本面成长（B站视频策略）：三筛 + 月调仓 + 涨停跑路日规则
+        return select_dividend_growth_stocks(trade_date, top_n)
     else:  # value
         return select_stocks(trade_date, top_n, mode=value_mode,
                              size_neutral=value_size_neutral, value_pct=value_pct)
@@ -1217,6 +1460,9 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     # 因子类策略月度调仓即退出，传 0 关闭个股止损。
     if stop_loss_pct is None:
         stop_loss_pct = STOP_LOSS
+    # 高股息+基本面成长：视频策略无个股止损（月调仓即退出），强制关闭
+    if selection_method == "div_growth":
+        stop_loss_pct = 0.0
     if top_n is None:
         top_n = get_top_n()
 
@@ -1231,7 +1477,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"月度调仓回测：{start_date} ~ {end_date}")
     print("=" * 70)
     print(f"  选股池：{_pool_name}成分股")
-    _sm_name = {"div_low_vol": "红利低波"}.get(selection_method, "价值选股")
+    _sm_name = {"div_low_vol": "红利低波", "momentum": "动量追涨",
+                "div_growth": "高股息+基本面成长"}.get(selection_method, "价值选股")
     print(f"  选股策略：{_sm_name}")
     if selection_method == "value":
         print(f"  价值模式：{value_mode}"
@@ -1275,6 +1522,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
 
     positions    = {}
     _DAY_OHLC.clear()   # 清空 OHLC 日缓存（每次回测独立）
+    _DAY_PCT.clear()    # 清空涨跌幅缓存（div_growth 日规则用）
     cash         = INIT_CAPITAL
     stop_count   = 0
     reduce_count = 0
@@ -1383,6 +1631,36 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                     "shares": pos["shares"], "reason": "pb_take_profit"
                 })
                 print(f"  🟢 止盈 {code}({name})：{td} PB={pb_val:.2f} > 阈值{PB_SELL_THRESHOLD}")
+
+        # ═══ 步骤3c：高股息+基本面成长 · 涨停跑路日规则 ═══
+        #   持仓昨涨停、今未封住涨停 → 当日收盘卖出（视频策略：短线资金抬轿后形态破坏就跑）
+        #   与 run_dividend_growth_monthly.py 独立脚本口径一致（昨/今涨跌幅均由 close/pre_close 计算）
+        if selection_method == "div_growth" and i > 0 and positions:
+            for code in list(positions.keys()):
+                if any(o["ts_code"] == code and o.get("reason") in ("stop_loss", "var_stop", "pb_take_profit")
+                       for o in pending_orders):
+                    continue
+                p_prev = _get_day_pct(code, trade_dates[i - 1])
+                p_cur = _get_day_pct(code, td)
+                if p_prev is None or p_cur is None:
+                    continue
+                _lim = 19.9 if code.startswith("688") else (
+                    19.9 if (code.startswith("300") and int(td) >= 20200824) else 9.9)
+                if p_prev >= _lim - 0.1 and p_cur < _lim - 0.1:
+                    px = get_price(code, td)
+                    if px is None:
+                        continue
+                    pos = positions[code]
+                    name = get_stock_name(code)
+                    proceeds = pos["shares"] * px
+                    fee = calc_fee("sell", px, pos["shares"])
+                    cash += proceeds - fee
+                    print(f"  🟡 涨停跑路 {code}({name})：{td} 昨涨停{p_prev:.1f}%今未封{p_cur:.1f}%，收盘{px:.2f}卖出")
+                    trades.append({
+                        "date": td, "action": "SELL", "code": code, "name": name,
+                        "price": px, "shares": pos["shares"], "reason": "limit_up_break"
+                    })
+                    del positions[code]
 
         # ═══ 步骤4：调仓日决策（仅调仓日执行）═══
         if td not in rebalance_set:

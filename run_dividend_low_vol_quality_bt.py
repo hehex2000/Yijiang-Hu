@@ -411,7 +411,7 @@ def run_legacy_comparison():
     """旧版 A/B/C 对照：OLD / NEW / SOFT（月频等权，沪深300 基准）。保留历史行为。"""
     print(f"红利低波质量复合 滚动回测  [{START} ~ {END}]  池={STOCK_POOL}  TOP_N={TOP_N}")
     print(f"INIT_CAPITAL={INIT_CAPITAL:,.0f}  手续费: 佣金{COMMISSION_RATE:.2%}(最低{COMMISSION_MIN})/"
-          f"印花税{STAMP_DUTY_RATE:.2%}/滑点{SLIPPAGE_RATE:.2%}\n")
+          f"印花税千1→千0.5(2023-08-28起)/滑点{SLIPPAGE_RATE:.2%}\n")
 
     # 预载行情 + 猴子补丁加速
     print(f"[preload] loading {STOCK_POOL} daily closes into memory...")

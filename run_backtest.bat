@@ -258,7 +258,7 @@ echo   [2] 设置回测区间
 echo   [3] 设置选股数量 / 初始资金
 echo   [4] 选择选股策略
 echo   [5] 设置股票池
-echo   [6] 月度调仓回测[价值/红利低波/动量/质量复合·季度]
+echo   [6] 月度调仓回测[价值/红利低波/动量/质量复合/高股息成长]
 echo   [7] 年度调仓[狗股/价值选股/神奇公式/神奇公式v2]
 echo   [8] 短线逆转策略[超跌反弹]
 echo   [9] 网格交易策略[波段收割]
@@ -506,6 +506,7 @@ echo   [2] 红利低波选股[高股息+低波动]
 echo   [3] 动量效应追涨[动量选股]
 echo   [4] 红利低波质量复合[季度调仓]
 echo   [5] MACD择时[逐股DIF^>DEA·无KDJ·跟随全局股票池]
+echo   [6] 高股息+基本面成长[股息率前10%%+PE/PEG/ROE/增长五关·月调仓·涨停跑路]
 echo   [0] 返回主菜单
 echo.
 set MR_ARG=
@@ -517,9 +518,10 @@ set VAR_MDD=15
     set VA_PCT=70
     set VAR_SEL=
     set VA_SEL=
-    set /p MR_METHOD=请选择 (1-5, 0返回):
+    set /p MR_METHOD=请选择 (1-6, 0返回):
 
 if "%MR_METHOD%"=="0" goto :menu
+if "%MR_METHOD%"=="6" goto :mr_dg
 if "%MR_METHOD%"=="2" goto :mr_div
 if "%MR_METHOD%"=="4" goto :mr_divq
 if "%MR_METHOD%"=="5" goto :macd_timing
@@ -533,6 +535,13 @@ goto :mr_after
 set MR_ARG=--selection-method div_low_vol
 echo.
 echo   已选择: 红利低波选股
+goto :mr_after
+
+:mr_dg
+set MR_ARG=--selection-method div_growth
+echo.
+echo   已选择: 高股息+基本面成长[股息率前10%%+PE/PEG/ROE/营收/净利五关]
+echo   说明: 月调仓 + 涨停跑路日规则（昨涨停今未封→当日收盘卖）；无个股止损
 goto :mr_after
 
 :mr_divq
@@ -569,6 +578,7 @@ set VB_ARGS=
 if "%MR_METHOD%"=="2" goto :mr_exec
 if "%MR_METHOD%"=="3" goto :mr_exec
 if "%MR_METHOD%"=="4" goto :mr_exec
+if "%MR_METHOD%"=="6" goto :mr_exec
 set VB_ARGS=%VALUE_ENHANCED% --value-quality-gates %VALUE_QGATES%
 :mr_exec
 REM === VaR 仓位缩放参数（动量/红利低波生效；价值忽略，var-control=0 即关闭）===

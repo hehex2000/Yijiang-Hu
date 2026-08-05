@@ -33,6 +33,8 @@
         v2基线 对照表（v2基线 vs v2+广度，均为本策略自身输出，独立文件无覆盖冲突）。
 """
 import sys, os, sqlite3, bisect
+# 印花税率复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5）
+from run_monthly_rebalance import stamp_duty_rate
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
@@ -710,12 +712,12 @@ def run_backtest_v2(start_date, end_date, top_n=15, industry_cap=2,
         pr = _px_raw(pos, code, last_td, "close")
         if ph is not None:
             rev = pos["shares"] * ph
-            cash_h += rev - max(rev * 0.0002, 5.0) - rev * 0.001
+            cash_h += rev - max(rev * 0.0002, 5.0) - rev * stamp_duty_rate(last_td)
         if pr is not None:
             rev_r = pos["shares_raw"] * pr
-            cash_r += rev_r - max(rev_r * 0.0002, 5.0) - rev_r * 0.001
+            cash_r += rev_r - max(rev_r * 0.0002, 5.0) - rev_r * stamp_duty_rate(last_td)
             rev_i = pos["shares_real"] * pr
-            cash_i += rev_i - max(rev_i * 0.0002, 5.0) - rev_i * 0.001
+            cash_i += rev_i - max(rev_i * 0.0002, 5.0) - rev_i * stamp_duty_rate(last_td)
         del positions[code]
     daily_vals[-1]["value"] = cash_h
     daily_vals[-1]["value_raw"] = cash_r

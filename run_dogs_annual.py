@@ -25,7 +25,7 @@ import numpy as np
 from datetime import datetime
 
 from config import DATA, SELECTION, GLOBAL, DOGS_OF_MARKET, BACKTEST, VALUE_STRATEGY
-from run_monthly_rebalance import compute_reality_discounts
+from run_monthly_rebalance import compute_reality_discounts, stamp_duty_rate
 
 DB_PATH = DATA.get("local_db_path", "D:/tu-shareData/astock_daily.db")
 # 初始【总】资金：默认跟随 config 的 total_capital（与「选股+回测」一致），
@@ -892,7 +892,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
                 # 卖出：扣佣金+印花税，同 sell() 逻辑
                 revenue = pos["shares"] * close
                 fee = max(revenue * 0.0002, 5.0)
-                tax = revenue * 0.001
+                tax = revenue * stamp_duty_rate(trade_dates[-1])
                 net_revenue = revenue - fee - tax
                 cash += net_revenue
                 total_cashout += net_revenue
@@ -900,13 +900,13 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
                 if close_raw:
                     revenue_raw = pos["shares_raw"] * close_raw
                     fee_raw = max(revenue_raw * 0.0002, 5.0)
-                    tax_raw = revenue_raw * 0.001
+                    tax_raw = revenue_raw * stamp_duty_rate(trade_dates[-1])
                     net_revenue_raw = revenue_raw - fee_raw - tax_raw
                     cash_raw += net_revenue_raw
                     # 真实趴账账本：末年平仓回收(用真实轨道股数)
                     revenue_real = pos["shares_real"] * close_raw
                     fee_real = max(revenue_real * 0.0002, 5.0)
-                    tax_real = revenue_real * 0.001
+                    tax_real = revenue_real * stamp_duty_rate(trade_dates[-1])
                     net_revenue_real = revenue_real - fee_real - tax_real
                     cash_idle += net_revenue_real
         positions.clear()

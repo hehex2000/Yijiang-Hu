@@ -694,6 +694,27 @@ STRATEGIES = {
 
     },
 
+    # ── MACD 趋势跟随择时策略（金叉买入·死叉卖出，DIF>DEA 多头区）──
+    # 与 run_macd_timing.py 核心一致，但跑在「已选出的个股」上，接入逐股对比框架。
+    # 全市场 MACD 择时（含指数 MA 门控）请用独立脚本 run_macd_timing.py。
+
+    "macd_timing": {
+
+        "enabled": True,
+
+        "name": "MACD趋势跟随择时策略（金叉买入·死叉卖出）",
+
+        # ── MACD 参数 ──
+        "fast": 12,
+        "slow": 26,
+        "signal": 9,
+
+        # ── 零轴过滤（可选，默认关）──
+        # True=多头区额外要求 DIF>0（更确认的上行，减少假死叉 whipshaw）
+        "zero_line": False,
+
+    },
+
     "turtle": {
 
         "enabled": False,  # ← 禁用简化版，使用完整版

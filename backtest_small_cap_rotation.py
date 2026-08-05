@@ -12,7 +12,7 @@
       层1 单票自买入价回撤>12% → 清仓该股且一段时间内不再买回
       层2 中证2000单日跌幅>6.6% → 清仓全部、当周空仓
       层3 昨涨停今炸板(周二开盘低于昨涨停价) → 清仓保利润
-  · 成本/滑点：佣金万2.5(最低5)+印花千1(卖)；流动性自适应滑点（小盘股顶到上限）
+  · 成本/滑点：佣金万2.5(最低5)+印花千1→千0.5(2023-08-28起,卖)；流动性自适应滑点（小盘股顶到上限）
   · 涨跌停：开盘涨停买不进、开盘跌停卖不出（日线策略只看开盘/收盘，不参考盘中高低）
   · 交易统计：轮动胜率（每笔买卖往返盈亏）
 """
@@ -26,6 +26,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DATA, BACKTEST
+# 印花税率复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5）
+from run_monthly_rebalance import stamp_duty_rate
 
 DB_PATH = DATA.get("local_db_path", "D:/tu-shareData/astock_daily.db")
 
@@ -70,12 +72,13 @@ def name_of(ts_code):
     return nm
 
 
-def trade_cost(side, price, shares):
-    """单笔交易成本（元），不含滑点（滑点已并入成交价）。"""
+def trade_cost(side, price, shares, trade_date=None):
+    """单笔交易成本（元），不含滑点（滑点已并入成交价）。
+    trade_date 省略时按旧税率；传入则按分段印花税率（2023-08-28 起千1→千0.5）。"""
     amt = price * shares
     comm = max(amt * COMMISSION_RATE, COMMISSION_MIN)
     if side == "sell":
-        return comm + amt * STAMP_RATE
+        return comm + amt * stamp_duty_rate(trade_date)
     return comm
 
 
@@ -270,7 +273,7 @@ def run_backtest(
     print(f"  B档成长倾斜: {'开(最小市值桶内 净利润同比>0 优先 + roe 降序)' if growth_tilt else '关'}")
     print(f"  维度3极端波动过滤: {'开(剔除近60日收益率方差最高5%%)' if vol_filter else '关'}")
     print(f"  维度5风格切换: {'开(沪深300连续20日跑赢中证1000→空仓)' if style_switch else '关'}")
-    print(f"  成本: 佣金万2.5(最低5) + 印花税千1(卖)")
+    print(f"  成本: 佣金万2.5(最低5) + 印花税千1→千0.5(2023-08-28起,卖)")
     print(f"  滑点: 流动性自适应 = base{int(BASE_SLIP*1e4)}bp + {int(SLIP_IMPACT*100)}%×参与度, 上限{int(MAX_SLIP*1e4)}bp")
     print(f"  流动性: 选股日均成交额>=3000万; 单票<=当日成交额{int(MAX_PARTICIPATION*100)}%")
     print(f"  无前视: 选股用成交日前一交易日快照")
@@ -403,7 +406,7 @@ def run_backtest(
                     continue
                 slip = get_slippage_rate(code, td, sh * hfq_open)
                 eff = hfq_open * (1 - slip)
-                revenue = sh * eff - trade_cost("sell", eff, sh)
+                revenue = sh * eff - trade_cost("sell", eff, sh, td)
                 cash += revenue
                 record_sell(code, revenue, sh * entry)
                 wk_traded += revenue
@@ -473,7 +476,7 @@ def run_backtest(
                 max_shares = min(max_by_cash, max_by_liq)
                 if max_shares <= 0:
                     continue
-                cost = max_shares * eff + trade_cost("buy", eff, max_shares)
+                cost = max_shares * eff + trade_cost("buy", eff, max_shares, td)
                 if cost > cash:
                     continue
                 positions[code] = {"shares": max_shares, "entry": eff, "entry_date": td}
@@ -526,7 +529,7 @@ def run_backtest(
                 info = positions.pop(code)
                 slip = get_slippage_rate(code, last_td, info["shares"] * close)
                 eff = close * (1 - slip)
-                revenue = info["shares"] * eff - trade_cost("sell", eff, info["shares"])
+                revenue = info["shares"] * eff - trade_cost("sell", eff, info["shares"], last_td)
                 cash += revenue
                 record_sell(code, revenue, info["shares"] * info["entry"])
         if daily_vals:
@@ -1005,7 +1008,7 @@ def emit_text_detail(events, year_groups, metrics, cfg, detail_path):
     L.append(f"  涨停买不进: {metrics.get('n_limit_up_skip', '')}  |  跌停卖不出(续持): {metrics.get('n_limit_down_hold', '')}  |  退市归零: {metrics.get('n_delist', '')}")
     L.append("")
     L.append("  说明: 本明细由 backtest_small_cap_rotation.py 自动导出；价格均为前复权口径，")
-    L.append("        含成本(佣金万2.5/最低5 + 印花税千1)与流动性自适应滑点；无前视(选股用成交日前一交易日快照)。")
+    L.append("        含成本(佣金万2.5/最低5 + 印花税千1→千0.5(2023-08-28起))与流动性自适应滑点；无前视(选股用成交日前一交易日快照)。")
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
