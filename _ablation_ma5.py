@@ -9,7 +9,7 @@
 import io, contextlib
 import run_ma5_swing as m
 
-START, END, POOL, CAP = "20200101", "20260630", "hs300", 1000000
+START, END, POOL, CAP = "20240903", "20260803", "all", 1000000
 
 # (exit_mode, hold_days, label)
 VARIANTS = [

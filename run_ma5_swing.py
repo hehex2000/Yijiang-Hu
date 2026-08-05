@@ -296,6 +296,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                   f"持仓 {len(positions)} 现金 {cash:,.0f}", flush=True)
         # ── 1) 执行昨日决策（今日开盘）──
         # 卖出
+        executed = set()  # 本交易日已实际成交的卖出（用于只清已成交、保留跌停未成交意图）
         for code, kind in list(pend_sells.items()):
             d = data.get(code)
             if d is None or code not in positions:
@@ -304,7 +305,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             if i is None or i >= d["n"]:
                 continue
             if d["is_limit_down_open"][i]:
-                continue  # 跌停封死 → 顺延（次日会重新决策）
+                continue  # 跌停封死 → 卖出意图保留，下一交易日开盘重试
             hfq_open = d["ho"][i]
             pos = positions[code]
             if kind == "full":
@@ -320,6 +321,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 fee = rmb.calc_fee("sell", hfq_open, sh, trade_date=int(td))
             proceeds = sh * hfq_open - fee
             cash += proceeds
+            executed.add(code)   # 标记已实际成交，用于保留跌停未成交的意图
             # 成本拆分
             if not zero_cost:
                 bd = rmb.calc_fee_breakdown("sell", hfq_open, sh, trade_date=int(td))
@@ -339,7 +341,9 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             else:
                 pos["shares"] -= sh
                 aud["n_reduce"] += 1
-        pend_sells = {}
+        # 仅清除已实际成交的卖出；跌停封死导致未成交的意图保留到下一交易日开盘重试，
+        # 修复“清仓信号恰逢跌停→意图被清空→次日反弹站回MA5→counter归零→止损丢失”的漏洞。
+        pend_sells = {c: k for c, k in pend_sells.items() if c not in executed}
 
         # 买入（按放量倍数降序 + code 字典序，容量受限）
         def _buy_key(c):
