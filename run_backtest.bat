@@ -262,7 +262,6 @@ echo   [6] 月度调仓回测[价值/红利低波/动量/质量复合/高股息成长]
 echo   [7] 年度调仓[狗股/价值选股/神奇公式/神奇公式v2]
 echo   [8] 短线逆转策略[超跌反弹]
 echo   [9] 网格交易策略[波段收割]
-echo   [G] 5日均线短线纪律[五句话·T+1·完整成本]
 echo   [A] 动量+网格择时 [方案①·网格作为市场温度计]
 echo   [B] ETF轮动策略[动量轮动·纯国内资产]
 echo   [C] 配对套利[均值回归·多头轮动]
@@ -283,7 +282,6 @@ if "%CHOICE%"=="6" goto :monthly_rebalance
 if "%CHOICE%"=="7" goto :dogs_annual
 if "%CHOICE%"=="8" goto :reversal
 if "%CHOICE%"=="9" goto :grid
-if /i "%CHOICE%"=="G" goto :ma5
 if /i "%CHOICE%"=="A" goto :momentum_grid_timing
 if /i "%CHOICE%"=="B" goto :etf_rotation
 if /i "%CHOICE%"=="C" goto :pairs_trading
@@ -757,24 +755,6 @@ echo   正在运行...
 echo.
 pause
 goto :reversal
-
-:ma5
-cls
-echo.
-echo ================
-echo   5日均线短线纪律策略[五句话·T+1·完整成本]
-echo ================
-echo.
-echo   股票池(跟随全局设置): %STOCK_POOL%
-echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
-echo   规则: 放量大阳线过滤+回踩MA5买点+T+1开盘买+偏离10%%减50%%(限1次)
-echo         +收盘跌破MA5(c=1减50%%/c=3清仓,站回重置)+清仓后20日黑名单
-echo.
-echo   正在运行...
-"venv_ml\Scripts\python.exe" run_ma5_swing.py %BACKTEST_START% %BACKTEST_END% --pool %STOCK_POOL% --capital %TOTAL_CAPITAL% --blacklist-days 20
-echo.
-pause
-goto :ma5
 
 :grid
 cls
