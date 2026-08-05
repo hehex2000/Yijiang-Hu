@@ -16,7 +16,7 @@
 复用：run_macd_regime(_conn/_load_code/_PX/_factor/index_close/_metrics/_yearly/_POOL_INDEX)、
       run_magic_formula(_get_pool_constituents)、run_monthly_rebalance(calc_fee)。
 """
-import sys, os, sqlite3, bisect, argparse, datetime
+import sys, os, sqlite3, bisect, argparse, datetime, time
 import numpy as np
 
 import run_macd_regime as reg
@@ -57,14 +57,70 @@ def default_params():
 
 # ───────────────────────────── 数据层 ─────────────────────────────
 _ST_CACHE = {}
+_BASIC = {}   # code -> (list_date, is_st)；run_backtest 启动时批量加载，避免逐票查库
+
+def _load_basic():
+    """一次性加载 stock_basic 的上市日与ST标记到 _BASIC 字典。"""
+    global _BASIC
+    if _BASIC:
+        return
+    conn = reg._conn()
+    for r in conn.execute("SELECT ts_code, list_date, name FROM stock_basic").fetchall():
+        nm = (r[2] or "") or ""
+        _BASIC[r[0]] = (r[1], "ST" in nm.upper())
+    conn.close()
+
+_DATA_LO = None   # 数据窗口下界(含)；None=全历史（独立诊断用）
+_DATA_HI = None
+_CONN = None       # 复用的数据库连接（避免逐票开连接）
+
+def _get_conn():
+    global _CONN
+    if _CONN is None:
+        _CONN = reg._conn()
+    return _CONN
 
 def _build(code):
-    """为单只股票构建后复权序列与指标数组，返回 dict（按本地日期索引）。"""
+    """为单只股票构建后复权序列与指标数组，返回 dict（按本地日期索引）。
+    若已设置 _DATA_LO/_DATA_HI，则只查询该窗口（回测区间±缓冲），大幅提速。"""
     if code in _ST_CACHE:
         return _ST_CACHE[code]
-    reg._load_code(code)
-    dates, o, h, l, c = reg._PX[code]
-    fd, ff = reg._FAC[code]
+    conn = _get_conn()
+    if _DATA_LO is None:
+        # 全历史路径（兼容独立诊断脚本）
+        reg._load_code(code)
+        dates, o, h, l, c = reg._PX[code]
+        fd, ff = reg._FAC[code]
+        rows = conn.execute(
+            "SELECT CAST(trade_date AS TEXT), vol, amount, pct_chg, pre_close "
+            "FROM daily WHERE ts_code=? ORDER BY trade_date", (code,)).fetchall()
+        if not rows:
+            _ST_CACHE[code] = None
+            return None
+    else:
+        # 窗口路径：单条合并查询 OHLCV，仅回测区间±缓冲（约数百根而非全历史）
+        rows = conn.execute(
+            "SELECT CAST(trade_date AS TEXT), open, high, low, close, vol, amount, pct_chg, pre_close "
+            "FROM daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+            (code, _DATA_LO, _DATA_HI)).fetchall()
+        fr = conn.execute(
+            "SELECT CAST(trade_date AS TEXT), adj_factor FROM adj_factor "
+            "WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date",
+            (code, _DATA_LO, _DATA_HI)).fetchall()
+        if not rows:
+            _ST_CACHE[code] = None
+            return None
+        dates = [r[0] for r in rows]
+        o = np.array([r[1] for r in rows], float)
+        h = np.array([r[2] for r in rows], float)
+        l = np.array([r[3] for r in rows], float)
+        c = np.array([r[4] for r in rows], float)
+        v = np.array([(r[5] or 0.0) for r in rows], float)
+        amt = np.array([(r[6] or 0.0) for r in rows], float)
+        pct = np.array([(r[7] or 0.0) for r in rows], float)
+        prec = np.array([(r[8] or 0.0) for r in rows], float)
+        fd = [r[0] for r in fr]
+        ff = [r[1] for r in fr]
     n = len(dates)
     if n < 30:
         _ST_CACHE[code] = None
@@ -72,16 +128,6 @@ def _build(code):
     dates = np.array(dates)
     o = np.asarray(o, float); h = np.asarray(h, float)
     l = np.asarray(l, float); c = np.asarray(c, float)
-    # 重新取 vol/amount（_PX 不含，单独查，顺序与 _PX 一致）
-    conn = reg._conn()
-    rows = conn.execute(
-        "SELECT CAST(trade_date AS TEXT), vol, amount, pct_chg, pre_close "
-        "FROM daily WHERE ts_code=? ORDER BY trade_date", (code,)).fetchall()
-    conn.close()
-    v = np.array([(r[1] or 0.0) for r in rows], float)
-    amt = np.array([(r[2] or 0.0) for r in rows], float)
-    pct = np.array([(r[3] or 0.0) for r in rows], float)
-    prec = np.array([(r[4] or 0.0) for r in rows], float)
 
     # 复权因子对齐（前向填充）
     fac = np.ones(n)
@@ -165,11 +211,8 @@ def _bench_of(pool):
 def _is_st(code, name_cache):
     if code in name_cache:
         return name_cache[code]
-    conn = reg._conn()
-    r = conn.execute("SELECT name FROM stock_basic WHERE ts_code=?", (code,)).fetchone()
-    conn.close()
-    nm = (r[0] if r else "") or ""
-    st = ("ST" in nm.upper())
+    b = _BASIC.get(code)
+    st = b[1] if b else False
     name_cache[code] = st
     return st
 
@@ -177,7 +220,7 @@ def _is_st(code, name_cache):
 # ───────────────────────────── 主回测 ─────────────────────────────
 def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                  zero_cost=False, **kw):
-    global P_BODY, P_VOL, P_LIMITUP
+    global P_BODY, P_VOL, P_LIMITUP, _DATA_LO, _DATA_HI
     P = default_params()
     P.update(kw)
     P_BODY = P["body_min"]; P_VOL = P["vol_mult"]; P_LIMITUP = P["limit_up_as_body"]
@@ -195,22 +238,36 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
 
     # 上市满 lookback+60 日过滤
     sd = datetime.date(int(start_date[:4]), int(start_date[4:6]), int(start_date[6:8]))
+    # 先批量加载 stock_basic（上市日/ST），供 _listed_before / _is_st 使用
+    _load_basic()
     list_cut = (sd - datetime.timedelta(days=P["lookback"] + 60)).strftime("%Y%m%d")
     universe = [c for c in _universe(pool, trade_dates[0])
                 if _listed_before(c, list_cut)]
     if not universe:
         print("[ERROR] 成分股为空")
+        _DATA_LO = None; _DATA_HI = None
         return None
 
+    # 数据窗口化：只加载回测区间前(lookback+40)日至 end_date，避免全历史逐票查询
+    lo_dt = sd - datetime.timedelta(days=P["lookback"] + 40)
+    _DATA_LO = lo_dt.strftime("%Y%m%d")
+    _DATA_HI = end_date
+
     # 预构建数据（ST/成交额过滤在信号时再做）
+    N_total = len(universe)
     data = {}
-    for code in universe:
+    t0 = time.time()
+    for k, code in enumerate(universe):
         d = _build(code)
         if d is not None:
             data[code] = d
+        if (k + 1) % 200 == 0 or (k + 1) == N_total:
+            print(f"  构建数据... {k+1}/{N_total} ({100*(k+1)//N_total}%)  "
+                  f"用时 {time.time()-t0:.0f}s", flush=True)
     codes = list(data.keys())
     if not codes:
         print("[ERROR] 无可用数据")
+        _DATA_LO = None; _DATA_HI = None
         return None
     N = len(codes)
 
@@ -234,6 +291,9 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
     warm_min = max(20, P["signal_valid"] + 1)
 
     for gi, td in enumerate(trade_dates):
+        if gi % 60 == 0:
+            print(f"  回测进度... {gi}/{len(trade_dates)} ({100*gi//len(trade_dates)}%)  "
+                  f"持仓 {len(positions)} 现金 {cash:,.0f}", flush=True)
         # ── 1) 执行昨日决策（今日开盘）──
         # 卖出
         for code, kind in list(pend_sells.items()):
@@ -423,14 +483,18 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
     if daily_vals:
         daily_vals[-1]["value"] = cash
 
+    _DATA_LO = None; _DATA_HI = None   # 复位，避免影响后续独立诊断调用
+    global _CONN
+    if _CONN is not None:
+        _CONN.close(); _CONN = None
     return _report(daily_vals, trade_dates, capital, idx_code, pool, P, aud, zero_cost, N)
 
 
 def _listed_before(code, cut):
-    conn = reg._conn()
-    r = conn.execute("SELECT list_date FROM stock_basic WHERE ts_code=?", (code,)).fetchone()
-    conn.close()
-    return r and r[0] and r[0] <= cut
+    b = _BASIC.get(code)
+    if b is None:
+        return False
+    return b[0] and b[0] <= cut
 
 
 def _hold_len(buy_date, sell_date, trade_dates):
@@ -502,9 +566,8 @@ def _report(daily_vals, trade_dates, capital, bench, pool, P, aud, zero_cost, N)
         print(f"  印花税合计    : ¥{aud['stamp']:,.0f}  ({aud['stamp']/capital:+.2%})")
         print(f"  滑点合计      : ¥{aud['slip']:,.0f}  ({aud['slip']/capital:+.2%})")
         print(f"  成本总计      : ¥{cost_total:,.0f}  ({cost_total/capital:+.2%})")
-        if aud["gross_profit"] != 0:
-            print(f"  毛收益(零成本): {aud['gross_profit']/capital:+.2%}")
-            print(f"  成本吞噬比例  : {cost_total/max(abs(aud['gross_profit']),1e-9):.1%}  ← 关键")
+        print(f"  成本占终值    : {cost_total/max(vals[-1],1e-9):.2%}")
+        print(f"  (注: 真实零成本收益请用 --zero-cost 单独跑，本行不直接折算)")
     else:
         print("  [零成本模式] 所有费率置 0，用于与完整成本对照量化摩擦代价。")
 
