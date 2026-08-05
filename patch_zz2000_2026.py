@@ -4,6 +4,7 @@
 依赖: tushare, config.DATA.tushare_token
 """
 import sys, os, sqlite3
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tushare as ts
 from config import DATA
@@ -12,7 +13,7 @@ DB_PATH = DATA.get("local_db_path", r"D:\tu-shareData\astock_daily.db")
 TOKEN = DATA.get("tushare_token", "")
 TUSHARE_CODE = "932000.CSI"
 LOCAL_CODE = "932000.SH"
-START, END = "20260101", "20260713"
+START, END = "20260101", datetime.now().strftime("%Y%m%d")
 
 def main():
     if not TOKEN:

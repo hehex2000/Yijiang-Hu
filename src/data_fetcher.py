@@ -143,9 +143,12 @@ class DataFetcher:
         将简单代码格式转换为Tushare格式
         000001 -> 000001.SZ
         600000 -> 600000.SH
+        已带后缀(如 000001.SZ)则原样返回，避免重复拼接成 000001.SZ.SZ
         """
         code = str(code).strip()
-        
+        # 已带交易所后缀，直接返回
+        if code[-3:] in (".SZ", ".SH", ".BJ", ".HK"):
+            return code
         # 判断交易所
         if code.startswith('6'):
             # 上海交易所
@@ -906,10 +909,14 @@ class DataFetcher:
             conn = sqlite3.connect(self.local_db_path)
             
             query = """
-            SELECT trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
-            FROM daily
-            WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ?
-            ORDER BY trade_date
+            SELECT d.trade_date, d.open, d.high, d.low, d.close, d.pre_close,
+                   d.change, d.pct_chg, d.vol, d.amount,
+                   b.turnover_rate, b.turnover_rate_f
+            FROM daily d
+            LEFT JOIN daily_basic b
+              ON d.ts_code = b.ts_code AND d.trade_date = b.trade_date
+            WHERE d.ts_code = ? AND d.trade_date >= ? AND d.trade_date <= ?
+            ORDER BY d.trade_date
             """
             
             df = pd.read_sql_query(query, conn, params=(ts_code, start_date, end_date))
@@ -963,14 +970,23 @@ class DataFetcher:
             # 注意：fina_indicator 表中没有 revenue_yoy (营业收入同比增长率) 字段
             query = """
             SELECT 
-                end_date as '截止日期',
-                ts_code as '代码',
-                roe as '净资产收益率',
-                roa as '总资产报酬率',
-                roic as '投入资本回报率',
-                netprofit_yoy as '净利润同比增长率',
-                op_yoy as '营业利润同比增长率',
-                debt_to_assets as '资产负债率'
+                end_date,
+                ts_code,
+                eps,
+                roe,
+                roa,
+                netprofit_yoy,
+                or_yoy,
+                op_yoy,
+                tr_yoy,
+                debt_to_assets,
+                current_ratio,
+                assets_turn,
+                grossprofit_margin,
+                ocf_to_debt,
+                ocfps,
+                revenue_ps,
+                roic
             FROM fina_indicator
             WHERE ts_code = ?
             ORDER BY end_date DESC
@@ -1010,12 +1026,14 @@ class DataFetcher:
             # 从 daily_basic 表读取最新的估值指标
             query = """
             SELECT 
-                trade_date as '日期',
-                ts_code as '代码',
-                pe as '市盈率',
-                pb as '市净率',
-                ps as '市销率',
-                ps_ttm as '市销率(TTM)',
+                trade_date,
+                ts_code,
+                pe,
+                pb,
+                ps,
+                ps_ttm,
+                dv_ratio,
+                dv_ttm,
                 total_mv as '总市值',
                 circ_mv as '流通市值'
             FROM daily_basic
@@ -1154,10 +1172,37 @@ class DataFetcher:
             logger.error(f"Failed to fetch valuation for {code}: {e}")
             return None
     
-    def get_financial_data(self, code: str) -> Optional[pd.DataFrame]:
+    def get_financial_history(self, code: str, years: int = 3) -> Optional[pd.DataFrame]:
         """
-        获取股票财务指标数据
+        获取股票最近 years 年的财务指标历史（年报+季报），用于 PEG 增长稳定性护栏。
+        按 end_date 降序返回，含 end_date / netprofit_yoy / or_yoy / op_yoy / roe / eps。
+        """
+        try:
+            ts_code = self._convert_code_to_ts_format(code)
+            conn = sqlite3.connect(self.local_db_path)
+            limit = years * 4 + 2
+            query = """
+            SELECT end_date, ts_code, netprofit_yoy, or_yoy, op_yoy, roe, eps
+            FROM fina_indicator
+            WHERE ts_code = ?
+            ORDER BY end_date DESC
+            LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(ts_code, limit))
+            conn.close()
+            if df is not None and len(df) > 0:
+                logger.debug(f"✓ Got financial history for {code} ({len(df)} rows)")
+                return df
+            return None
+        except Exception as e:
+            logger.error(f"Error reading financial history from local DB for {code}: {e}")
+            return None
+
+    def get_financial_data_single(self, code: str) -> Optional[pd.DataFrame]:
+        """
+        获取单只股票财务指标数据（最新一期）
         优先从本地数据库读取，失败后用AkShare/Tushare
+        注意：与批量版 get_financial_data(stock_codes, date) 区分，避免同名覆盖。
         
         Args:
             code: 股票代码

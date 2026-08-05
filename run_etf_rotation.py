@@ -14,7 +14,7 @@ ETF轮动策略 - 国内资产动量轮动
   · 熊市避险：全部标的走弱时自动转入货币基金（华宝添益）
   · 波动率惩罚：使用非年化20日波动率，与动量收益同量级
 
-标的池（20只·分类覆盖）：
+标的池（20只·分类覆盖·不含红利ETF——动量轮动与红利不兼容，另由DCA定投/买入持有覆盖）：
   宽基(9)：沪深300/上证50/中证800/上证指数/中证500/中证1000/创业板/创业板50/科创50
   行业(5)：半导体/新能源车/医药/消费/证券
   跨境(2)：恒生ETF(港股)/纳指ETF(美股)
@@ -31,7 +31,13 @@ import sys, os, argparse, numpy as np, pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── 导入现有工具函数 ──────────────────────────────────────
-from run_monthly_rebalance import get_conn, get_monthly_5th_trading_days, COMMISSION_RATE, COMMISSION_MIN, SLIPPAGE_RATE
+from run_monthly_rebalance import get_conn, get_monthly_5th_trading_days, COMMISSION_RATE, COMMISSION_MIN, SLIPPAGE_RATE, compute_reality_discounts
+
+# ── 折溢价过滤（可选，缺失不影响主流程）────────────────────
+try:
+    from backtest import etf_premium_filter as _epf
+except Exception:
+    _epf = None
 
 # ── 常量 ──────────────────────────────────────────────────
 STAMP_DUTY_RATE_ETF = 0.0       # ETF 免印花税
@@ -76,6 +82,31 @@ ETF_UNIVERSE = [
 
 BENCHMARK_CODE = "510300.SH"   # 基准（沪深300ETF）
 CASH_NAME = "货币基金"          # 现金避险名称
+
+# ── 行业池（--pool industry）─────────────────────────────
+# 12 只 2018 年前上市的行业旗舰 + 科技板块 2 只（2019 起上市，历史不足时自动跳过）
+# 纯行业、不掺宽基/跨境——"钱在板块间搬家"的赛道（行业动量视频灵感）
+INDUSTRY_UNIVERSE = [
+    {"code": "512880.SH", "name": "证券ETF",     "desc": "券商",       "cat": "行业", "layer": "进攻"},
+    {"code": "512660.SH", "name": "军工ETF",     "desc": "国防军工",   "cat": "行业", "layer": "进攻"},
+    {"code": "512800.SH", "name": "银行ETF",     "desc": "银行",       "cat": "行业", "layer": "防守"},
+    {"code": "512400.SH", "name": "有色ETF",     "desc": "有色金属",   "cat": "行业", "layer": "进攻"},
+    {"code": "512200.SH", "name": "房地产ETF",   "desc": "地产",       "cat": "行业", "layer": "进攻"},
+    {"code": "159928.SZ", "name": "消费ETF",     "desc": "大消费",     "cat": "行业", "layer": "防守"},
+    {"code": "512010.SH", "name": "医药ETF",     "desc": "医药生物",   "cat": "行业", "layer": "防守"},
+    {"code": "159930.SZ", "name": "能源ETF",     "desc": "能源",       "cat": "行业", "layer": "防守"},
+    {"code": "512330.SH", "name": "信息技术ETF", "desc": "中证信息",   "cat": "行业", "layer": "进攻"},
+    {"code": "512580.SH", "name": "环保ETF",     "desc": "环保",       "cat": "行业", "layer": "进攻"},
+    {"code": "512070.SH", "name": "证券保险ETF", "desc": "非银金融",   "cat": "行业", "layer": "进攻"},
+    {"code": "512980.SH", "name": "传媒ETF",     "desc": "传媒",       "cat": "行业", "layer": "进攻"},
+    # ── 科技板块（2019 起上市，回测早期数据不足会被自动跳过）──
+    {"code": "515000.SH", "name": "科技ETF",     "desc": "科技龙头",   "cat": "科技", "layer": "进攻"},
+    {"code": "512480.SH", "name": "半导体ETF",   "desc": "芯片半导体", "cat": "科技", "layer": "进攻"},
+    # ── 货币（避险层：全弱时转入）──
+    {"code": "511990.SH", "name": "华宝添益",    "desc": "货币基金",   "cat": "货币", "layer": "避险"},
+]
+
+MIXED_UNIVERSE = ETF_UNIVERSE   # 保留原 20 只混合池引用（--pool mixed 默认）
 
 
 # ── 数据表路由 ────────────────────────────────────────────
@@ -224,6 +255,54 @@ def calc_ma(ts_code, trade_date, period=60):
     return np.mean(closes[:period])
 
 
+def _etf_basket_var(codes, trade_date, conf=0.95, lookback=120, method="hist"):
+    """等权 ETF 篮子的单日 VaR 损失比例（正数小数）；数据不足返回 None
+
+    与 run_monthly_rebalance.estimate_basket_var 同口径，但走 etf_daily 表。
+    """
+    if not codes:
+        return None
+    series = []
+    for code in codes:
+        closes = _query_history(code, trade_date, "close", int(lookback) + 1)
+        if closes and len(closes) >= 2:
+            arr = np.array(closes[::-1], dtype=float)  # 升序
+            r = np.diff(arr) / arr[:-1]
+            series.append(r)
+    if not series:
+        return None
+    n = min(len(s) for s in series)
+    if n < 10:
+        return None
+    basket = np.mean(np.array([s[-n:] for s in series]), axis=0)
+    if method == "param":
+        mu, sigma = basket.mean(), basket.std(ddof=1)
+        z = {0.90: 1.282, 0.95: 1.645, 0.99: 2.326}.get(conf, 1.645)
+        var_ret = mu - z * sigma
+    else:
+        q = max(0.0, min(1.0, 1.0 - conf))
+        var_ret = float(np.quantile(basket, q))
+    loss = -var_ret
+    return float(loss) if loss > 0 else 0.0
+
+
+def _etf_var_invest_ratio(codes, trade_date, var_control, var_maxdd, var_n,
+                          var_lookback=120, var_method="hist"):
+    """VaR 反解投入比例（0~1）。var_control<=0 → 1.0（满仓不缩放）
+
+    持有期VaR = 日VaR×√21（月度调仓）；预算 = 目标回撤/N；比例 = min(1, 预算/持有期VaR)
+    """
+    if not (var_control and var_control > 0) or not codes:
+        return 1.0
+    bvar = _etf_basket_var(codes, trade_date, conf=var_control / 100.0,
+                           lookback=var_lookback, method=var_method)
+    if not bvar or bvar <= 0:
+        return 1.0
+    hold_var = bvar * (21 ** 0.5)
+    risk_budget = (var_maxdd / 100.0) / max(1, var_n)
+    return min(1.0, risk_budget / hold_var)
+
+
 def calc_volatility(ts_code, trade_date, window=20, annualized=True):
     """计算波动率
 
@@ -256,15 +335,18 @@ def get_trade_dates(start_date, end_date):
 
 # ── 打分与选标逻辑 ────────────────────────────────────────
 
-def score_assets(trade_date, method="dual", roc_period=20, ma_period=60):
-    """对 ETF_UNIVERSE 中所有标的打分，返回排序后的列表
+def score_assets(trade_date, method="dual", roc_period=20, ma_period=60, universe=None):
+    """对标的池中所有标的打分，返回排序后的列表
 
+    universe: 标的池列表（默认 ETF_UNIVERSE 混合池）
     返回:
         [ (code, name, score), ... ] 按得分降序
         或 [] 表示全部走弱应空仓
     """
+    if universe is None:
+        universe = ETF_UNIVERSE
     results = []
-    for etf in ETF_UNIVERSE:
+    for etf in universe:
         code = etf["code"]
         # 货币基金不参与打分（作为熊市避险资产单独处理）
         if code == MONEY_FUND_CODE:
@@ -346,13 +428,225 @@ def select_targets(scored_list, method="dual", top_n=2):
     return []
 
 
+# ── 折溢价闸门（ETF专属风控）──────────────────────────────
+#
+# 【实证依据】对本池 2018-2026 共 104 个调仓日、1755 个样本的事件研究：
+#   · 境内ETF 溢价>5%：后20日均值 -6.18%、胜率20%  → 有真实负预测力
+#     但 14/15 样本来自 501018(原油LOF·QDII额度受限)，宽基ETF因做市商
+#     实时套利，91.5% 的样本溢价都在 ±1% 内，根本触发不了阈值。
+#   · 跨境ETF 溢价>3%：后20日均值 +1.16%、胜率53.8% → 无负预测力
+#     纳指ETF的溢价主要反映"境外隔夜已涨、NAV尚未更新"，是动量的代理
+#     而非泡沫。对它设更严阈值会误杀（实测拖累收益，见 --premium-filter 对比）。
+# 【结论】默认 off。仅在池中含申赎受限品种(QDII商品/QDII额度紧张)时建议开启 qdii 模式。
+#
+QDII_LIMITED = {          # 申赎受限 → 套利机制失灵 → 溢价会均值回归
+    "501018.SH": "原油LOF",
+    "513100.SH": "纳指ETF",
+}
+QDII_HARD_THRESHOLD = 0.08   # 受限品种的硬阈值（实证最优区间 8%+）
+MAX_NAV_STALE_DAYS = 7       # 净值滞后超此天数 → 读数不可信 → 放行（不拦截）
+
+# ── rolling 模式参数（推荐）──────────────────────────────
+# 固定阈值的缺陷：QDII额度紧张会让溢价【结构性】抬升（纳指ETF 2026年平均
+# 溢价+5.48%），固定5%线会把它永久屏蔽60%的时间——这不是择时，是误杀。
+# 改用"相对自身过去1年的分位数"，自动区分结构性溢价与情绪泡沫。
+# 实证(N=1741)：P95分位 且 绝对溢价≥2% → 后20日均值 -6.67%、胜率20.8%，
+#               仅命中1.4%的样本；同期纳指ETF在2026年的P90拦截率为0%。
+ROLLING_LOOKBACK = 252       # 分位数回看窗口（约1年）
+ROLLING_MIN_HIST = 60        # 历史观测不足则放行
+ROLLING_PCT = 0.95           # 分位阈值
+ROLLING_MIN_PREM = 0.02      # 同时要求绝对溢价下限，避免低溢价品种被乱拦
+
+
+class PremiumGate:
+    """
+    调仓日折溢价闸门：把高溢价标的从候选中剔除，让 top_n 自动顺延到下一名。
+
+    mode:
+      off     不启用（默认，保证历史回测可复现）
+      uniform 统一硬阈值 5%（不区分跨境）
+      strict  跨境更严（block 3% / 境内 5%）—— 实证偏差，仅供对比
+      qdii    仅对申赎受限品种(QDII_LIMITED)用 8% 硬阈值
+      rolling 自适应：溢价处于自身过去1年 P95 且绝对值≥2% —— 推荐
+
+    溢价基准：统一使用「收盘确认净值 NAV」而非 IOPV(盘中参考净值)。
+      IOPV 在标的停牌 / 交投清淡 / 跨境休市时会失真(沿用旧价)，NAV 为收盘确认值最可靠
+      （依据 同UP主 BV1YP326jE7S《一只ETF同时出现两个价格》）。跨境标的额外用 NAV 滞后
+      天数识别时滞造成的"假溢价拉宽"。
+
+    安全默认：净值缺失 / 滞后过久 / 计价单位不一致 → 一律放行，绝不误杀。
+    """
+
+    def __init__(self, universe, mode="off", conn=None):
+        self.mode = mode
+        self.enabled = (mode != "off") and (_epf is not None)
+        self.nav = {}        # {code: {date: unit_nav}}
+        self.pxdates = {}    # {code: [排序的交易日]}，用于二分找 <=day 的最近价
+        self.px = {}         # {code: {date: close}}
+        self.blocked = []    # [(date, code, name, premium)]
+        self.skipped_nodata = 0
+        if not self.enabled:
+            return
+        c = conn or get_conn()
+        for e in universe:
+            code = e["code"]
+            try:
+                nrows = c.execute(
+                    "SELECT nav_date, unit_nav FROM etf_nav WHERE ts_code=? "
+                    "ORDER BY nav_date", (code,)).fetchall()
+            except Exception:
+                nrows = []
+            self.nav[code] = {str(d): float(v) for d, v in nrows if v and v > 0}
+            try:
+                prows = c.execute(
+                    "SELECT trade_date, close FROM etf_daily WHERE ts_code=? "
+                    "ORDER BY trade_date", (code,)).fetchall()
+            except Exception:
+                prows = []
+            self.px[code] = {str(d): float(v) for d, v in prows if v and v > 0}
+            self.pxdates[code] = sorted(self.px[code])
+        # rolling 模式：预构造【同日配对】的溢价序列，用于滚动分位数
+        self.prem_series = {}   # {code: [(date, prem), ...]}
+        if mode == "rolling":
+            for code in self.px:
+                ser = []
+                navmap = self.nav.get(code, {})
+                for d in self.pxdates[code]:
+                    nav = navmap.get(d)
+                    if not nav or nav <= 0:
+                        continue
+                    p = self.px[code][d]
+                    if p / nav > _epf.PRICE_NAV_RATIO_CAP:
+                        continue        # 货币ETF等计价单位不一致
+                    ser.append((d, (p - nav) / nav))
+                self.prem_series[code] = ser
+
+    def _rolling_pct(self, code, day, prem):
+        """当前溢价在自身过去 ROLLING_LOOKBACK 个观测中的分位；不可得返回 None。"""
+        ser = self.prem_series.get(code) or []
+        lo, hi, pos = 0, len(ser) - 1, -1
+        while lo <= hi:
+            m = (lo + hi) // 2
+            if ser[m][0] <= day:
+                pos = m
+                lo = m + 1
+            else:
+                hi = m - 1
+        if pos < 0:
+            return None
+        hist = [v for _, v in ser[max(0, pos - ROLLING_LOOKBACK):pos]]
+        if len(hist) < ROLLING_MIN_HIST:
+            return None
+        return sum(1 for v in hist if v <= prem) / len(hist)
+
+    def _price_on_or_before(self, code, day):
+        """<= day 的最近交易日及其收盘价 (date, close)；无则 None。
+
+        注意：不能用 get_etf_price()，它会无限回溯 fallback，
+        导致把数月前的价格与当期净值配对，产生虚假溢价。
+        """
+        arr = self.pxdates.get(code) or []
+        lo, hi, best = 0, len(arr) - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if arr[mid] <= day:
+                best = arr[mid]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return (best, self.px[code][best]) if best else None
+
+    def hard_threshold(self, code):
+        """该标的的 block 阈值；返回 None 表示不设限。
+
+        rolling 模式返回绝对溢价下限（真正的判定还要叠加分位数条件）。
+        """
+        if self.mode == "uniform":
+            return _epf.PREMIUM_HARD
+        if self.mode == "strict":
+            extra = _epf.CROSSBORDER_EXTRA if _epf.is_crossborder(code) else 0.0
+            return _epf.PREMIUM_HARD - extra
+        if self.mode == "qdii":
+            return QDII_HARD_THRESHOLD if code in QDII_LIMITED else None
+        if self.mode == "rolling":
+            return ROLLING_MIN_PREM
+        return None
+
+    def check(self, code, day):
+        """
+        返回 (allow: bool, premium: float)。
+        折溢价必须【同一天】的市价与净值配对，否则读数无意义。
+        任何数据不确定的情形都返回 allow=True（宁可不拦，不可误杀）。
+        """
+        if not self.enabled:
+            return True, float("nan")
+        thr = self.hard_threshold(code)
+        if thr is None:
+            return True, float("nan")
+        day = str(day)
+        pr = self._price_on_or_before(code, day)
+        if not pr:
+            self.skipped_nodata += 1
+            return True, float("nan")
+        price_date, price = pr
+        # 价格过于陈旧（该标的行情未更新）→ 放行
+        if _epf.staleness_days(price_date, day) > MAX_NAV_STALE_DAYS:
+            self.skipped_nodata += 1
+            return True, float("nan")
+        # 严格同日净值：找不到就放行，绝不用邻近日期凑
+        nav = self.nav.get(code, {}).get(price_date)
+        if not nav or nav <= 0:
+            self.skipped_nodata += 1
+            return True, float("nan")
+        # 计价单位不一致（如货币ETF 净值1.0/市价100）→ 折溢价无意义
+        if price / nav > _epf.PRICE_NAV_RATIO_CAP:
+            return True, float("nan")
+        prem = (price - nav) / nav
+        if self.mode == "rolling":
+            # 双条件：绝对溢价不低 + 处于自身历史高位（自适应结构性溢价）
+            if prem < ROLLING_MIN_PREM:
+                return True, prem
+            pct = self._rolling_pct(code, price_date, prem)
+            if pct is None:
+                self.skipped_nodata += 1
+                return True, prem
+            return (pct < ROLLING_PCT), prem
+        return (prem < thr), prem
+
+    def filter_scored(self, scored, day, universe, verbose=False):
+        """对打分列表逐个过滤，返回保留下来的列表（顺序不变）。"""
+        if not self.enabled or not scored:
+            return scored
+        kept = []
+        for item in scored:
+            code = item[0]
+            allow, prem = self.check(code, day)
+            if allow:
+                kept.append(item)
+            else:
+                name = next((e["name"] for e in universe if e["code"] == code), code)
+                self.blocked.append((day, code, name, prem))
+                if verbose:
+                    why = (f"处于自身1年P{ROLLING_PCT*100:.0f}高位"
+                           if self.mode == "rolling"
+                           else f"≥ {self.hard_threshold(code):.0%}")
+                    print(f"    [折溢价拦截] {name}({code}) 溢价 {prem:+.2%} {why}"
+                          f" → 剔除候选")
+        return kept
+
+
 # ── 主回测循环 ────────────────────────────────────────────
 
 def run_etf_rotation(start_date="20200101", end_date="20251231",
                      method="dual", roc_period=20, ma_period=60,
                      capital=INITIAL_CAPITAL, verbose=True,
                      top_n=2, switch_threshold=SWITCH_THRESHOLD,
-                     cash_buffer_pct=CASH_BUFFER_PCT):
+                     cash_buffer_pct=CASH_BUFFER_PCT,
+                     pool="mixed",
+                     var_control=0, var_maxdd=15.0, var_n=5,
+                     var_lookback=120, var_method="hist",
+                     interrupt_start=None, interrupt_months=0, interrupt_pct=0.0,
+                     premium_filter="off"):
     """ETF轮动策略主回测
 
     Args:
@@ -370,6 +664,10 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
     Returns:
         dict: 回测结果
     """
+    # ── 标的池选择 ──
+    universe = INDUSTRY_UNIVERSE if pool == "industry" else ETF_UNIVERSE
+    pool_names = {"mixed": "混合池(20只·宽基+行业+跨境+商品)", "industry": "行业池(14只·纯行业+科技)"}
+
     # ── 获取交易日和调仓日 ──
     trade_dates = get_trade_dates(start_date, end_date)
     if len(trade_dates) < 60:
@@ -386,8 +684,11 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         print(f"\n{'=' * 70}")
         print(f"  ETF轮动策略回测")
         print(f"{'=' * 70}")
-        print(f"  标的池：{' | '.join(e['name'] for e in ETF_UNIVERSE)}")
+        print(f"  标的池：{pool_names.get(pool, pool)}")
+        print(f"  成员：{' | '.join(e['name'] for e in universe)}")
         print(f"  调仓方法：{method_names.get(method, method)}")
+        if var_control and var_control > 0:
+            print(f"  VaR仓位缩放：开启 置信{var_control}% | 目标回撤{var_maxdd}% | N={var_n}（未投部分留现金）")
         print(f"  回测区间：{start_date} ~ {end_date}")
         print(f"  初始资金：{capital:,.2f}")
         print(f"  交易日：{len(trade_dates)} 天 | 调仓日：{len(rebalance_dates)} 次")
@@ -398,6 +699,15 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
     positions = {}  # { code: {"shares": int, "buy_price": float} }
     trades = []
     daily_vals = []
+
+    # ── 折溢价闸门（默认 off，不影响历史结果）──
+    gate = PremiumGate(universe, mode=premium_filter)
+    if gate.enabled and verbose:
+        mode_desc = {"uniform": "统一5%硬阈值", "strict": "跨境更严(3%/5%)",
+                     "qdii": f"仅限申赎受限品种({QDII_HARD_THRESHOLD:.0%})",
+                     "rolling": "自适应分位数(P95+abs≥2%)"}
+        print(f"  折溢价过滤：开启 [{premium_filter}] {mode_desc.get(premium_filter, '')}")
+        print()
 
     # ── 逐日循环 ──
     for i, td_str in enumerate(trade_dates):
@@ -410,8 +720,18 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         if td in rebalance_dates:
             # 用前一天收盘价打分
             scored = score_assets(prev_td, method=method,
-                                  roc_period=roc_period, ma_period=ma_period)
+                                  roc_period=roc_period, ma_period=ma_period,
+                                  universe=universe)
+            # 折溢价闸门：剔除高溢价标的，top_n 自动顺延到下一名
+            scored = gate.filter_scored(scored, prev_td, universe, verbose=verbose)
             targets = select_targets(scored, method=method, top_n=top_n)
+
+            # ── VaR 仓位缩放（可选）：按目标篮子历史估 VaR，反解本期投入比例 ──
+            var_ratio = 1.0
+            if var_control and var_control > 0 and targets:
+                var_ratio = _etf_var_invest_ratio(
+                    [c for c, _, _ in targets], prev_td,
+                    var_control, var_maxdd, var_n, var_lookback, var_method)
 
             # ── 最小切换阈值（防抖动）──
             # 当前持仓得分与新目标接近时，不切换，避免临界来回换手
@@ -436,9 +756,10 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                     target_str = ", ".join(f"{n}({w:.0%})" for _, n, w in targets)
                 else:
                     target_str = f"{CASH_NAME}(避险)"
-                prot_names = [next((e["name"] for e in ETF_UNIVERSE if e["code"] == p), p) for p in protected]
+                prot_names = [next((e["name"] for e in universe if e["code"] == p), p) for p in protected]
                 prot_str = f" | 保留={','.join(prot_names)}" if protected else ""
-                print(f"  调仓日 {td}：得分前三={score_str} | 目标={target_str}{prot_str}")
+                var_str = f" | VaR投入{var_ratio:.0%}" if (var_control and var_control > 0 and targets and var_ratio < 1.0) else ""
+                print(f"  调仓日 {td}：得分前三={score_str} | 目标={target_str}{prot_str}{var_str}")
 
             # ── 卖出不在目标中的旧持仓（跳过protected和货币基金）──
             for code in list(positions.keys()):
@@ -456,11 +777,11 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                 cash += proceeds - fee
                 trades.append({
                     "date": td, "action": "SELL", "code": code,
-                    "name": next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code),
+                    "name": next((e["name"] for e in universe if e["code"] == code), code),
                     "price": open_price, "shares": pos["shares"], "reason": "rotation"
                 })
                 if verbose:
-                    etf_name = next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code)
+                    etf_name = next((e["name"] for e in universe if e["code"] == code), code)
                     print(f"    → 卖出 {etf_name}：{pos['shares']}份 @ {open_price:.3f}")
                 del positions[code]
 
@@ -468,7 +789,8 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
             if targets:
                 new_to_buy = [(c, n, w) for c, n, w in targets if c not in positions]
                 if new_to_buy:
-                    investable = cash * (1 - cash_buffer_pct)
+                    # VaR 缩放：现金缓冲后再乘投入比例，未投部分留现金（凶策略同款口径）
+                    investable = cash * (1 - cash_buffer_pct) * var_ratio
                     cash_per_target = investable / len(new_to_buy)
                     for code, name, weight in new_to_buy:
                         open_price = get_etf_open(code, td)
@@ -506,7 +828,7 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                             if cost + fee <= cash:
                                 cash -= cost + fee
                                 positions[MONEY_FUND_CODE] = {"shares": max_shares, "buy_price": open_price}
-                                mf_name = next((e["name"] for e in ETF_UNIVERSE if e["code"] == MONEY_FUND_CODE), CASH_NAME)
+                                mf_name = next((e["name"] for e in universe if e["code"] == MONEY_FUND_CODE), CASH_NAME)
                                 trades.append({
                                     "date": td, "action": "BUY", "code": MONEY_FUND_CODE,
                                     "name": mf_name, "price": open_price,
@@ -535,7 +857,7 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                 cash += proceeds - fee
                 trades.append({
                     "date": last_date, "action": "SELL", "code": code,
-                    "name": next((e["name"] for e in ETF_UNIVERSE if e["code"] == code), code),
+                    "name": next((e["name"] for e in universe if e["code"] == code), code),
                     "price": price, "shares": pos["shares"], "reason": "backtest_end"
                 })
                 del positions[code]
@@ -584,6 +906,34 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
     print(f"  基准（沪深300）涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
 
+    # ── 现实折扣三件套（扣通胀 / 定投拖累 / 中断模拟）──
+    disc = compute_reality_discounts(
+        daily_vals, capital,
+        interrupt_start=interrupt_start,
+        interrupt_months=interrupt_months,
+        interrupt_pct=interrupt_pct,
+    )
+    if "real_total_return" in disc:
+        print(f"  ── 现实折扣（预期管理，不改收益计算）──")
+        print(f"  扣通胀真实总收益：{disc['real_total_return']:+.2f}% ｜ 真实年化：{disc['real_annual_return']:+.2f}%")
+    if "dca_drag_pct" in disc:
+        print(f"  定投对比(DCA)：一次性建仓较分12月定投 {disc['dca_drag_pct']:+.2f}%"
+              f"（正=一次性占优·负=定投占优）｜ 终值 一次性 {disc['dca_lump_final']:,.0f} / 定投 {disc['dca_dca_final']:,.0f}")
+    if "interrupt_loss_pct" in disc:
+        print(f"  中断模拟：{interrupt_start}起撤{interrupt_pct*100:.0f}%持有{interrupt_months}月，"
+              f"终值损失 {disc['interrupt_loss_pct']:+.2f}%（终值 {disc['interrupt_final']:,.0f}）")
+
+    # ── VaR 报告行（开启 VaR 缩放时输出实际权益曲线的风险水平）──
+    if var_control and var_control > 0:
+        try:
+            from run_monthly_rebalance import equity_curve_var
+            _ev = equity_curve_var([d["value"] for d in daily_vals],
+                                   capital=final_value, conf_levels=(0.95, 0.99), method="hist")
+            print(f"  VaR(95%)单日：{_ev[0.95]['hist_loss']*100:.2f}% | "
+                  f"VaR(99%)单日：{_ev[0.99]['hist_loss']*100:.2f}%（历史法·实际权益曲线）")
+        except Exception:
+            pass
+
     return {
         "total_return": total_return,
         "annual_return": annual_return,
@@ -592,6 +942,10 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         "trades": len(trades),
         "idx_return": idx_return,
         "final_value": final_value,
+        "pool": pool,
+        "var_control": var_control,
+        "premium_filter": premium_filter,
+        "premium_blocked": list(gate.blocked),
     }
 
 
@@ -604,6 +958,15 @@ if __name__ == "__main__":
     parser.add_argument("--method", default="dual",
                         choices=["single", "dual", "ma_filter"],
                         help="调仓方法（默认 dual=双动量法）")
+    parser.add_argument("--pool", default="mixed",
+                        choices=["mixed", "industry"],
+                        help="标的池：mixed=原20只混合池（默认）| industry=行业池14只(12行业+2科技)")
+    parser.add_argument("--var-control", type=int, default=0,
+                        help="VaR仓位缩放置信度：0=关闭（默认）| 95 | 99")
+    parser.add_argument("--var-maxdd", type=float, default=15.0,
+                        help="VaR目标最大回撤上限%%（默认15）")
+    parser.add_argument("--var-n", type=int, default=5,
+                        help="回撤预算分摊系数N（默认5）")
     parser.add_argument("--roc-period", type=int, default=20, help="ROC计算周期（默认20）")
     parser.add_argument("--ma-period", type=int, default=60, help="MA计算周期（默认60）")
     parser.add_argument("--capital", type=int, default=INITIAL_CAPITAL, help="初始资金（默认100000）")
@@ -612,7 +975,18 @@ if __name__ == "__main__":
                         help=f"最小切换阈值（默认{SWITCH_THRESHOLD}，防抖动）")
     parser.add_argument("--cash-buffer", type=float, default=CASH_BUFFER_PCT,
                         help=f"现金缓冲比例（默认{CASH_BUFFER_PCT}）")
+    parser.add_argument("--premium-filter", type=str, default="off",
+                        choices=["off", "uniform", "strict", "qdii", "rolling"],
+                        help="ETF折溢价过滤：off=关(默认) | uniform=统一5%% | "
+                             "strict=跨境更严(3%%/5%%) | qdii=仅申赎受限品种8%% | "
+                             "rolling=自适应分位数(P95+绝对值≥2%%，推荐)")
     parser.add_argument("--quiet", action="store_true", help="静默模式")
+    parser.add_argument("--interrupt-start", type=str, default=None,
+                        help="现实折扣-中断模拟：从 YYYYMM 起撤出部分资金（配合 --interrupt-months/--interrupt-pct）")
+    parser.add_argument("--interrupt-months", type=int, default=0,
+                        help="中断模拟持续月数（默认0=关闭）")
+    parser.add_argument("--interrupt-pct", type=float, default=0.0,
+                        help="中断模拟撤出比例(0~1，如 0.5=撤一半)，默认0")
     args = parser.parse_args()
 
     run_etf_rotation(
@@ -626,4 +1000,12 @@ if __name__ == "__main__":
         top_n=args.top_n,
         switch_threshold=args.switch_threshold,
         cash_buffer_pct=args.cash_buffer,
+        pool=args.pool,
+        var_control=args.var_control,
+        var_maxdd=args.var_maxdd,
+        var_n=args.var_n,
+        interrupt_start=args.interrupt_start,
+        interrupt_months=args.interrupt_months,
+        interrupt_pct=args.interrupt_pct,
+        premium_filter=args.premium_filter,
     )

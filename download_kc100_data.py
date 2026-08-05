@@ -11,6 +11,7 @@
 依赖: tushare(1.4.29), config.DATA.tushare_token
 """
 import sys, os, argparse, sqlite3, time
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
@@ -78,7 +79,7 @@ def download_daily(pro, start, end):
 def main():
     ap = argparse.ArgumentParser(description="回补 科创100 日行情(index_daily)")
     ap.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
-    ap.add_argument("--end", default="20260706", help="结束日期 YYYYMMDD")
+    ap.add_argument("--end", default=datetime.now().strftime("%Y%m%d"), help="结束日期 YYYYMMDD(默认今天)")
     args = ap.parse_args()
     pro = get_pro()
     download_daily(pro, args.start, args.end)

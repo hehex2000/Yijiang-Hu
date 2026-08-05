@@ -315,6 +315,57 @@ def calculate_max_drawdown(portfolio_values):
     return max_dd
 
 
+def calculate_var(return_series, conf_levels=(0.95, 0.99), capital=None, method="both"):
+    """
+    计算风险价值 VaR（参数法 + 历史法），用于「前瞻风险」报告。
+
+    return_series : 周期收益率序列（小数，0.01=1%）；也可直接传资产净值序列
+                    （值常 >>1，会自动差分转收益率）。
+    conf_levels   : 置信水平，默认 (0.95, 0.99)
+    capital       : 当前组合市值（换算金额用）；None 则只返回百分比
+    method        : 'param' | 'hist' | 'both'
+
+    返回 dict：{
+        0.95: {'param_loss','hist_loss','param_amt','hist_amt','param_ret','hist_ret'},
+        0.99: {...}
+    }
+    说明：
+      - 参数法（正态假设）：分位收益率 = μ - z·σ，z=1.645(95%)/2.326(99%)；
+        损失幅度 = max(0, -(μ - z·σ))。
+      - 历史法（经验分位，抗肥尾）：直接取 (1-c) 分位收益率，损失=其负值。
+      注意：VaR 只覆盖「正常行情」，尾部极端风险(黑天鹅)需另配硬止损。
+    """
+    rs = np.asarray(return_series, dtype=float)
+    if rs.ndim == 1 and len(rs) > 1 and np.max(np.abs(rs)) > 5:
+        # 传入的是净值序列 → 转收益率
+        rs = np.diff(rs) / rs[:-1]
+    rs = rs[np.isfinite(rs)]
+    if len(rs) < 5:
+        return {c: {"param_loss": 0.0, "hist_loss": 0.0, "param_amt": 0.0,
+                   "hist_amt": 0.0, "param_ret": 0.0, "hist_ret": 0.0} for c in conf_levels}
+    Z = {0.90: 1.282, 0.95: 1.645, 0.99: 2.326}
+    mu = float(np.mean(rs))
+    sigma = float(np.std(rs, ddof=1))
+    out = {}
+    for c in conf_levels:
+        z = Z.get(c, 1.645)
+        param_ret = mu - z * sigma
+        param_loss = max(0.0, -param_ret)
+        if method in ("hist", "both"):
+            q = max(0.0, min(1.0, 1.0 - c))
+            hist_ret = float(np.quantile(rs, q))
+        else:
+            hist_ret = param_ret
+        hist_loss = max(0.0, -hist_ret)
+        out[c] = {
+            "param_ret": param_ret, "hist_ret": hist_ret,
+            "param_loss": param_loss, "hist_loss": hist_loss,
+            "param_amt": (param_loss * capital) if capital else 0.0,
+            "hist_amt": (hist_loss * capital) if capital else 0.0,
+        }
+    return out
+
+
 def _norm_date(d):
     """把各种日期格式（int 20220104 / str '2022-01-04' / Timestamp）归一化为 YYYY-MM-DD"""
     if d is None:
@@ -543,67 +594,6 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
         dates.append(df.iloc[i]["trade_date"])
     
     # 循环结束后计算最终收益率和最大回撤
-    final = portfolio_values[-1] if portfolio_values else capital
-    ret = (final / capital - 1) * 100
-    max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
-
-    return ret, trade_records, max_dd, (pk, tr)
-
-
-def backtest_macd_kdj(df, capital, cfg, start_idx=0):
-    """MACD金叉+KDJ超卖买入"""
-    fast, slow, sig = cfg.get("fast", 12), cfg.get("slow", 26), cfg.get("signal", 9)
-    kp = cfg.get("kdj_period", 9)
-    tp, sl = cfg.get("take_profit", 0.50), cfg.get("stop_loss", 0.15)
-    close = df["close"].values
-    s = df["close"]
-    n = len(close)
-    if n < 35:
-        return None, 0, 0.0
-
-    dif = ema(s, fast) - ema(s, slow)
-    dea = ema(dif, sig)
-    hist = (dif - dea).values
-
-    low_n, high_n = s.rolling(kp).min(), s.rolling(kp).max()
-    rsv = (s - low_n) / (high_n - low_n + 1e-10) * 100
-    k = ema(rsv, 3)
-    d = ema(k, 3)
-    j_vals = (3*k - 2*d).values
-    k_vals, d_vals = k.values, d.values
-
-    cash, pos, cost = capital, 0, 0.0
-    trade_records = []
-    portfolio_values = []
-    dates = []
-    
-    for i in range(n):
-        if i < start_idx:
-            portfolio_values.append(capital)
-            dates.append(df.iloc[i]["trade_date"])
-            continue
-        p = close[i]
-        if pos == 0 and i >= 34:
-            macd_gold = (hist[i-1] <= 0 < hist[i]) or (dif.iloc[i] > dea.iloc[i] and dif.iloc[i-1] <= dea.iloc[i-1])
-            kdj_low = j_vals[i] < 30 and k_vals[i] > d_vals[i]
-            if macd_gold or kdj_low:
-                amt = cash * 0.5
-                pos = int(amt / p / 100) * 100
-                if pos > 0:
-                    cash -= pos * p * 1.0002
-                    cost = p
-                    trade_records.append({"action": "BUY", "price": p, "shares": pos})
-        elif pos > 0 and i >= 34:
-            macd_dead = (hist[i-1] >= 0 > hist[i]) or (dif.iloc[i] < dea.iloc[i] and dif.iloc[i-1] >= dea.iloc[i-1])
-            kdj_high = j_vals[i] > 80
-            if macd_dead or kdj_high or p > cost * (1+tp) or p < cost * (1-sl):
-                cash += pos * p * 0.9988
-                trade_records.append({"action": "SELL", "price": p, "shares": pos})
-                pos, cost = 0, 0.0
-        
-        portfolio_values.append(cash + pos * p)
-        dates.append(df.iloc[i]["trade_date"])
-    
     final = portfolio_values[-1] if portfolio_values else capital
     ret = (final / capital - 1) * 100
     max_dd, pk, tr = max_drawdown_with_dates(portfolio_values, dates, start_idx)
@@ -1753,7 +1743,6 @@ def run_backtest(stocks):
     strategy_funcs = {
         "buy_hold": (backtest_buy_hold, 0),
         "rsi": (backtest_rsi, 0),
-        "macd_kdj": (backtest_macd_kdj, 0),
         "bollinger": (backtest_bollinger, 0),
         "turtle": (backtest_turtle, 0),
         "rsi_trend": (backtest_rsi_trend, 0),
@@ -1962,9 +1951,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", "-s",
         type=str,
-        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance", "sc_rotation", "weekly"],
+        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance", "sc_rotation", "dca_etf", "macd_regime"],
         default=None,
-        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓) / sc_rotation(小市值轮动) / weekly(周度四因子·高股息+高波动·周度调仓)"
+        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓) / sc_rotation(小市值轮动) / dca_etf(ETF定投·单产品/宽基篮子·月/周)"
     )
     parser.add_argument(
         "--start-date", type=str, default=None,
@@ -2020,13 +2009,84 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--selection-method", type=str, default="value",
-        choices=["value", "div_low_vol", "momentum"],
-        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨)"
+        choices=["value", "div_low_vol", "momentum", "div_low_vol_quality"],
+        help="月度调仓的选股策略: value(价值) / div_low_vol(红利低波) / momentum(动量追涨) / div_low_vol_quality(红利低波质量复合·季度调仓)"
+    )
+    parser.add_argument(
+        "--dlvq-mode", type=str, default="official_compact",
+        choices=["official", "official_improved", "official_compact"],
+        help="div_low_vol_quality 的模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)"
+    )
+    parser.add_argument(
+        "--var-stop", action="store_true",
+        help="启用 VAR 动态止损（动量月度同款 ATR 追踪：跌破[最高收-倍数×ATR]次日开盘卖；默认关）"
+    )
+    parser.add_argument(
+        "--atr-mult", type=float, default=2.0,
+        help="VAR动态止损的 ATR 倍数（默认2.0，与动量月度一致）"
+    )
+    parser.add_argument(
+        "--atr-cooling", type=int, default=5,
+        help="VAR动态止损的买入后冷静期交易日数（默认5，期内不触发止损）"
+    )
+    parser.add_argument(
+        "--leverage-filter", action="store_true",
+        help="启用杠杆因子风控过滤（产权比率一票否决+利息保障倍数；默认关）"
+    )
+    parser.add_argument(
+        "--de-ratio-exclude-pct", type=float, default=5.0,
+        help="杠杆过滤：产权比率最高的百分之多少被剔除（默认5%%）"
+    )
+    parser.add_argument(
+        "--icover-min", type=float, default=3.0,
+        help="杠杆过滤：利息保障倍数最小值（默认3倍；<=0不启用）"
+    )
+    parser.add_argument(
+        "--div-quality-filter", action="store_true",
+        help="启用红利质量三因子过滤（连续分红年数+分红现金覆盖+分红增长；默认关，仅红利低波生效）"
+    )
+    parser.add_argument(
+        "--div-years-min", type=int, default=3,
+        help="红利质量：要求连续分红年数下限（默认3年；<=0不启用）"
+    )
+    parser.add_argument(
+        "--div-growth-min", type=float, default=None,
+        help="红利质量：分红增长CAGR下限（小数，如0.05=5%%；默认None=随--div-quality-filter启用后按0%%要求不萎缩）"
+    )
+    parser.add_argument(
+        "--dq-ocf", action="store_true",
+        help="红利质量：仅启用「稳② 经营现金流覆盖分红」单维度（自动关闭连续分红年数/分红增长），用于隔离验证分红现金流维度本身是否有用"
     )
     parser.add_argument(
         "--dogs-strategy", type=str, default="dogs",
-        choices=["dogs", "value", "magic"],
-        help="年度调仓的子策略: dogs(狗股·高股息+低PB) / value(价值选股·破净+ROE+现金流) / magic(神奇公式·ROC+EY双排名)"
+        choices=["dogs", "value", "magic", "ep", "ep_obv"],
+        help="年度调仓的子策略: dogs(狗股·高股息+低PB) / value(价值选股·破净+ROE+现金流) / magic(神奇公式·ROC+EY双排名) / ep(EP行业中性·低PE) / ep_obv(EP+OBV吸筹过滤)"
+    )
+    parser.add_argument(
+        "--value-mode", type=str, default="pobreak",
+        choices=["pobreak", "pure_bm"],
+        help="价值选股模式(配合 --source value / monthly_rebalance value / dogs_annual value): "
+             "pobreak=破净价值(PB<1+ROE质量) / pure_bm=放宽破净·全市场BM前N%%门槛(让中性化/分位真正区分)"
+    )
+    parser.add_argument(
+        "--price-mode", type=str, default="dual",
+        choices=["dual", "hfq", "raw"],
+        help="年度调仓(dogs_annual)价格口径: dual=双轨同时算后复权+原始价(默认,一次出两套结果) / "
+             "hfq=仅后复权(含分红再投) / raw=仅原始价(不含分红,用于看纯选股α)"
+    )
+    parser.add_argument(
+        "--value-size-neutral", action="store_true",
+        help="价值选股: 市值中性化(对BM回归掉市值,取残差作纯价值得分)"
+    )
+    parser.add_argument(
+        "--value-pct", type=float, default=None,
+        help="价值选股: BM分位筛选(如0.3=全市场BM前30%%,Fama-French前20-30%%口径)"
+    )
+    parser.add_argument(
+        "--value-quality-gates", type=str, default="on",
+        choices=["on", "off"],
+        help="价值选股: 四道质量门槛(②盈余质量ocfps/eps ③杠杆debt+ocf_to_debt ④应收周转 ⑤估值纵向分位) "
+             "on=按config阈值启用(默认) / off=全部关闭(回退到仅破净+ROE, 用于对照)"
     )
     parser.add_argument(
         "--hold-count", type=int, default=None,
@@ -2038,11 +2098,27 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--stop-loss", action="store_true",
-        help="小市值轮动: 开启三层止损(单票-12% / 中证2000单日-6.6% / 昨涨停今炸板)"
+        help="小市值轮动: 开启三层止损(单票-12%% / 中证2000单日-6.6%% / 昨涨停今炸板)"
     )
     parser.add_argument(
         "--sc-fundamental", action="store_true",
         help="小市值轮动: 开启基本面过滤(最近年报 净利润>0 且 营收>5亿)"
+    )
+    parser.add_argument(
+        "--sc-quality-filter", action="store_true",
+        help="小市值轮动(A档): 质量门禁 roe>0 & 净资产>0 & 负债率<70%% & 经营现金流>0，避雷提质"
+    )
+    parser.add_argument(
+        "--sc-growth-tilt", action="store_true",
+        help="小市值轮动(B档): 成长倾斜，最小市值桶内优先 净利润同比>0 且 高roe，size为底+成长增强"
+    )
+    parser.add_argument(
+        "--sc-vol-filter", action="store_true",
+        help="小市值轮动(维度3): 极端波动过滤，剔除近60日收益率方差最高5%%的票(波动特别极端→伪超额)"
+    )
+    parser.add_argument(
+        "--sc-style-switch", action="store_true",
+        help="小市值轮动(维度5): 风格切换，沪深300连续20个周二跑赢中证1000→当周空仓(小市值阶段性失效避险)"
     )
     parser.add_argument(
         "--exclude-delisted", action="store_true",
@@ -2054,8 +2130,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sc-mode", type=str, default="single",
-        choices=["single", "compare", "sensitivity"],
-        help="小市值轮动运行模式: single(单次) / compare(含退市vs剔除退市对照) / sensitivity(持仓数×流动性网格)"
+        choices=["single", "compare", "sensitivity", "size_quintile"],
+        help="小市值轮动运行模式: single(单次) / compare(含退市vs剔除退市对照) / sensitivity(持仓数×流动性网格) / size_quintile(维度2·市值分位小/中/大桶对照)"
     )
     parser.add_argument(
         "--hold-grid", default="5,7,10,15",
@@ -2069,6 +2145,71 @@ if __name__ == "__main__":
         "--sc-pool-mode", type=str, default="zz2000",
         choices=["cyb", "zz2000", "zz1000"],
         help="小市值轮动选股宇宙: cyb(纯创业板) / zz2000(中证2000风格·含微盘尾) / zz1000(中证1000风格·剔除微盘尾)"
+    )
+    parser.add_argument(
+        "--sc-bucket", type=str, default=None,
+        choices=["small", "mid", "large"],
+        help="小市值轮动·市值分位桶(单独跑某一档): small(最小N只) / mid(宇宙40%%分位档) / large(宇宙最大N只)。仅 single 模式生效，size_quintile 模式忽略(自身跑三桶)"
+    )
+    parser.add_argument(
+        "--sc-no-html", action="store_true",
+        help="小市值轮动(single模式)·不生成HTML净值曲线报告(默认会同时生成明细+HTML)"
+    )
+    parser.add_argument(
+        "--sc-no-detail", action="store_true",
+        help="小市值轮动(single模式)·不导出文本+CSV回测明细(默认会同时生成明细+HTML)"
+    )
+    # ── 定投 ETF（dca_etf）专用参数 ──
+    parser.add_argument(
+        "--dca-freq", type=str, default="both",
+        choices=["monthly", "weekly", "both"],
+        help="定投频率: monthly(每月首交易日) / weekly(每周首交易日) / both(两者+对比)"
+    )
+    parser.add_argument(
+        "--dca-code", type=str, default="510300.SH",
+        help="定投标的 ETF：单代码 / 逗号分隔篮子(如 510300.SH,510500.SH,159915.SZ) / 预设名(core6,core4,core3,large3,all_legacy,a500_4)"
+    )
+    parser.add_argument(
+        "--dca-preset", type=str, default=None,
+        help="预设篮子名(等效于 --dca-code 设同名)：core6/core4/core3/large3/all_legacy/a500_4"
+    )
+    parser.add_argument(
+        "--dca-monthly", type=float, default=4000.0,
+        help="月度定投每期金额(元)，默认 4000"
+    )
+    parser.add_argument(
+        "--dca-weekly", type=float, default=1000.0,
+        help="周度定投每期金额(元)，默认 1000"
+    )
+    parser.add_argument(
+        "--dca-mode", type=str, default="plain", choices=["plain", "smart"],
+        help="定投模式: plain(普通纪律定投) / smart(均线增强·5周/20周线操作法)"
+    )
+    # ── VaR 仓位缩放（动量轮动专用，复现「设计即锁回撤」）──
+    parser.add_argument(
+        "--var-control", type=int, default=0, choices=[0, 90, 95, 99],
+        help="VaR仓位缩放置信水平: 0=关闭 | 90/95/99=启用(对应分位)"
+    )
+    parser.add_argument(
+        "--var-maxdd", type=float, default=15.0,
+        help="目标最大回撤上限(%%)，用于反解每期风险预算（默认15）"
+    )
+    parser.add_argument(
+        "--var-n", type=int, default=5,
+        help="连续下跌周期数 N（趋势类=5，反转类=3），用于分摊回撤预算（默认5）"
+    )
+    parser.add_argument(
+        "--value-area", type=int, default=0,
+        help="价值区过滤回看天数: 0=关闭 | >0=启用(动量/反转生效，默认0)"
+    )
+    parser.add_argument(
+        "--va-pct", type=float, default=70.0,
+        help="价值区覆盖成交量比例(%%)（默认70）"
+    )
+    parser.add_argument(
+        "--macd-filter", type=str, default=None,
+        choices=["golden", "regime"],
+        help="MACD信号模式(monthly_rebalance div_low_vol择时共用): golden=旧金叉死叉当按钮 | regime=金叉须叠加指数>MA200且非盘整(语境感知)。不指定则按策略默认：逆转=regime，红利低波=golden"
     )
     args = parser.parse_args()
 
@@ -2098,6 +2239,27 @@ if __name__ == "__main__":
             args.capital = 100000
         BACKTEST["total_capital"] = args.capital
         print(f"  [参数] 总初始资金: {args.capital}")
+
+    # ── 价值选股四道质量门槛开关（仅价值相关路径生效）──
+    _value_related = (
+        args.source in ("value", "monthly_rebalance")
+        or (args.source == "dogs_annual" and getattr(args, "dogs_strategy", "") == "value")
+    )
+    if _value_related:
+        if getattr(args, "value_quality_gates", "on") == "off":
+            VALUE_STRATEGY["eq_ocf_eps_min"] = 0
+            VALUE_STRATEGY["lev_debt_to_assets_max"] = 0
+            VALUE_STRATEGY["lev_require_ocf_to_debt_pos"] = False
+            VALUE_STRATEGY["ar_turn_yoy_drop_max"] = 0
+            VALUE_STRATEGY["val_hist_years"] = 0
+            print("  [参数] 价值四道质量门槛: 关闭(仅破净+ROE)")
+        else:
+            print("  [参数] 价值四道质量门槛: 启用"
+                  f"(盈余质量ocfps/eps>={VALUE_STRATEGY.get('eq_ocf_eps_min')}, "
+                  f"负债率<={VALUE_STRATEGY.get('lev_debt_to_assets_max')}%, "
+                  f"应收降幅<={VALUE_STRATEGY.get('ar_turn_yoy_drop_max')}, "
+                  f"PE<=自身{VALUE_STRATEGY.get('val_hist_years')}年"
+                  f"{int(VALUE_STRATEGY.get('val_hist_pe_pct_max',0.5)*100)}%分位)")
 
 
     # 列出可用 CSV 文件
@@ -2166,7 +2328,13 @@ if __name__ == "__main__":
 
     elif args.source == "value":
         # 价值投资选股
-        print(f"\n  价值投资选股模式...")
+        VALUE_STRATEGY["value_mode"] = args.value_mode
+        VALUE_STRATEGY["value_size_neutral"] = args.value_size_neutral
+        VALUE_STRATEGY["value_pct"] = args.value_pct
+        print(f"\n  价值投资选股模式 (模式={args.value_mode}"
+              f"{'·放宽破净·BM分位门槛' if args.value_mode=='pure_bm' else '·破净+ROE质量'}"
+              f" | 市值中性化={'开' if args.value_size_neutral else '关'}"
+              f" | BM分位={('前%.0f%%'%(args.value_pct*100)) if args.value_pct else '关'})...")
         stocks = run_value_selection()
         if stocks is None or len(stocks) == 0:
             print(f"\n  [ERROR] 价值投资选股失败！")
@@ -2238,6 +2406,10 @@ if __name__ == "__main__":
             dogs_strat_name = "神奇公式(Magic Formula·ROC+EY双排名)"
         elif dogs_strat == "value":
             dogs_strat_name = "价值选股(破净+ROE+现金流)"
+        elif dogs_strat == "ep":
+            dogs_strat_name = "EP行业中性(低PE·行业内五分位)"
+        elif dogs_strat == "ep_obv":
+            dogs_strat_name = "EP+OBV吸筹过滤(低PE·OBV净流入)"
         else:
             dogs_strat_name = "狗股策略(高股息+低PB)"
         print(f"\n  {dogs_strat_name} · 年度调仓回测模式...")
@@ -2253,13 +2425,15 @@ if __name__ == "__main__":
             top_n=SELECTION.get("top_n", 5),
             capital=BACKTEST["total_capital"],
             strategy=dogs_strat,
+            value_mode=args.value_mode,
+            price_mode=args.price_mode,
         )
         sys.exit(0)
         
     elif args.source == "monthly_rebalance":
         # 月度调仓回测（直接导入调用，避免子进程输出混乱）
         sel_method = args.selection_method or "value"
-        method_names = {"value": "价值选股", "div_low_vol": "红利低波选股", "momentum": "动量效应追涨"}
+        method_names = {"value": "价值选股", "div_low_vol": "红利低波选股", "momentum": "动量效应追涨", "div_low_vol_quality": "红利低波质量复合(季度调仓)"}
         print(f"\n  月度调仓回测模式...")
         print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
         print(f"  选股策略: {method_names.get(sel_method, sel_method)}")
@@ -2282,24 +2456,104 @@ if __name__ == "__main__":
                 atr_stop_multiple=2.0,
                 skip_recent_months=0,
                 trend_filter_ma=200,
+                var_control=args.var_control,
+                var_maxdd=args.var_maxdd,
+                var_n=args.var_n,
+                value_area=args.value_area,
+                va_pct=args.va_pct,
             )
+        elif sel_method == "div_low_vol_quality":
+            # 红利低波「质量复合」策略：官方编制法实战三档（季度调仓）
+            import run_dividend_low_vol_quality_bt as dlq
+            dlq.START = BACKTEST["start_date"]
+            dlq.END = BACKTEST["end_date"]
+            _dlq_mode = args.dlvq_mode
+            print(f"  {'='*60}")
+            print(f"  ※ 本策略为【季度调仓】：官方编制法(中证红利低波930955口径)，"
+                  f"季频 / 股息率加权；模式={_dlq_mode}")
+            dlq.run_official_backtest(_dlq_mode, capital=args.capital)
         else:
             from run_monthly_rebalance import run_backtest as run_monthly_rebalance_bt
             print(f"  {'='*60}")
+            # 红利质量过滤档位解析：
+            #  --dq-ocf             → 仅稳②(现金流覆盖分红)，关年数/增长
+            #  --div-quality-filter → 全开(年数默认3 / 增长默认0%)；--div-years-min/--div-growth-min 可覆盖
+            #  均未指定             → 全关
+            if args.dq_ocf:
+                _dq_filter = True
+                _dq_years = 0
+                _dq_ocf = True
+                _dq_growth = None
+            elif args.div_quality_filter:
+                _dq_filter = True
+                _dq_years = args.div_years_min
+                _dq_ocf = True
+                _dq_growth = 0.0 if args.div_growth_min is None else args.div_growth_min
+            else:
+                _dq_filter = False
+                _dq_years = args.div_years_min
+                _dq_ocf = True
+                _dq_growth = args.div_growth_min
             run_monthly_rebalance_bt(
                 start_date=BACKTEST["start_date"],
                 end_date=BACKTEST["end_date"],
                 top_n=SELECTION.get("top_n", 5),
                 selection_method=sel_method,
+                value_mode=args.value_mode,
+                value_size_neutral=args.value_size_neutral,
+                value_pct=args.value_pct,
+                # 因子类策略(EP行业中性)月度调仓即退出，关闭个股15%止损；
+                # 价值/红利低波沿用默认 STOP_LOSS 行为。
+                stop_loss_pct=0 if sel_method in ("ep_neutral", "ep_obv") else None,
+                # VAR动态止损（动量月度同款 ATR 追踪）；默认关，仅 --var-stop 时启用
+                var_stop=args.var_stop,
+                atr_mult=args.atr_mult,
+                atr_cooling=args.atr_cooling,
+                # 杠杆因子风控过滤（默认关）
+                leverage_filter=args.leverage_filter,
+                de_ratio_exclude_pct=args.de_ratio_exclude_pct,
+                icover_min=args.icover_min,
+                # 红利质量过滤（档位见调用前解析块）
+                div_quality_filter=_dq_filter,
+                div_years_min=_dq_years,
+                require_ocf_cover=_dq_ocf,
+                div_growth_min=_dq_growth,
+                macd_filter_mode=args.macd_filter,
             )
         sys.exit(0)
         
+    elif args.source == "macd_regime":
+        # MACD 背离感知策略（池选股 + 月度调仓，无 KDJ）
+        # 复用 run_macd_regime.run_strategy（已修复选股 set 哈希随机顺序导致的非确定性 bug；
+        # 消融证明 KDJ-J 确认门反而拖累净值 ~22pp，故 kdj_gate 默认关）。
+        # 与旧的 macd_kdj 择时插件（金叉/KDJ极值当按钮，已退休）无关——本策略是池选股形态。
+        from run_macd_regime import run_strategy as _run_macd_regime
+        # 优先用命令行 --stock-pool（000XXX.SH 或 hs300/zz800 键均可），否则回退 config SELECTION
+        _SP_MAP = {"000300.SH": "hs300", "000905.SH": "zz500",
+                   "000906.SH": "zz800", "000852.SH": "zz1000"}
+        if getattr(args, "stock_pool", None):
+            _pool = _SP_MAP.get(args.stock_pool, args.stock_pool)
+        else:
+            _pool = SELECTION.get("stock_pool", "zz800")
+        _topn = args.top_n if args.top_n else SELECTION.get("top_n", 10)
+        _cap = args.capital if args.capital else BACKTEST.get("total_capital", 100000)
+        print(f"\n  MACD背离感知策略（池选股 + 月度调仓）")
+        print(f"  回测区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}")
+        print(f"  股票池: {_pool} | 持仓: {_topn} | 资金: {_cap:,}")
+        _run_macd_regime(
+            BACKTEST["start_date"], BACKTEST["end_date"],
+            pool=_pool, capital=_cap, top_n=_topn,
+            regime_filter=True, kdj_gate=False,
+        )
+        sys.exit(0)
+
     elif args.source == "sc_rotation":
         # 小市值轮动回测（全市场最小流通市值·中证2000风格宇宙）
         from backtest_small_cap_rotation import (
             run_backtest as sc_run,
             run_survivor_bias_comparison,
             run_sensitivity,
+            run_size_quintile_comparison,
         )
         _capital = args.capital if args.capital is not None else BACKTEST.get("total_capital", 500000)
         _hold = args.hold_count if args.hold_count is not None else 7
@@ -2307,7 +2561,9 @@ if __name__ == "__main__":
         print(f"\n  小市值轮动策略 · 回测")
         print(f"  区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}  | 持仓: {_hold} 只")
         print(f"  总资金: {_capital:,} 元")
-        print(f"  空仓1/4月: {'开' if args.empty_jan_apr else '关'}  | 三层止损: {'开' if args.stop_loss else '关'}")
+        print(f"  空仓1/4月: {'开' if args.empty_jan_apr else '关'}  | 三层止损: {'开' if args.stop_loss else '关'}"
+              f"  | A档质量门禁: {'开' if args.sc_quality_filter else '关'}  | B档成长倾斜: {'开' if args.sc_growth_tilt else '关'}"
+              f"  | 维度3波动过滤: {'开' if args.sc_vol_filter else '关'}  | 维度5风格切换: {'开' if args.sc_style_switch else '关'}")
         print(f"  模式: {_mode}  | 选股宇宙: {args.sc_pool_mode}")
         print(f"  {'='*60}")
         if _mode == "compare":
@@ -2316,6 +2572,7 @@ if __name__ == "__main__":
                 capital=_capital, empty_jan_apr=args.empty_jan_apr,
                 enable_stop_loss=args.stop_loss, fundamental_filter=args.sc_fundamental,
                 pool_mode=args.sc_pool_mode,
+                quality_filter=args.sc_quality_filter, growth_tilt=args.sc_growth_tilt,
             )
         elif _mode == "sensitivity":
             run_sensitivity(
@@ -2325,37 +2582,41 @@ if __name__ == "__main__":
                 hold_grid=[int(x) for x in args.hold_grid.split(",")],
                 liq_grid=[float(x) for x in args.liq_grid.split(",")],
                 pool_mode=args.sc_pool_mode,
+                quality_filter=args.sc_quality_filter, growth_tilt=args.sc_growth_tilt,
+            )
+        elif _mode == "size_quintile":
+            run_size_quintile_comparison(
+                BACKTEST["start_date"], BACKTEST["end_date"], hold_count=_hold,
+                capital=_capital, pool_mode=args.sc_pool_mode,
             )
         else:
+            # 市值分位桶：small/mid/large → (order, offset, label)
+            _BUCKET_MAP = {
+                "small": ("ASC", 0, "小市值桶(最小N只)"),
+                "mid":   ("ASC", 800, "中市值桶(宇宙40%分位档)"),
+                "large": ("DESC", 0, "大市值桶(宇宙最大N只)"),
+            }
+            _b_order, _b_offset, _b_label = ("ASC", 0, None)
+            if args.sc_bucket:
+                _b_order, _b_offset, _b_label = _BUCKET_MAP[args.sc_bucket]
+            _sc_detail_path = None
+            if not args.sc_no_detail:
+                _bn = f"_{args.sc_bucket}" if args.sc_bucket else ""
+                _sc_detail_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "outputs",
+                    f"sc_detail{_bn}_{args.sc_pool_mode}_{_hold}_{BACKTEST['start_date']}_{BACKTEST['end_date']}")
             sc_run(
                 BACKTEST["start_date"], BACKTEST["end_date"], hold_count=_hold,
                 capital=_capital, empty_jan_apr=args.empty_jan_apr,
                 enable_stop_loss=args.stop_loss, fundamental_filter=args.sc_fundamental,
                 exclude_delisted=args.exclude_delisted, min_avg_amount_k=args.min_avg_amount_k,
                 pool_mode=args.sc_pool_mode,
+                quality_filter=args.sc_quality_filter, growth_tilt=args.sc_growth_tilt,
+                vol_filter=args.sc_vol_filter, style_switch=args.sc_style_switch,
+                pool_order=_b_order, pool_offset=_b_offset, bucket_label=_b_label,
+                detail_path=_sc_detail_path, no_html=args.sc_no_html,
+                var_control=args.var_control, var_maxdd=args.var_maxdd, var_n=args.var_n,
             )
-        sys.exit(0)
-
-    elif args.source == "weekly":
-        # 周度四因子选股回测（高股息+高波动·周度调仓）
-        from run_weekly_highdiv_vol import (
-            run_backtest as run_weekly_bt,
-            DIV_PCT, TURN_PCT, DEBT_PCT, SIZE_PCT,
-        )
-        _wcap = args.capital if args.capital is not None else BACKTEST.get("total_capital", 500000)
-        _wtop = SELECTION.get("top_n", 10)
-        print(f"\n  周度四因子选股回测（高股息+高波动·周度调仓）")
-        print(f"  区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}  | 持仓: {_wtop} 只")
-        print(f"  总资金: {_wcap:,} 元")
-        print(f"  因子阈值(默认): 股息前{DIV_PCT}% 换手前{TURN_PCT}% "
-              f"负债最低{DEBT_PCT}% 市值最低{SIZE_PCT}%")
-        print(f"  {'='*60}")
-        run_weekly_bt(
-            start_date=BACKTEST["start_date"],
-            end_date=BACKTEST["end_date"],
-            top_n=_wtop,
-            capital=_wcap,
-        )
         sys.exit(0)
 
     elif args.source == "csv":
@@ -2390,6 +2651,26 @@ if __name__ == "__main__":
         stocks = pd.DataFrame(manual, columns=["code", "name"])
         print(f"\n  使用手动股票池: {len(stocks)} 只")
         run_backtest(stocks)
+        sys.exit(0)
+
+    elif args.source == "dca_etf":
+        # 宽基 ETF 定投（单标的 / 篮子等权，月度 / 周度）+ 一次性投入对比
+        from run_dca_etf import run_both, run_backtest as run_dca_one
+        _sd = BACKTEST["start_date"]
+        _ed = BACKTEST["end_date"]
+        _code = args.dca_preset if args.dca_preset else args.dca_code
+        print(f"\n  宽基 ETF 定投策略（DCA）")
+        print(f"  标的: {_code} | 区间: {_sd} ~ {_ed}")
+        print(f"  月投: ¥{args.dca_monthly:,.0f} | 周投: ¥{args.dca_weekly:,.0f} | 频率: {args.dca_freq} | 模式: {args.dca_mode}")
+        print(f"  {'='*60}")
+        if args.dca_freq == "both":
+            run_both(start_date=_sd, end_date=_ed, codes=_code,
+                     monthly_amount=args.dca_monthly, weekly_amount=args.dca_weekly,
+                     mode=args.dca_mode)
+        else:
+            run_dca_one(start_date=_sd, end_date=_ed, freq=args.dca_freq, codes=_code,
+                        monthly_amount=args.dca_monthly, weekly_amount=args.dca_weekly,
+                        mode=args.dca_mode)
         sys.exit(0)
 
     else:

@@ -23,7 +23,7 @@ from run_monthly_rebalance import (
     get_trade_dates, get_monthly_5th_trading_days,
     get_stock_pool_index, get_stock_name,
     select_momentum_stocks, is_above_ma,
-    INIT_CAPITAL, INDEX_DISPLAY_NAME, calc_win_rate,
+    INIT_CAPITAL, INDEX_DISPLAY_NAME, calc_win_rate, compute_reality_discounts,
 )
 from run_grid_backtest import generate_grid_levels
 
@@ -252,7 +252,8 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
                                    atr_cooling_days=0, trailing_stop_pct=0,
                                    skip_recent_months=1, trend_filter_ma=0,
                                    grid_pct=GRID_PCT, per_grid_cash=PER_GRID_CASH,
-                                   grid_index=DEFAULT_GRID_INDEX):
+                                   grid_index=DEFAULT_GRID_INDEX,
+                                   interrupt_start=None, interrupt_months=0, interrupt_pct=0.0):
     """
     动量策略 + 网格持仓择时回测
 
@@ -601,6 +602,23 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
     print(f"  基准涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
 
+    # ── 现实折扣三件套（扣通胀 / 定投拖累 / 中断模拟）──
+    disc = compute_reality_discounts(
+        daily_vals, INIT_CAPITAL,
+        interrupt_start=interrupt_start,
+        interrupt_months=interrupt_months,
+        interrupt_pct=interrupt_pct,
+    )
+    if "real_total_return" in disc:
+        print(f"  ── 现实折扣（预期管理，不改收益计算）──")
+        print(f"  扣通胀真实总收益：{disc['real_total_return']:+.2f}% ｜ 真实年化：{disc['real_annual_return']:+.2f}%")
+    if "dca_drag_pct" in disc:
+        print(f"  定投对比(DCA)：一次性建仓较分12月定投 {disc['dca_drag_pct']:+.2f}%"
+              f"（正=一次性占优·负=定投占优）｜ 终值 一次性 {disc['dca_lump_final']:,.0f} / 定投 {disc['dca_dca_final']:,.0f}")
+    if "interrupt_loss_pct" in disc:
+        print(f"  中断模拟：{interrupt_start}起撤{interrupt_pct*100:.0f}%持有{interrupt_months}月，"
+              f"终值损失 {disc['interrupt_loss_pct']:+.2f}%（终值 {disc['interrupt_final']:,.0f}）")
+
     # 保存结果
     csv_dir = "data/results/momentum_grid_timing"
     os.makedirs(csv_dir, exist_ok=True)
@@ -648,6 +666,12 @@ if __name__ == "__main__":
     parser.add_argument("--per-grid", type=int, default=PER_GRID_CASH, help="每格金额（默认5000）")
     parser.add_argument("--grid-index", type=str, default=DEFAULT_GRID_INDEX, help="网格参考指数（默认000300.SH）")
     parser.add_argument("--trend-filter", type=int, default=200, help="MA趋势过滤（默认200）")
+    parser.add_argument("--interrupt-start", type=str, default=None,
+                        help="现实折扣-中断模拟：从 YYYYMM 起撤出部分资金（配合 --interrupt-months/--interrupt-pct）")
+    parser.add_argument("--interrupt-months", type=int, default=0,
+                        help="中断模拟持续月数（默认0=关闭）")
+    parser.add_argument("--interrupt-pct", type=float, default=0.0,
+                        help="中断模拟撤出比例(0~1，如 0.5=撤一半)，默认0")
     args = parser.parse_args()
 
     run_momentum_with_grid_timing(
@@ -663,4 +687,7 @@ if __name__ == "__main__":
         grid_pct=args.grid_pct,
         per_grid_cash=args.per_grid,
         grid_index=args.grid_index,
+        interrupt_start=args.interrupt_start,
+        interrupt_months=args.interrupt_months,
+        interrupt_pct=args.interrupt_pct,
     )

@@ -13,24 +13,41 @@ RSI超买超卖 + 布林带双确认择时策略
    - RSI说"涨多了" + 价格还没碰上轨 → 别急着卖（还能涨）
    - RSI和布林带同时指向极端区域 → 信号可信度大幅提升
 
-3. A股参数适配：
-   - RSI周期: 9天（比Wilder默认14更敏感，适合A股震荡节奏）
+3. 参数（已用自有数据完整回测校准，见 run_rsi_bb_dual_ablation.py）：
+   - RSI周期: 9天（非 Wilder 默认14）。
+     注意：事件研究(analyze_rsi_regime.py)显示 RSI(14)<30 的「单笔超额胜率」
+     优于 9 天，但完整策略回测结论相反——9 天信号量约 2×、额外信号均为正期望，
+     净值(+11.09%)显著优于 14 天(+6.44%)。故全策略口径保留 9 天。
    - RSI阈值: 30/70（标准设置）
    - 布林带周期: 20天, 标准差: 2.0
 
 4. 半凯利公式仓位管理
    参考《凯利公式——一个教我们每次买票买多少的数学公式》
+   kelly_win_rate 回填事件研究实测值 0.57（RSI<30 + 布林带下轨确认约 56.7%~61%），
+   回测验证 0.53→0.57 提升净值 +2.88pp。
+
+5. 市场状态门控（regime gate，可选，默认关闭）：
+   - 仅作风控工具。回测显示对「均值回归」策略，门控降低净收益：
+       ma  指数站上 MA200 → 均值 +1.81%（−4.63pp）
+       adx 指数 ADX(14)<25 → 均值 +3.26%（仍低于无门控 +6.44%），
+       但 adx 模式有真实风控价值：均最大回撤 2.99%→2.18%、胜率升至 60.9%。
+   - 若更看重回撤可控而非收益，设 regime_filter=True, regime_mode="adx"。
+   - 用前一日指数状态判定，避免未来函数。
 
 信号基于前一日数据（shift(1)），避免未来函数
 买入/卖出均用次日开盘价执行
 """
+import sqlite3
 import pandas as pd
 import numpy as np
 import talib as ta
-from backtest.base_strategy import BaseStrategy
+from backtest.base_strategy import BaseStrategy, DB_PATH
 from backtest.atr_stop_loss import ATRStopLoss
 from backtest.kelly_sizer import KellySizer
 from loguru import logger
+
+# 指数行情缓存：key=(index_code, ma_window) -> 布尔 Series(指数站上MA)
+_INDEX_CACHE: dict = {}
 
 
 class RsiBbDualStrategyPlugin(BaseStrategy):
@@ -40,11 +57,21 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
         super().__init__("RsiBbDualStrategyPlugin", capital, cfg)
 
         # ── RSI参数 ----
-        self.rsi_period = cfg.get("rsi_period", 9)            # A股适配：9天比14更敏感
+        self.rsi_period = cfg.get("rsi_period", 14)            # Wilder 默认14（实测优于9）
         self.rsi_oversold = cfg.get("rsi_oversold", 30)        # 超卖阈值
         self.rsi_overbought = cfg.get("rsi_overbought", 70)    # 超买阈值
         # RSI中轴：上穿50确认反弹，下穿50确认回落
         self.rsi_center = cfg.get("rsi_center", 50)
+
+        # ── 市场状态门控（regime gate）──
+        self.regime_filter = cfg.get("regime_filter", False)   # 是否启用指数MA门控
+        self.regime_index = cfg.get("regime_index", "000300.SH")  # 判定市场状态用的指数
+        self.regime_ma = int(cfg.get("regime_ma", 200))        # 均线窗口
+        # 门控模式：'ma' = 指数站上MA才做多（趋势策略思路，对均值回归偏严）；
+        #          'adx' = 指数 ADX 低于阈值才做（震荡市思路，更贴合 RSI 均值回归）
+        self.regime_mode = cfg.get("regime_mode", "ma")
+        self.regime_adx_period = int(cfg.get("regime_adx_period", 14))
+        self.regime_adx_threshold = float(cfg.get("regime_adx_threshold", 25.0))
 
         # ── 布林带参数 ----
         self.bb_period = cfg.get("bb_period", 20)
@@ -99,6 +126,60 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
     def _calculate_rsi(self, close: pd.Series) -> pd.Series:
         """计算RSI指标（TA-Lib）"""
         return pd.Series(ta.RSI(close.values, timeperiod=self.rsi_period), index=close.index)
+
+    def _regime_ok_series(self, dates) -> pd.Series:
+        """
+        返回与 dates 对齐的布尔序列：该日市场处于可交易状态。
+
+        regime_mode='ma' : 指数站上其 MA(regime_ma) → 可交易（趋势思路）
+        regime_mode='adx': 指数 ADX(regime_adx_period) < 阈值 → 可交易（震荡/均值回归思路）
+
+        无未来函数：调用方应自行 shift(1) 取「前一日」状态用于当日买入判定。
+        指数交易日可能与个股不一致，按「不晚于该股票日的最近指数日」对齐。
+        """
+        # ── 加载并缓存指数 OHLC ──
+        if self.regime_index not in _INDEX_CACHE:
+            c = sqlite3.connect(DB_PATH)
+            rows = c.execute(
+                "SELECT trade_date, close, high, low FROM index_daily "
+                "WHERE ts_code=? ORDER BY trade_date",
+                (self.regime_index,),
+            ).fetchall()
+            c.close()
+            if not rows:
+                logger.warning(f"regime gate: 指数 {self.regime_index} 无数据，门控放行")
+                _INDEX_CACHE[self.regime_index] = None
+            else:
+                idx_dates = [str(r[0]) for r in rows]
+                _INDEX_CACHE[self.regime_index] = {
+                    "close": pd.Series([float(r[1]) for r in rows], index=idx_dates),
+                    "high": pd.Series([float(r[2]) for r in rows], index=idx_dates),
+                    "low": pd.Series([float(r[3]) for r in rows], index=idx_dates),
+                }
+        cached = _INDEX_CACHE[self.regime_index]
+        if cached is None:
+            return pd.Series(True, index=[str(d) for d in dates])
+
+        if self.regime_mode == "adx":
+            closes, highs, lows = cached["close"], cached["high"], cached["low"]
+            # TA-Lib ADX 需要 float 数组
+            adx = pd.Series(
+                ta.ADX(highs.values, lows.values, closes.values,
+                       timeperiod=self.regime_adx_period),
+                index=closes.index,
+            )
+            flag = (adx < self.regime_adx_threshold).fillna(False)
+        else:  # 'ma'
+            closes = cached["close"]
+            ma = closes.rolling(self.regime_ma).mean()
+            flag = (closes >= ma).fillna(False)
+
+        out = []
+        for d in dates:
+            dd = str(d)
+            mask = flag.index <= dd
+            out.append(bool(flag[mask].iloc[-1]) if mask.any() else True)
+        return pd.Series(out, index=[str(d) for d in dates])
 
     def run(self, df: pd.DataFrame, start_idx: int = 0) -> dict:
         """
@@ -171,6 +252,22 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
 
         data['buy_signal'] = buy_signal
         data['sell_signal'] = sell_signal
+
+        # === 市场状态门控（regime gate）===
+        # 用「前一日」指数状态判定，避免未来函数；门控只剔除「指数跌破MA的下跌市」。
+        # 注意：ok_prev 需用 .to_numpy() 按行位置对齐，buy_signal 的索引是 RangeIndex，
+        # 若直接按索引对齐会因索引不一致得到全 False。
+        if self.regime_filter:
+            ok = self._regime_ok_series(data['trade_date'])
+            ok_prev = ok.shift(1).fillna(True).to_numpy()
+            gated_out = int(((~ok_prev) & buy_signal.to_numpy()).sum())
+            buy_signal = buy_signal & ok_prev
+            data['buy_signal'] = buy_signal
+            logger.info(
+                f"Regime gate({self.regime_index} mode={self.regime_mode}): "
+                f"原始买入信号 {int(buy_signal.sum()) + gated_out} → "
+                f"门控后 {int(buy_signal.sum())}（剔除 {gated_out}）"
+            )
 
         # === 遍历数据执行交易 ===
         for i in range(start_idx, len(data)):

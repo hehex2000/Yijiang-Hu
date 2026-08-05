@@ -16,13 +16,18 @@ if not defined P_TOTAL_CAPITAL set P_TOTAL_CAPITAL=100000
 if not defined P_SELECTION_METHOD set P_SELECTION_METHOD=multi
 if not defined P_STOCK_POOL set P_STOCK_POOL=all
 if not defined P_PAIRS_CAPITAL set P_PAIRS_CAPITAL=500000
+if not defined P_VALUE_ENHANCED set P_VALUE_ENHANCED=
+if not defined P_VALUE_QGATES set P_VALUE_QGATES=on
 
 REM 应用到会话变量
 set BACKTEST_START=%P_BACKTEST_START%
 set BACKTEST_END=%P_BACKTEST_END%
 set TOP_N=%P_TOP_N%
 set SELECTION_METHOD=%P_SELECTION_METHOD%
+set VALUE_ENHANCED=%P_VALUE_ENHANCED%
+set VALUE_QGATES=%P_VALUE_QGATES%
 set TOTAL_CAPITAL=%P_TOTAL_CAPITAL%
+set STOCK_POOL=%P_STOCK_POOL%
 
 REM ================================
 REM  保存持久化配置到 user_config.bat
@@ -115,6 +120,11 @@ echo   [4] MA200均线过滤法[长周期·更保守]
 echo   [0] 返回主菜单
 echo.
 set ETF_METHOD=
+set ETF_POOL_ARG=
+set ETF_VAR_ARG=
+set ETF_TOPN_ARG=
+set ETF_VARSEL=
+set ETF_PREMIUM_ARG=
 set /p ETF_METHOD=请选择 (1-4, 默认1):
 
 if "%ETF_METHOD%"=="0" goto :menu
@@ -125,10 +135,37 @@ if "%ETF_METHOD%"=="2" set ETF_METHOD_ARG=single
 if "%ETF_METHOD%"=="3" set ETF_METHOD_ARG=ma_filter
 if "%ETF_METHOD%"=="4" set ETF_METHOD_ARG=ma_filter
 if "%ETF_METHOD%"=="4" set ETF_MA_ARG=--ma-period 200
+goto :etf_var
 
+:etf_var
+echo.
+echo   VaR 仓位缩放（可选·按篮子VaR反解投入比例，未投部分留现金·默认关闭）:
+echo   [0] 关闭=默认   [1] 95%%置信   [2] 99%%置信
+set /p ETF_VARSEL=请选择 (0/1/2, 回车=0关闭):
+if "%ETF_VARSEL%"=="1" set ETF_VAR_ARG=--var-control 95 --var-maxdd 15 --var-n 5
+if "%ETF_VARSEL%"=="2" set ETF_VAR_ARG=--var-control 99 --var-maxdd 15 --var-n 5
+goto :etf_premium
+
+:etf_premium
+echo.
+echo   ETF折溢价过滤（可选·实盘防泡沫护栏·默认关闭）:
+echo   [0] 关闭=默认（回测可复现）
+echo   [1] rolling=自适应分位数（推荐·实盘护栏）
+echo   [2] uniform=统一5%%硬阈值
+echo   [3] strict=跨境更严（3%%/5%%）
+echo   [4] qdii=仅限申赎受限品种8%%
+set /p ETF_PREMIUM_SEL=请选择 (0/1/2/3/4, 回车=0关闭):
+if "%ETF_PREMIUM_SEL%"=="1" set ETF_PREMIUM_ARG=--premium-filter rolling
+if "%ETF_PREMIUM_SEL%"=="2" set ETF_PREMIUM_ARG=--premium-filter uniform
+if "%ETF_PREMIUM_SEL%"=="3" set ETF_PREMIUM_ARG=--premium-filter strict
+if "%ETF_PREMIUM_SEL%"=="4" set ETF_PREMIUM_ARG=--premium-filter qdii
+if not defined ETF_PREMIUM_ARG set ETF_PREMIUM_ARG=
+goto :etf_exec
+
+:etf_exec
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG% %ETF_MA_ARG%
+"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG% %ETF_MA_ARG% %ETF_POOL_ARG% %ETF_TOPN_ARG% %ETF_VAR_ARG% %ETF_PREMIUM_ARG%
 echo.
 echo   [返回主菜单]
 pause
@@ -157,17 +194,23 @@ echo   [5] 半导体     vs 新能源车   [行业·科技制造]
 echo   [6] 沪深300   vs 中证800   [宽基·大中盘]
 echo   [7] 恒生ETF   vs 沪深300   [跨境·AH溢价]
 echo   [8] 黄金ETF   vs 国债ETF   [避险·股债轮动]
+echo   [9] 红利ETF   vs 红利低波ETF [红利·同主题高相关]
 echo   [0] 返回主菜单
 echo.
 set PAIR_CHOICE=
-set /p PAIR_CHOICE=请选择 (1-8, 默认1):
+set /p PAIR_CHOICE=请选择 (1-9, 默认1):
 
 if "%PAIR_CHOICE%"=="0" goto :menu
 if "%PAIR_CHOICE%"=="" set PAIR_CHOICE=1
 set PAIR_ARG=%PAIR_CHOICE%
 
 echo.
-echo   正在运行...
+set /p PAIRS_CAPITAL_INPUT=输入初始资金(元, 回车默认%P_PAIRS_CAPITAL%):
+if "%PAIRS_CAPITAL_INPUT%"=="" set PAIRS_CAPITAL_INPUT=%P_PAIRS_CAPITAL%
+set P_PAIRS_CAPITAL=%PAIRS_CAPITAL_INPUT%
+
+echo.
+echo   正在运行(初始资金 %P_PAIRS_CAPITAL% 元)...
 "venv_ml\Scripts\python.exe" run_pairs_trading.py %BACKTEST_START% %BACKTEST_END% --pair %PAIR_ARG% --capital %P_PAIRS_CAPITAL%
 echo.
 echo   [返回配对菜单]
@@ -180,6 +223,8 @@ echo set P_BACKTEST_END=%BACKTEST_END%
 echo set P_TOP_N=%TOP_N%
 echo set P_TOTAL_CAPITAL=%TOTAL_CAPITAL%
 echo set P_SELECTION_METHOD=%SELECTION_METHOD%
+echo set P_VALUE_ENHANCED=%VALUE_ENHANCED%
+echo set P_VALUE_QGATES=%VALUE_QGATES%
 echo set P_PAIRS_CAPITAL=%P_PAIRS_CAPITAL%
 ) > user_config.bat
 goto :eof
@@ -213,8 +258,8 @@ echo   [2] 设置回测区间
 echo   [3] 设置选股数量 / 初始资金
 echo   [4] 选择选股策略
 echo   [5] 设置股票池
-echo   [6] 月度调仓回测[价值/红利低波/动量选股]
-echo   [7] 年度调仓[狗股/价值选股/神奇公式]
+echo   [6] 月度调仓回测[价值/红利低波/动量/质量复合·季度]
+echo   [7] 年度调仓[狗股/价值选股/神奇公式/神奇公式v2]
 echo   [8] 短线逆转策略[超跌反弹]
 echo   [9] 网格交易策略[波段收割]
 echo   [A] 动量+网格择时 [方案①·网格作为市场温度计]
@@ -222,10 +267,10 @@ echo   [B] ETF轮动策略[动量轮动·纯国内资产]
 echo   [C] 配对套利[均值回归·多头轮动]
 echo   [D] 指数/ETF 涨跌一览[回测周期表现]
 echo   [E] 小市值轮动 [创业板最小流通市值·无前视+流动性+三层止损]
-echo   [F] 周度四因子选股[高股息+高波动·周度调仓]
+echo   [F] ETF定投 [单产品/宽基篮子·月/周对比]
 echo   [0] 退出
 echo.
-set /p CHOICE=请选择 (1-9/A-E, 0退出):
+set /p CHOICE=请选择 (1-9/A-F, 0退出):
 echo.
 
 if "%CHOICE%"=="1" goto :run_all
@@ -242,8 +287,76 @@ if /i "%CHOICE%"=="B" goto :etf_rotation
 if /i "%CHOICE%"=="C" goto :pairs_trading
 if /i "%CHOICE%"=="D" goto :index_etf_changes
 if /i "%CHOICE%"=="E" goto :sc_rotation
-if /i "%CHOICE%"=="F" goto :weekly_factor
+if /i "%CHOICE%"=="F" goto :dca_etf
 if "%CHOICE%"=="0" goto :eof
+goto :menu
+:dca_etf
+cls
+echo.
+echo ================
+echo   ETF 定投策略 (DCA)
+echo ================
+echo.
+echo   国内被动宽基 ETF 定投：月度 / 周度 / 一次性投入对比
+echo   月投 / 周投金额可在下方自行设定（默认 4000 / 1000）
+echo.
+echo   请选择定投标的：
+echo   [1] 沪深300ETF  (510300)
+echo   [2] 中证500ETF  (510500)
+echo   [3] 创业板ETF   (159915)
+echo   [4] 上证50ETF   (510050)
+echo   [5] 宽基核心篮子（沪深300+中证500+创业板+上证50，4只等权）
+echo   [6] 红利ETF     (510880·上证红利，全历史)
+echo   [7] 红利低波ETF (512890·中证红利低波)
+echo   [8] 红利核心篮子（红利+红利低波，dividend）
+echo   [9] 红利+科技弹性篮子（红利+红利低波+创业板，div_tech）
+echo   [0] 返回主菜单
+echo.
+set DCA_CODE=
+set DCA_PRESET=
+set DCA_MONTHLY=4000
+set DCA_WEEKLY=1000
+set /p DCA_CHOICE=请选择 (0-9):
+if "%DCA_CHOICE%"=="0" goto :menu
+if "%DCA_CHOICE%"=="1" ( set DCA_CODE=510300.SH )
+if "%DCA_CHOICE%"=="2" ( set DCA_CODE=510500.SH )
+if "%DCA_CHOICE%"=="3" ( set DCA_CODE=159915.SZ )
+if "%DCA_CHOICE%"=="4" ( set DCA_CODE=510050.SH )
+if "%DCA_CHOICE%"=="5" ( set DCA_PRESET=core4 )
+if "%DCA_CHOICE%"=="6" ( set DCA_CODE=510880.SH )
+if "%DCA_CHOICE%"=="7" ( set DCA_CODE=512890.SH )
+if "%DCA_CHOICE%"=="8" ( set DCA_PRESET=dividend )
+if "%DCA_CHOICE%"=="9" ( set DCA_PRESET=div_tech )
+if not defined DCA_CODE ( if not defined DCA_PRESET ( goto :dca_etf ) )
+echo.
+echo   选择频率：
+echo   [1] 月度定投   [2] 周度定投   [3] 月/周对比 + 一次性投入基准
+echo.
+set /p DCA_FREQ_CHOICE=请选择 (1-3):
+if "%DCA_FREQ_CHOICE%"=="2" ( set DCA_FREQ=weekly ) else if "%DCA_FREQ_CHOICE%"=="3" ( set DCA_FREQ=both ) else ( set DCA_FREQ=monthly )
+echo.
+echo   定投模式（smart=文章《玩红利ETF的实战思路》5周/20周线操作法）：
+echo   [1] 普通纪律定投(plain)   [2] 均线增强(smart)
+echo.
+set /p DCA_MODE_CHOICE=请选择 (1-2, 回车默认1):
+if "%DCA_MODE_CHOICE%"=="2" ( set DCA_MODE=smart ) else ( set DCA_MODE=plain )
+echo.
+echo   投入金额（月投 / 周投，回车用默认值）:
+set /p DCA_MONTHLY=  月投金额 (默认 4000):
+if "%DCA_MONTHLY%"=="" set DCA_MONTHLY=4000
+set /p DCA_WEEKLY=  周投金额 (默认 1000):
+if "%DCA_WEEKLY%"=="" set DCA_WEEKLY=1000
+echo.
+echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+if defined DCA_PRESET (
+  "venv_ml\Scripts\python.exe" run_backtest.py --source dca_etf --dca-preset %DCA_PRESET% --dca-freq %DCA_FREQ% --dca-mode %DCA_MODE% --dca-monthly %DCA_MONTHLY% --dca-weekly %DCA_WEEKLY% --start-date %BACKTEST_START% --end-date %BACKTEST_END%
+) else (
+  "venv_ml\Scripts\python.exe" run_backtest.py --source dca_etf --dca-freq %DCA_FREQ% --dca-code %DCA_CODE% --dca-mode %DCA_MODE% --dca-monthly %DCA_MONTHLY% --dca-weekly %DCA_WEEKLY% --start-date %BACKTEST_START% --end-date %BACKTEST_END%
+)
+echo.
+echo   [返回主菜单]
+pause
 goto :menu
 
 :set_top_n_capital
@@ -253,47 +366,21 @@ echo ================
 echo   设置选股数量 / 初始资金
 echo ================
 echo.
-echo   当前: 选股数量=%TOP_N% 只, 初始【总】资金=%P_TOTAL_CAPITAL% 元 (将均分到每只)
+echo   当前选股数量: %TOP_N% 只
+echo   当前初始(总)资金: %P_TOTAL_CAPITAL% 元 (将均分到每只)
 echo.
-echo   [直接回车 = 保持当前值；选股数量至少5只，初始资金至少100000]
-echo.
-
-:input_top_n
-set /p TOP_N_INPUT=  请输入选择的股票支数（至少5只, 回车保持 %TOP_N%）:
-if "%TOP_N_INPUT%"=="" goto :input_capital
-set TN=0
-set /a "TN=%TOP_N_INPUT%" 2>nul
-if %TN% LSS 5 (
-    echo   [错误] 选股数量必须至少为 5，请重新输入！
-    goto :input_top_n
-)
+set /p TOP_N_INPUT=  选股数量 (回车默认 %P_TOP_N%):
+if "%TOP_N_INPUT%"=="" set TOP_N_INPUT=%P_TOP_N%
+set P_TOP_N=%TOP_N_INPUT%
 set TOP_N=%TOP_N_INPUT%
-
-:input_capital
-set /p CAP_INPUT=  请输入初始【总】资金量（将均分到每只, 至少100000, 回车保持 %P_TOTAL_CAPITAL%）:
-if "%CAP_INPUT%"=="" goto :apply_capital
-set CAP=0
-set /a "CAP=%CAP_INPUT%" 2>nul
-if %CAP% LSS 100000 (
-    echo   [错误] 初始资金必须至少为 100000，请重新输入！
-    goto :input_capital
-)
-set TOTAL_CAPITAL=%CAP_INPUT%
-set P_TOTAL_CAPITAL=%CAP_INPUT%
-set /a PER_STOCK=%P_TOTAL_CAPITAL% / %TOP_N%
-
-:apply_capital
 echo.
-echo   [OK] 已更新: 选股数量=%TOP_N% 只, 初始【总】资金=%P_TOTAL_CAPITAL% 元
-echo   [OK] 每支将分配约 %PER_STOCK% 元 (= 总资金 ÷ 选股数)
+set /p CAPITAL_INPUT=  初始总资金(元, 回车默认 %P_TOTAL_CAPITAL%):
+if "%CAPITAL_INPUT%"=="" set CAPITAL_INPUT=%P_TOTAL_CAPITAL%
+set P_TOTAL_CAPITAL=%CAPITAL_INPUT%
+set TOTAL_CAPITAL=%CAPITAL_INPUT%
 echo.
-REM 同步写入 config.py
-if not "%TOP_N_INPUT%"=="" venv_ml\Scripts\python.exe update_top_n.py %TOP_N%
-if not "%CAP_INPUT%"=="" venv_ml\Scripts\python.exe update_capital.py %P_TOTAL_CAPITAL%
-if errorlevel 1 (
-    echo   [错误] 更新 config.py 失败！
-    pause
-)
+echo   [OK] 已更新: 选股 %TOP_N% 只 / 总资金 %TOTAL_CAPITAL% 元
+echo.
 call :save_config
 goto :menu
 
@@ -342,12 +429,7 @@ if "%METHOD_CHOICE%"=="1" (
     call :save_config
     goto :menu
 )
-if "%METHOD_CHOICE%"=="2" (
-    set SELECTION_METHOD=value
-    echo   [OK] 已选择: 价值投资选股
-    call :save_config
-    goto :menu
-)
+if "%METHOD_CHOICE%"=="2" goto :method_value
 if "%METHOD_CHOICE%"=="3" (
     set SELECTION_METHOD=div_low_vol
     echo   [OK] 已选择: 红利低波选股
@@ -362,6 +444,34 @@ if "%METHOD_CHOICE%"=="4" (
 )
 goto :set_method_menu
 
+:method_value
+set SELECTION_METHOD=value
+echo   [OK] 已选择: 价值投资选股
+echo.
+echo   价值 BM 增强(纯BM·全市场BM前30%%+市值中性化^):
+echo   [1] 不开(原版·破净+ROE质量^)  [2] 一键开启
+set /p VE_CHOICE=请选择 1-2, 默认1不开:
+if "%VE_CHOICE%"=="2" (
+    set VALUE_ENHANCED=--value-mode pure_bm --value-pct 0.3 --value-size-neutral
+    echo   [OK] BM增强: 已开启(纯BM + 前30%% + 市值中性化^)
+) else (
+    set VALUE_ENHANCED=
+    echo   [OK] BM增强: 未开启(原版破净^)
+)
+echo.
+echo   四道质量门槛(盈余质量/杠杆/应收/估值纵向分位·防价值陷阱^):
+echo   [1] 启用(默认·过滤高杠杆现金流差的伪便宜^)  [2] 关闭(仅破净+ROE·用于对照^)
+set /p QG_CHOICE=请选择 1-2, 默认1启用:
+if "%QG_CHOICE%"=="2" (
+    set VALUE_QGATES=off
+    echo   [OK] 质量门槛: 已关闭(仅破净+ROE^)
+) else (
+    set VALUE_QGATES=on
+    echo   [OK] 质量门槛: 已启用(②盈余质量 ③杠杆 ④应收 ⑤纵向分位^)
+)
+call :save_config
+goto :menu
+
 :run_all
 cls
 echo.
@@ -374,7 +484,10 @@ echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo     选股数量: %TOP_N% 只
 echo     选股策略: %SELECTION_METHOD%
 echo.
-venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL%
+set VB_ARGS=
+if "%SELECTION_METHOD%"=="value" set VB_ARGS=%VALUE_ENHANCED% --value-quality-gates %VALUE_QGATES%
+:run_all_exec
+venv_ml\Scripts\python.exe run_backtest.py --source %SELECTION_METHOD% --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% %VB_ARGS%
 echo.
 pause
 goto :menu
@@ -391,30 +504,81 @@ echo   ----------------
 echo   [1] 价值选股[PB破净+ROE质量]
 echo   [2] 红利低波选股[高股息+低波动]
 echo   [3] 动量效应追涨[动量选股]
+echo   [4] 红利低波质量复合[季度调仓]
+echo   [5] MACD择时[逐股DIF^>DEA·无KDJ·跟随全局股票池]
 echo   [0] 返回主菜单
 echo.
 set MR_ARG=
-set /p MR_METHOD=请选择 (1-3, 0返回):
+set MR_VAR_ARG=
+set VAR_CTRL=0
+set VAR_MDD=15
+    set VAR_N=5
+    set VA_LOOK=0
+    set VA_PCT=70
+    set VAR_SEL=
+    set VA_SEL=
+    set /p MR_METHOD=请选择 (1-5, 0返回):
 
 if "%MR_METHOD%"=="0" goto :menu
-if "%MR_METHOD%"=="2" (
-    set MR_ARG=--selection-method div_low_vol
-    echo.
-    echo   已选择: 红利低波选股
-) else if "%MR_METHOD%"=="3" (
-    set MR_ARG=--selection-method momentum
-    echo.
-    echo   已选择: 动量效应追涨
-) else (
-    set MR_ARG=--selection-method value
-    echo.
-    echo   已选择: 价值选股
-)
+if "%MR_METHOD%"=="2" goto :mr_div
+if "%MR_METHOD%"=="4" goto :mr_divq
+if "%MR_METHOD%"=="5" goto :macd_timing
+if "%MR_METHOD%"=="3" goto :mr_mom
+set MR_ARG=--selection-method value
+echo.
+echo   已选择: 价值选股
+goto :mr_after
+
+:mr_div
+set MR_ARG=--selection-method div_low_vol
+echo.
+echo   已选择: 红利低波选股
+goto :mr_after
+
+:mr_divq
+set MR_ARG=--selection-method div_low_vol_quality --dlvq-mode official_compact
+echo.
+echo   已选择: 红利低波质量复合[季度调仓]
+goto :mr_after
+
+:mr_mom
+set MR_ARG=--selection-method momentum
+echo.
+echo   已选择: 动量效应追涨
+echo.
+echo   VaR 仓位缩放（凶策略默认开启 95%%，锁定目标回撤）:
+echo   [0] 关闭   [1] 95%%置信=默认   [2] 99%%置信
+set /p VAR_SEL=请选择 (0/1/2, 回车=1·95%%开启):
+set VAR_CTRL=95
+if "%VAR_SEL%"=="0" set VAR_CTRL=0
+if "%VAR_SEL%"=="2" set VAR_CTRL=99
+if not "%VAR_CTRL%"=="0" set /p VAR_MDD=目标最大回撤上限 %%（默认15）:
+if "%VAR_MDD%"=="" set VAR_MDD=15
+if not "%VAR_CTRL%"=="0" set /p VAR_N=连续下跌周期数 N（趋势=5/反转=3, 默认5）:
+if "%VAR_N%"=="" set VAR_N=5
+echo.
+echo   价值区过滤（动量只接价值区内/上方，剔除价值区下方弱势票）:
+echo   [0] 关闭=默认   [1] 开启·回看20日
+set /p VA_SEL=请选择 (0/1, 回车=0关闭):
+if "%VA_SEL%"=="1" set VA_LOOK=20
+goto :mr_after
+
+:mr_after
+echo.
+set VB_ARGS=
+if "%MR_METHOD%"=="2" goto :mr_exec
+if "%MR_METHOD%"=="3" goto :mr_exec
+if "%MR_METHOD%"=="4" goto :mr_exec
+set VB_ARGS=%VALUE_ENHANCED% --value-quality-gates %VALUE_QGATES%
+:mr_exec
+REM === VaR 仓位缩放参数（动量/红利低波生效；价值忽略，var-control=0 即关闭）===
+set VB_ARGS=%VB_ARGS% --var-control %VAR_CTRL% --var-maxdd %VAR_MDD% --var-n %VAR_N%
+if not "%VA_LOOK%"=="0" set VB_ARGS=%VB_ARGS% --value-area %VA_LOOK% --va-pct %VA_PCT%
 echo.
 echo   配置:
 echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
-venv_ml\Scripts\python.exe run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% %MR_ARG%
+venv_ml\Scripts\python.exe run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% %MR_ARG% %VB_ARGS%
 echo.
 echo   [返回主菜单]
 pause
@@ -468,19 +632,35 @@ echo   ----------------
 echo   [1] 狗股策略[高股息 + 低PB + 均值回归]
 echo   [2] 价值选股[破净 + ROE质量 + 自由现金流]
 echo   [3] 神奇公式（Magic Formula · ROC+EY双排名 · 年度调仓）
+echo   [4] 神奇公式修改版v2（EBIT3年均值+MA200趋势过滤+行业上限 · 抗回撤）
 echo   [0] 返回主菜单
 echo.
 set DA_STRAT=dogs
-set /p DA_CHOICE=请选择 (1-3, 默认1狗股):
+set DA_QG=
+set /p DA_CHOICE=请选择 (1-4, 默认1狗股):
 if "%DA_CHOICE%"=="0" goto :menu
 if "%DA_CHOICE%"=="2" set DA_STRAT=value
 if "%DA_CHOICE%"=="3" set DA_STRAT=magic
+if "%DA_CHOICE%"=="4" goto :magic_v2_run
 if "%DA_CHOICE%"=="" set DA_STRAT=dogs
+if "%DA_STRAT%"=="value" set DA_QG=--value-quality-gates %VALUE_QGATES%
 
 echo.
 echo   正在运行[子策略: %DA_STRAT%]...
-"venv_ml\Scripts\python.exe" run_backtest.py --source dogs_annual --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% --dogs-strategy %DA_STRAT%
+"venv_ml\Scripts\python.exe" run_backtest.py --source dogs_annual --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% --dogs-strategy %DA_STRAT% %DA_QG%
 echo.
+pause
+goto :menu
+
+:magic_v2_run
+echo.
+echo   正在运行[神奇公式修改版 v2]...
+echo     ①EBIT近3年均值(抑制周期股盈利峰值陷阱)
+echo     ②HS300小于MA200时降半仓(月检趋势过滤)
+echo     ③单行业上限 2 只/行业（持仓数=全局选股数 %TOP_N%）
+"venv_ml\Scripts\python.exe" run_magic_v2.py %BACKTEST_START% %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL%
+echo.
+echo   [对照] 报告尾部自动附带原版(magic)同区间对照表
 pause
 goto :menu
 
@@ -492,17 +672,27 @@ echo   指数 / ETF 涨跌一览
 echo ================
 echo.
 echo   覆盖主要宽基与风格指数[优先显示ETF，无ETF则显示指数]
-echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   当前回测区间设置: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+set IEC_END=%BACKTEST_END%
+set IEC_END_IN=
+set /p IEC_END_IN=结束日期 YYYYMMDD (回车沿用 %BACKTEST_END%, 输入 auto 用数据库最新日):
+if not "%IEC_END_IN%"=="" set IEC_END=%IEC_END_IN%
+if "%IEC_END%"=="" set IEC_END=auto
+echo.
+echo   实际统计区间: %BACKTEST_START% ~ %IEC_END%
 echo.
 echo   正在统计...
 echo.
-"venv_ml\Scripts\python.exe" show_index_etf_changes.py %BACKTEST_START% %BACKTEST_END%
+"venv_ml\Scripts\python.exe" show_index_etf_changes.py %BACKTEST_START% %IEC_END%
 echo.
-echo   [HTML报告] outputs\index_etf_changes_%BACKTEST_START%_%BACKTEST_END%.html
+echo   [HTML报告] outputs\index_etf_changes_%BACKTEST_START%_*.html
 echo.
 echo   [返回主菜单]
 pause
 goto :menu
+
 
 :reversal
 cls
@@ -526,12 +716,32 @@ set REV_ARG=--stock-pool 000300.SH
 if "%REV_POOL%"=="2" set REV_ARG=--stock-pool 000906.SH
 if "%REV_POOL%"=="3" set REV_ARG=--stock-pool 000905.SH
 
+set REV_VAR=--var-control 95 --var-maxdd 15 --var-n 3
+set REV_VA=0
+set REV_FO=0
+echo.
+echo   VaR 仓位缩放（反转=肥尾策略，默认开启 95%%·目标回撤15%%·N=3）:
+echo   [0] 关闭   [1] 95%%置信(默认)   [2] 99%%置信
+set /p REV_VARSEL=请选择 (0/1/2, 回车=1·95%%开启):
+if "%REV_VARSEL%"=="0" (set REV_VAR=) else if "%REV_VARSEL%"=="2" (set REV_VAR=--var-control 99 --var-maxdd 15 --var-n 3)
+echo.
+echo   价值区过滤(反转只接价值区下沿/下方超跌区):
+echo   [0] 关闭(默认)   [1] 开启(回看20日)
+set /p REV_VASEL=请选择 (0/1, 回车=0关闭):
+if "%REV_VASEL%"=="1" (set REV_VA=20)
+echo.
+echo   反转 fakeout-reclaim 优先(扫止损后快速收回的标的排前):
+echo   [0] 关闭(默认)   [1] 开启
+set /p REV_FOSEL=请选择 (0/1, 回车=0关闭):
+if "%REV_FOSEL%"=="1" (set REV_FO=1)
+if "%REV_FO%"=="1" (set REV_FO_ARG=--fakeout-reclaim) else (set REV_FO_ARG=)
+
 echo.
 echo   配置: 20日跌幅排名, 8日持有, 5只, MACD金叉过滤, 8%%止损
 echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_monthly_rebalance.py %BACKTEST_START% %BACKTEST_END% --selection-method reversal %REV_ARG% --top-n 5 --reversal-lookback 20 --reversal-hold 8 --market-filter macd --reversal-stop 0.08
+"venv_ml\Scripts\python.exe" run_monthly_rebalance.py %BACKTEST_START% %BACKTEST_END% --selection-method reversal %REV_ARG% --top-n 5 --reversal-lookback 20 --reversal-hold 8 --market-filter macd --reversal-stop 0.08 %REV_VAR% --value-area %REV_VA% --va-pct 70 %REV_FO_ARG%
 echo.
 pause
 goto :reversal
@@ -580,78 +790,113 @@ if not defined GRID_ARG (
 )
 
 echo.
-echo   请设置网格策略:
+echo   请设置网格间距:
 echo   ----------------
-echo   [1] 2%% 对称网格    (窄间距·高频收割·标准)
-echo   [2] 4%% 对称网格    (宽间距·低频·减少趋势踏空·推荐·默认)
-echo   [4] 3%% 中网格      (中频·平衡收割与踏空)
-echo   [5] 非对称 2/8%%   (锚定成本线·浮亏不割·浮盈宽卖)
+echo   [1] 2%% 对称网格    (窄间距·高频收割)
+echo   [2] 4%% 对称网格    (宽间距·低频·减少踏空·推荐·默认)
 echo.
 set GRID_STRAT=
-set /p GRID_STRAT=请选择 (1-5, 默认2):
+set /p GRID_STRAT=请选择 (1-2, 默认2):
 
-rem 默认 = 4%% 对称网格
+rem 默认 = 4%% 对称网格；仅 [1] 切换为 2%%
 set GRID_MODE=symmetric
 set GRID_PCT_ARG=--grid-pct 0.04
 set GRID_SELL_ARG=
-if "%GRID_STRAT%"=="1" (
-    set GRID_MODE=symmetric
-    set GRID_PCT_ARG=--grid-pct 0.02
-)
-if "%GRID_STRAT%"=="3" (
-    set GRID_MODE=symmetric
-    set GRID_PCT_ARG=--grid-pct 0.01
-)
-if "%GRID_STRAT%"=="4" (
-    set GRID_MODE=symmetric
-    set GRID_PCT_ARG=--grid-pct 0.03
-)
-if "%GRID_STRAT%"=="5" (
-    set GRID_MODE=asymmetric
-    set GRID_PCT_ARG=--grid-pct 0.02
-    set GRID_SELL_ARG=--sell-pct 0.08
-)
-if "%GRID_STRAT%"=="" (
-    set GRID_MODE=symmetric
-    set GRID_PCT_ARG=--grid-pct 0.04
-)
+if "%GRID_STRAT%"=="1" set GRID_PCT_ARG=--grid-pct 0.02
+
+rem ── 对照买入持有：默认常开（评判网格好坏的标尺）──
+set GRID_BH_ARG=--compare-buyhold
+
+rem ── 高级选项默认全部关闭 ──
+set GRID_TF_ARG=
+set GRID_SL_ARG=
+set GRID_VF_ARG=
+set GRID_CV_ARG=
+rem ── 中枢模式/初始仓位默认(稳健通用) ──
+set GRID_CM_ARG=--center-mode fixed
+set GRID_CMW_ARG=
+set GRID_IP_ARG=
+
+rem ── 网格中枢模式：主流程主问题（决定买卖线是否随市场浮动，是"零成交"痛点的核心开关）──
+echo.
+echo   网格中枢模式[决定买卖线如何锚定]:
+echo   [1] 固定价位(旧版·锚定首日收盘价·通用稳健·默认)
+echo   [2] 滚动MA中枢(买卖线随中枢浮动·深跌能补仓/反弹能收割·震荡深跌市更优)
+set GRID_CM=
+set /p GRID_CM=请选择 (1-2, 默认1固定):
+if "%GRID_CM%"=="2" set GRID_CM_ARG=--center-mode ma
+if "%GRID_CM%"=="2" set /p GRID_CMW=  MA窗口(日, 默认60):
+if "%GRID_CM%"=="2" if "%GRID_CMW%"=="" set GRID_CMW=60
+if "%GRID_CM%"=="2" set GRID_CMW_ARG=--center-ma-window %GRID_CMW%
+
+rem ── 初始仓位：主流程主问题（越低深跌时购买力越强；中枢模式配低仓位效果最佳）──
+echo.
+echo   初始仓位[预留干火药·越低深跌时购买力越强]:
+echo   [1] 50%% (默认·上涨市占优)   [2] 30%%   [3] 20%% (震荡/深跌市占优·配中枢模式最佳)
+set GRID_IP=
+set /p GRID_IP=请选择 (1-3, 默认1=50%%):
+if "%GRID_IP%"=="2" set GRID_IP_ARG=--init-pos 0.30
+if "%GRID_IP%"=="3" set GRID_IP_ARG=--init-pos 0.20
+
+echo.
+echo   [A] 高级选项 (进阶间距 / 趋势过滤 / 止损 / 波动率关网 / 情景提示)
+echo       默认全部关闭，回车直接跑；输入 A 逐项设置。
+echo.
+set GRID_ADV=
+set /p GRID_ADV=请选择 (回车跳过 / A 进入高级):
+if /i "%GRID_ADV%"=="A" goto :grid_advanced
+goto :grid_run
+
+:grid_advanced
+echo.
+echo   [进阶间距] 覆盖上面的间距选择:
+echo   [1] 保持不变   [2] 3%% 中网格   [3] 非对称 2/8%% (锚定成本·浮亏不割·浮盈宽卖)
+set GRID_ADVPCT=
+set /p GRID_ADVPCT=请选择 (1-3, 默认1保持):
+if "%GRID_ADVPCT%"=="2" set GRID_PCT_ARG=--grid-pct 0.03
+if "%GRID_ADVPCT%"=="3" set GRID_MODE=asymmetric
+if "%GRID_ADVPCT%"=="3" set GRID_PCT_ARG=--grid-pct 0.02
+if "%GRID_ADVPCT%"=="3" set GRID_SELL_ARG=--sell-pct 0.08
 
 echo.
 echo   趋势过滤[站上250日均线只持有不卖]:
-echo   [1] 关闭[纯网格]
-echo   [2] 开启
-echo.
+echo   注意: 会抑制卖出, 单边涨市≈买入持有
+echo   [1] 关闭[纯网格]   [2] 开启
 set GRID_TF=
 set /p GRID_TF=请选择 (1-2, 默认1关闭):
-set GRID_TF_ARG=
 if "%GRID_TF%"=="2" set GRID_TF_ARG=--trend-filter
 
 echo.
 echo   总止损线[净值峰回撤超阈值即停止新建网格·仅持有]:
-echo   [1] 关闭
-echo   [2] 开启 (-30%%)
-echo.
+echo   [1] 关闭   [2] 开启 (-30%%)
 set GRID_SL=
 set /p GRID_SL=请选择 (1-2, 默认1关闭):
-set GRID_SL_ARG=
 if "%GRID_SL%"=="2" set GRID_SL_ARG=--stop-loss -0.30
 
 echo.
 echo   波动率关网[短期波动突升暂停网格·恢复自动重启]:
-echo   [1] 关闭
-echo   [2] 开启 (20日年化波动^^>基准×2.5)
-echo.
+echo   [1] 关闭   [2] 开启 (20日年化波动^^>基准×2.5)
 set GRID_VF=
 set /p GRID_VF=请选择 (1-2, 默认1关闭):
-set GRID_VF_ARG=
 if "%GRID_VF%"=="2" set GRID_VF_ARG=--vol-filter
 
 echo.
-echo   配置: 每格5000元, 初始50%%仓位
+echo   情景提示[幸存者偏差/未来收益下行/集中度认知]:
+echo   [1] 关闭   [2] 开启
+set GRID_CV=
+set /p GRID_CV=请选择 (1-2, 默认1关闭):
+if "%GRID_CV%"=="2" set GRID_CV_ARG=--caveat
+
+goto :grid_run
+
+:grid_run
+echo.
+echo   配置: 每格5000元 ^| 中枢%GRID_CM_ARG% %GRID_CMW_ARG% ^| 仓位%GRID_IP_ARG% ^| 对照买入持有:常开
+echo   (仓位/中枢为空=默认 初始50%%仓位·固定价位网格)
 echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_grid_backtest.py %GRID_ARG% %BACKTEST_START% %BACKTEST_END% %GRID_PCT_ARG% --mode %GRID_MODE% %GRID_SELL_ARG% %GRID_TF_ARG% %GRID_SL_ARG% %GRID_VF_ARG% --per-grid 5000
+"venv_ml\Scripts\python.exe" run_grid_backtest.py %GRID_ARG% %BACKTEST_START% %BACKTEST_END% %GRID_PCT_ARG% --mode %GRID_MODE% %GRID_SELL_ARG% %GRID_TF_ARG% %GRID_SL_ARG% %GRID_VF_ARG% %GRID_BH_ARG% %GRID_CV_ARG% %GRID_CM_ARG% %GRID_CMW_ARG% %GRID_IP_ARG% --per-grid 5000
 echo.
 echo   [返回主菜单]
 pause
@@ -685,6 +930,23 @@ set /p SC_POOL_INPUT=  选择 (1/2/4, 默认1):
 if "%SC_POOL_INPUT%"=="2" set SC_POOL=cyb
 if "%SC_POOL_INPUT%"=="4" set SC_POOL=zz1000
 echo.
+echo   请选择运行方式？
+echo   [1] 单回测（可选小/中/大桶，出明细+HTML）
+echo   [2] 三桶对比（小/中/大桶一起跑，只生成HTML对比图）
+set SC_RUN=single
+set /p SC_RUN_INPUT=  选择 (1/2, 默认1单回测):
+if "%SC_RUN_INPUT%"=="2" set SC_RUN=compare
+echo.
+if "%SC_RUN%"=="compare" goto :sc_compare
+echo   选择「市值分位桶」？(替代默认最小桶)
+echo   [1] 最小桶[默认·最小N只]
+echo   [2] 中桶[宇宙40%%分位档·跳过最小800只取其后N只]
+echo   [3] 大桶[宇宙最大N只]
+set SC_BUCKET=
+set /p SC_BUCKET_INPUT=  选择 (1/2/3, 默认1最小桶):
+if "%SC_BUCKET_INPUT%"=="2" set SC_BUCKET=mid
+if "%SC_BUCKET_INPUT%"=="3" set SC_BUCKET=large
+echo.
 echo   是否开启「1月/4月空仓」(年报/一季报窗口避险)？
 echo   [1] 关闭[默认，全年持有]   [2] 开启
 set SC_EMPTY=0
@@ -692,61 +954,71 @@ set /p SC_EMPTY_INPUT=  选择 (1/2, 默认1):
 if "%SC_EMPTY_INPUT%"=="2" set SC_EMPTY=1
 echo.
 echo   是否开启「三层止损」？
-echo    层1 单票自买入价回撤>12%% 清仓该股
-echo    层2 中证2000单日跌幅>6.6%% 清仓全部当周空仓
+echo    层1 单票自买入价回撤^>12%% 清仓该股
+echo    层2 中证2000单日跌幅^>6.6%% 清仓全部当周空仓
 echo    层3 昨涨停今炸板(周二开盘低于昨涨停价) 清仓保利润
 echo   [1] 关闭[默认]   [2] 开启
 set SC_SL=0
 set /p SC_SL_INPUT=  选择 (1/2, 默认1):
 if "%SC_SL_INPUT%"=="2" set SC_SL=1
 echo.
-echo   可选增强：
-echo   [1] 基础[默认]   [2] 基本面过滤(净利润>0且营收>5亿·防壳公司)
-set SC_FUND=0
-set /p SC_FUND_INPUT=  选择 (1/2, 默认1):
-if "%SC_FUND_INPUT%"=="2" set SC_FUND=1
+echo   输出格式？(明细=逐笔文本+CSV, 你一定看得到; HTML=净值曲线辅助可视化)
+echo   [1] 明细 + HTML[默认·推荐: 两者都给, 不只甩HTML]
+echo   [2] 仅明细(文本+CSV, 不生成HTML)
+echo   [3] 仅HTML(不导出明细)
+set SC_OUT=
+set /p SC_OUT_INPUT=  选择 (1/2/3, 默认1明细+HTML):
+if "%SC_OUT_INPUT%"=="2" set SC_OUT=--sc-no-html
+if "%SC_OUT_INPUT%"=="3" set SC_OUT=--sc-no-detail
+
 echo.
-set SC_ARGS=--hold-count %SC_HOLD% --sc-pool-mode %SC_POOL%
+echo   VaR 仓位缩放（小市值=高波动凶策略，默认开启 95%%·目标回撤15%%·N=5）:
+echo   [0] 关闭   [1] 95%%置信(默认)   [2] 99%%置信
+set /p SC_VARSEL=请选择 (0/1/2, 回车=1·95%%开启):
+if "%SC_VARSEL%"=="0" (set SC_VAR=) else if "%SC_VARSEL%"=="2" (set SC_VAR=--var-control 99 --var-maxdd 15 --var-n 5) else (set SC_VAR=--var-control 95 --var-maxdd 15 --var-n 5)
+echo.
+set SC_ARGS=--hold-count %SC_HOLD% --sc-pool-mode %SC_POOL% --sc-mode single
+if not "%SC_BUCKET%"=="" set SC_ARGS=%SC_ARGS% --sc-bucket %SC_BUCKET%
 if "%SC_EMPTY%"=="1" set SC_ARGS=%SC_ARGS% --empty-jan-apr
 if "%SC_SL%"=="1" set SC_ARGS=%SC_ARGS% --stop-loss
-if "%SC_FUND%"=="1" set SC_ARGS=%SC_ARGS% --sc-fundamental
-echo   配置: 选股宇宙=%SC_POOL%  持仓%SC_HOLD%只  空仓1/4月=%SC_EMPTY%  三层止损=%SC_SL%  基本面过滤=%SC_FUND%
+echo   配置: 宇宙=%SC_POOL% 持仓%SC_HOLD%只 桶=%SC_BUCKET%^空仓1/4月=%SC_EMPTY% 止损=%SC_SL%
 echo   正在运行...
 echo.
-"venv_ml\Scripts\python.exe" run_backtest.py --source sc_rotation --start-date %BACKTEST_START% --end-date %BACKTEST_END% --capital %TOTAL_CAPITAL% %SC_ARGS%
+"venv_ml\Scripts\python.exe" run_backtest.py --source sc_rotation --start-date %BACKTEST_START% --end-date %BACKTEST_END% --capital %TOTAL_CAPITAL% %SC_ARGS% %SC_OUT% %SC_VAR%
 echo.
 echo   [返回主菜单]
 pause
 goto :menu
 
-:eof
-cls
+:sc_compare
+set SC_ARGS=--hold-count %SC_HOLD% --sc-pool-mode %SC_POOL% --sc-mode size_quintile
+echo   配置: 宇宙=%SC_POOL% 持仓%SC_HOLD%只 模式=三桶对比(仅生成HTML, 不含明细)
+echo   正在运行...
 echo.
-echo   再见！
+"venv_ml\Scripts\python.exe" run_backtest.py --source sc_rotation --start-date %BACKTEST_START% --end-date %BACKTEST_END% --capital %TOTAL_CAPITAL% %SC_ARGS% --sc-no-detail
 echo.
-:weekly_factor
-cls
-echo ==================================================
-echo   周度四因子选股回测 [高股息+高波动 · 周度调仓]
-echo ==================================================
-echo   当前配置：
-echo     回测区间 : %BACKTEST_START% ~ %BACKTEST_END%
-echo     选股数量 : %TOP_N% 只
-echo     初始资金 : %TOTAL_CAPITAL% 元
-echo     因子阈值 : 股息前25%% / 换手前85%% / 负债最低55%% / 市值最低50%%（脚本默认）
-echo --------------------------------------------------
-echo   [1] 运行周度四因子回测
-echo   [0] 返回主菜单
-echo --------------------------------------------------
-set /p WF_CHOICE=请选择(1运行 / 0返回)：
-if "%WF_CHOICE%"=="1" goto :run_weekly
-if "%WF_CHOICE%"=="0" goto :menu
-goto :weekly_factor
+echo   [返回主菜单]
+pause
+goto :menu
 
-:run_weekly
+:macd_timing
 cls
-echo 正在运行周度四因子选股回测...
-"venv_ml\Scripts\python.exe" run_backtest.py --source weekly --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL%
 echo.
+echo ========================================
+echo   MACD 择时策略 [逐股DIF^>DEA·无KDJ]（月度调仓入口）
+echo ========================================
+echo.
+echo   逐股 timing：每只股票独立按 MACD 状态多/空（DIF^>DEA=多头区，金叉进/死叉出），
+echo   无 KDJ 按钮。顶替已退休的 macd_kdj 逐股择时插件。
+echo   股票池: %STOCK_POOL% （跟随全局，主菜单[5]设置）
+echo   记账口径与平台一致（hfq 后复权）。指数门控默认关（MA200 太慢、牛市易长期空仓）；
+echo   如需风控可加 --regime（CLI 用：run_macd_timing.py ... --regime --ma 200）。
+echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+if "%STOCK_POOL%"=="" set STOCK_POOL=all
+echo   正在运行...（%STOCK_POOL% 池，逐股独立子账户等权）
+"venv_ml\Scripts\python.exe" run_macd_timing.py %BACKTEST_START% %BACKTEST_END% --pool %STOCK_POOL% --capital %TOTAL_CAPITAL%
+echo.
+echo   [返回主菜单]
 pause
 goto :menu

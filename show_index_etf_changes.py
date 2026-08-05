@@ -64,6 +64,20 @@ def _has_code(conn, table, code):
     return row is not None
 
 
+def _auto_latest_date(conn):
+    """自动探测数据库最新交易日（index_daily 与 etf_daily 取并集最大值）。
+
+    返回 'YYYYMMDD' 字符串；两表皆空时返回 None。
+    """
+    row = conn.execute(
+        "SELECT MAX(d) FROM ("
+        "  SELECT CAST(trade_date AS TEXT) AS d FROM index_daily "
+        "  UNION SELECT CAST(trade_date AS TEXT) AS d FROM etf_daily"
+        ")"
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def _query_index_series(conn, code, start, end):
     """返回指数区间逐日 [date, close, high, low]（升序）。"""
     sql = """
@@ -124,7 +138,13 @@ def _latest_etf_close(conn, code, end):
 
 
 def _etf_total_return(conn, code, start, end):
-    """ETF 前复权总回报（价格+股息），即买入持有 ETF 的真实收益。无数据返回 None。"""
+    """ETF 前复权总回报（价格+股息），即买入持有 ETF 的真实收益。
+
+    返回 (总回报小数, 实际起算日YYYYMMDD, 实际交易日数)；无数据返回 None。
+    实际起算日可能晚于 start（ETF 上市晚），此时总回报只覆盖上市后的区间，
+    与「指数涨跌」（全程）不可直接相减 —— 调用方应据此标注。
+    实际交易日数用于计算「ETF年化」（按实际持有区间年化，而非表格全程）。
+    """
     rows = conn.execute(
         "SELECT CAST(trade_date AS TEXT), close FROM etf_daily "
         "WHERE ts_code = ? AND CAST(trade_date AS TEXT) >= ? "
@@ -142,11 +162,36 @@ def _etf_total_return(conn, code, start, end):
         return None
     first_unadj, last_unadj = rows[0][1], rows[-1][1]
     adj_first = first_unadj * f0 / f1
-    return last_unadj / adj_first - 1.0
+    return last_unadj / adj_first - 1.0, rows[0][0], len(rows)
+
+
+def _top10_concentration(conn, index_code, end):
+    """取该指数在 end(含)之前最近一个快照日前十大成分股权重之和(%)，量化"分散悄悄集中"风险。
+
+    返回百分比数值（如 62.3 表示前十大占 62.3%）；无 index_weight 数据(%)返回 None。
+    权重字段 weight 本身为百分比（5.008 => 5.008%）。
+    """
+    row = conn.execute(
+        "SELECT MAX(trade_date) FROM index_weight "
+        "WHERE index_code = ? AND CAST(trade_date AS TEXT) <= ?",
+        (index_code, end),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    td = row[0]
+    weights = conn.execute(
+        "SELECT weight FROM index_weight WHERE index_code = ? AND trade_date = ? "
+        "ORDER BY weight DESC LIMIT 10",
+        (index_code, td),
+    ).fetchall()
+    if not weights:
+        return None
+    return sum(float(r[0]) for r in weights)
 
 
 def _pack(name, code, kind, ref, start_dt, start_close, end_dt, end_close,
-          pct, amplitude, max_dd, ann, n_days, etf_total=None):
+          pct, amplitude, max_dd, ann, n_days, etf_total=None, top10=None,
+          etf_total_start=None, etf_ann=None):
     return {
         "name": name,
         "code": code,
@@ -158,10 +203,17 @@ def _pack(name, code, kind, ref, start_dt, start_close, end_dt, end_close,
         "end_close": end_close,
         "pct": pct,
         "etf_total": etf_total,
+        # ETF总回报的实际起算日(YYYYMMDD)；晚于表格 start 时说明 ETF 上市晚，
+        # 总回报与「指数涨跌」(全程)区间不同，不可直接对比 → 输出时需标注
+        "etf_total_start": etf_total_start,
+        # ETF年化(%): 按 ETF 实际数据区间(上市日起)对总回报年化。
+        # 上市晚于表格 start 的 ETF，该值才是其真实年化，「年化」列(指数全程)与其无关
+        "etf_ann": etf_ann,
         "amplitude": amplitude,
         "max_dd": max_dd,
         "ann": ann,
         "n_days": n_days,
+        "top10": top10,
     }
 
 
@@ -187,6 +239,9 @@ def compute_one(conn, name, index_code, etf_code, start, end):
     """
     etf_avail = bool(etf_code) and _has_code(conn, "etf_daily", etf_code)
     idx_avail = _has_code(conn, "index_daily", index_code)
+
+    # 前十大成分股权重集中度（"分散悄悄集中"风险量化），无数据则为 None
+    top10 = _top10_concentration(conn, index_code, end)
 
     # ── 情形 A：有 ETF 且有指数 → ETF 现价 × 指数收益路径校正 ──
     if etf_avail and idx_avail:
@@ -217,10 +272,21 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         years = len(adj) / TRADING_DAYS
         ann = ((end_ratio) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
 
-        etf_total = _etf_total_return(conn, etf_code, start, end)
+        _etr = _etf_total_return(conn, etf_code, start, end)
+        etf_total, etf_total_start, etf_n = (_etr if _etr is not None else (None, None, None))
+        # ETF年化: 按 ETF 实际数据区间(上市日起)年化, 与「年化」列(指数全程)口径无关
+        etf_ann = None
+        if etf_total is not None and etf_n and etf_n > 1:
+            etf_years = etf_n / TRADING_DAYS
+            if etf_years > 0 and (1.0 + etf_total) > 0:
+                etf_ann = ((1.0 + etf_total) ** (1.0 / etf_years) - 1.0) * 100.0
+        # 起算日与全程起点相同(或同一交易日)则无需标注
+        if etf_total_start is not None and etf_total_start <= start_dt:
+            etf_total_start = None
         return _pack(name, etf_code, "ETF(指数校正)", index_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(adj), ann, len(adj), etf_total)
+                     pct, amplitude, _max_drawdown(adj), ann, len(adj), etf_total, top10,
+                     etf_total_start=etf_total_start, etf_ann=etf_ann)
 
     # ── 情形 B：有 ETF 但无对应指数 → ETF 自身 pct_chg 复权序列 ──
     if etf_avail:
@@ -251,7 +317,8 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         ann = ((end_close / start_close) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
         return _pack(name, etf_code, "ETF", etf_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(adj), ann, n, pct / 100.0)
+                     pct, amplitude, _max_drawdown(adj), ann, n, pct / 100.0, top10,
+                     etf_ann=ann)
 
     # ── 情形 C：无 ETF（etf_code 为空）→ 纯指数兜底 ──
     if idx_avail:
@@ -270,7 +337,7 @@ def compute_one(conn, name, index_code, etf_code, start, end):
         ann = ((end_close / start_close) ** (1.0 / years) - 1.0) * 100.0 if years > 0 else 0.0
         return _pack(name, index_code, "指数", index_code,
                      start_dt, start_close, end_dt, end_close,
-                     pct, amplitude, _max_drawdown(closes), ann, len(closes), None)
+                     pct, amplitude, _max_drawdown(closes), ann, len(closes), None, top10)
 
     return None
 
@@ -294,24 +361,43 @@ def print_console(results, start, end):
     print(f"  指数 / ETF 涨跌一览    区间: {start} ~ {end}")
     print("  展示标的为 ETF(现价=当前买入价)；「指数涨跌」用对应指数收益路径校正(消除ETF拆分伪影)，为指数价格口径(不含股息)")
     print("  「ETF总回报」= ETF前复权(价格+股息)即买入持有ETF的真实收益；二者对照可见跟踪差与股息贡献")
+    print("  带 * 的总回报: ETF上市晚于区间起点, 仅覆盖上市后区间(见表尾脚注), 与全程指数涨跌不可直接对比")
+    print("  「年化」= 指数全程路径年化；「ETF年化」= ETF总回报按实际数据区间(上市日起)年化, 上市晚的ETF看这列才对")
     print("=" * 82)
     print(f"  {'#':<3}{'指数':<14}{'标的':<11}{'类型':<14}"
-          f"{'起→现价':<20}{'指数涨跌':>9}{'ETF总回报':>10}{'振幅':>8}{'最大回撤':>9}{'年化':>8}")
-    print("-" * 82)
+          f"{'起→现价':<20}{'指数涨跌':>9}{'ETF总回报':>10}{'振幅':>8}{'最大回撤':>9}{'年化':>8}{'ETF年化':>9}{'前十大集中度':>14}")
+    print("-" * 104)
     for i, r in enumerate(results, 1):
         arrow = "▲" if r["pct"] >= 0 else "▼"
         arrow_colored = _color(arrow, r["pct"], tty)
         pct_str = _color(f"{r['pct']:+7.2f}%", r["pct"], tty)
         kind_disp = (f"ETF↔{r['ref']}" if r["kind"] == "ETF(指数校正)"
                      else r["kind"])
-        etf_total_str = f"{(r['etf_total'] * 100):+7.2f}%" if r.get("etf_total") is not None else "  --  "
+        if r.get("etf_total") is not None:
+            _star = "*" if r.get("etf_total_start") else " "
+            etf_total_str = f"{(r['etf_total'] * 100):+7.2f}%{_star}"
+        else:
+            etf_total_str = "  --   "
+        if r.get("etf_ann") is not None:
+            _star2 = "*" if r.get("etf_total_start") else " "
+            etf_ann_str = f"{r['etf_ann']:>7.1f}%{_star2}"
+        else:
+            etf_ann_str = "   --   "
         line = (f"  {i:>2}.{r['name']:<13}{r['code']:<11}{kind_disp:<14}"
                 f"{r['start_close']:>9.2f}→{r['end_close']:>9.2f} "
                 f"{arrow_colored}{pct_str:>7}{etf_total_str:>10}"
                 f"{r['amplitude']:>7.1f}%"
-                f"{r['max_dd']:>8.1f}%{r['ann']:>7.1f}%")
+                f"{r['max_dd']:>8.1f}%{r['ann']:>7.1f}%{etf_ann_str:>9}")
+        top10_str = f"{r['top10']:.1f}%" if r.get("top10") is not None else "  --  "
+        line += f"{top10_str:>14}"
         print(line)
-    print("-" * 78)
+    print("-" * 104)
+    late = [r for r in results if r.get("etf_total_start")]
+    if late:
+        print("  * ETF上市晚于区间起点，「ETF总回报」「ETF年化」仅覆盖上市后区间，与「指数涨跌」「年化」(全程)不可直接对比:")
+        for r in late:
+            _ea = f"，ETF年化 {r['etf_ann']:+.1f}%" if r.get("etf_ann") is not None else ""
+            print(f"      {r['name']}({r['code']}) 实际起算 {r['etf_total_start']}{_ea}")
     if ups or downs:
         best = max(results, key=lambda x: x["pct"])
         worst = min(results, key=lambda x: x["pct"])
@@ -346,9 +432,35 @@ def write_html(results, start, end, out_path):
         if r.get("etf_total") is not None:
             _et = r["etf_total"]
             _cls = "up" if _et >= 0 else "down"
-            etf_total_disp = f'<span class="{_cls}">{_et * 100:+.2f}%</span>'
+            _ts = r.get("etf_total_start")
+            if _ts:
+                _d = f"{_ts[:4]}-{_ts[4:6]}"
+                etf_total_disp = (
+                    f'<span class="{_cls}" title="ETF上市晚于区间起点，总回报自 {_ts} 起算，'
+                    f'与「指数涨跌」(全程)区间不同，不可直接相减">{_et * 100:+.2f}%'
+                    f'<span class="since">自{_d}</span></span>')
+            else:
+                etf_total_disp = f'<span class="{_cls}">{_et * 100:+.2f}%</span>'
         else:
             etf_total_disp = '<span class="muted">--</span>'
+        if r.get("etf_ann") is not None:
+            _ea = r["etf_ann"]
+            _ea_cls = "up" if _ea >= 0 else "down"
+            _ts2 = r.get("etf_total_start")
+            if _ts2:
+                _d2 = f"{_ts2[:4]}-{_ts2[4:6]}"
+                etf_ann_disp = (
+                    f'<span class="{_ea_cls}" title="按ETF实际数据区间(自 {_ts2} 上市起算)年化，'
+                    f'这是该ETF真实的年化收益；左侧「年化」列为指数全程口径，与其区间不同">'
+                    f'{_ea:+.1f}%<span class="since">自{_d2}</span></span>')
+            else:
+                etf_ann_disp = f'<span class="{_ea_cls}">{_ea:+.1f}%</span>'
+        else:
+            etf_ann_disp = '<span class="muted">--</span>'
+        if r.get("top10") is not None:
+            top10_disp = f'<span class="up">{r["top10"]:.1f}%</span>'
+        else:
+            top10_disp = '<span class="muted">--</span>'
         rows.append(f"""
         <tr>
           <td class="name">{r['name']}</td>
@@ -364,6 +476,8 @@ def write_html(results, start, end, out_path):
           <td class="num">{r['amplitude']:.1f}%</td>
           <td class="num">{r['max_dd']:.1f}%</td>
           <td class="num">{r['ann']:.1f}%</td>
+          <td class="num">{etf_ann_disp}</td>
+          <td class="num" title="该指数在最近快照日前十大成分股权重之和(%)。值越高说明看似宽基实则越集中于少数巨头(被动投资'分散悄悄集中'风险)">{top10_disp}</td>
         </tr>""")
 
     ups = sum(1 for r in results if r["pct"] >= 0)
@@ -396,11 +510,13 @@ def write_html(results, start, end, out_path):
            vertical-align:middle; }}
   .chv {{ font-size:12px; margin-left:6px; color:#555; }}
   .muted {{ color:#aaa; }}
+  .since {{ font-size:10px; color:#b8860b; background:#fdf6e3; border-radius:4px;
+           padding:0 4px; margin-left:4px; font-weight:400; vertical-align:middle; }}
   tr:hover {{ background:#fafcff; }}
 </style></head>
 <body>
   <h1>指数 / ETF 涨跌一览</h1>
-  <div class="meta">回测区间 {start} ~ {end} ｜ 以 ETF 为标的（现价=当前买入价）；「指数涨跌」用对应指数收益路径校正(消除ETF拆分伪影, 指数价格口径不含股息)；「ETF总回报」= ETF前复权(价格+股息)即买入持有ETF真实收益 ｜ 红涨绿跌</div>
+  <div class="meta">回测区间 {start} ~ {end} ｜ 以 ETF 为标的（现价=当前买入价）；「指数涨跌」用对应指数收益路径校正(消除ETF拆分伪影, 指数价格口径不含股息)；「ETF总回报」= ETF前复权(价格+股息)即买入持有ETF真实收益，带「自YYYY-MM」角标表示ETF上市晚于区间起点、总回报仅覆盖上市后区间(与全程指数涨跌不可直接相减)；「ETF年化」= ETF总回报按实际数据区间(上市日起)年化，上市晚的ETF以该列为准 ｜ 红涨绿跌</div>
   <div class="summary">
     <div class="card"><div class="k">覆盖指数</div><div class="v">{len(results)}</div></div>
     <div class="card"><div class="k">上涨 / 下跌</div>
@@ -412,7 +528,7 @@ def write_html(results, start, end, out_path):
     <thead><tr>
       <th>指数</th><th>标的(ETF)</th><th>类型</th><th>起始日</th><th>起始(复权)</th>
       <th>结束日</th><th>现价(ETF)</th><th>指数涨跌</th><th>ETF总回报</th><th>涨跌分布</th>
-      <th>振幅</th><th>最大回撤</th><th>年化</th>
+      <th>振幅</th><th>最大回撤</th><th title="指数全程路径年化(价格口径)">年化</th><th title="ETF总回报按实际数据区间(上市日起)年化；上市晚于区间起点的ETF看这列才是真实年化">ETF年化</th><th>前十大集中度</th>
     </tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
@@ -431,19 +547,37 @@ def main():
     args = ap.parse_args()
 
     if not args.start or not args.end:
-        # 回退：尝试读取 config.py 的回测区间
+        # 回退：尝试读取 config.py 的回测区间（仅取 start；end 默认自动到最新）
         try:
             import config  # noqa
-            args.start = args.start or config.GLOBAL["backtest_start"]
-            args.end = args.end or config.GLOBAL["backtest_end"]
+            args.start = args.start or config.GLOBAL.get("backtest_start", "20240101")
         except Exception:
-            args.start = args.start or "20240101"
-            args.end = args.end or "20260703"
+            pass
+        args.start = args.start or "20240101"
+        args.end = args.end or "auto"  # 指数涨跌一览默认展示到数据库最新交易日
 
     start, end = args.start, args.end
-    print(f"[*] 区间 {start} ~ {end}，数据库: {DB_PATH}")
-
     conn = sqlite3.connect(DB_PATH)
+
+    # 结束日期留空或显式传 auto/latest/today 时，自动匹配数据库最新交易日
+    if end in (None, "auto", "latest", "today", ""):
+        auto = _auto_latest_date(conn)
+        if auto:
+            print(f"[*] 结束日期未指定，自动使用数据库最新交易日: {auto}")
+            end = auto
+        else:
+            print("[!] 无法自动探测最新交易日，请手动指定 end 日期。")
+            conn.close()
+            return
+
+    if not start:
+        try:
+            import config  # noqa
+            start = config.GLOBAL.get("backtest_start", "20240101")
+        except Exception:
+            start = "20240101"
+
+    print(f"[*] 区间 {start} ~ {end}，数据库: {DB_PATH}")
     results = []
     missing = []
     for name, idx_code, etf_code, etf_name, _cat in INDEX_MAP:

@@ -7,7 +7,10 @@
   市场波段本身就是利润来源，不需要预测涨跌。
 
 设计立场（参考《网格交易策略详解与回测》BV1Yf4y177cA 提炼，不盲从）：
-  · 保留「固定价位·无限网格」（等比、穿越式格线、永不冻结）——比文档的每日重设中枢更稳健，是我们的核心优势。
+  · 网格中枢（核心价值）：以「滚动移动平均(MA)」为中枢，买/卖线每日挂在 中枢±gap 上，
+    跟随市场下沉/回升而移动——单边下跌后反弹时卖线随中枢抬升被价格触及(可卖)，
+    而非钉死在周期顶永远够不到；买线随中枢下移、把弹药沿整个下跌路径铺开而非山顶打光。
+    仍保留「穿越式·永不冻结」特性。center_mode="fixed" 时退化为旧版(锚定首日收盘价)供对照。
   · 保留「宽基/风格指数 ETF 标的 + 50% 底仓起步 + 非对称浮亏不割」——契合文档"选宽基、留子弹"思想。
   · 提取文档两大风控缺口补强：① 总止损线（硬熔断，防深套虚无）；② 波动率关网（波动突升暂停、恢复自动重启）。
   · 不照搬：零仓起步（我们需底仓可收割）、强制清仓止损（宽基长期向上宜持有）、1% 过密档（摩擦成本高，仅作可选预设）。
@@ -18,6 +21,7 @@
 import sys
 import os
 import sqlite3
+import datetime as _dtmod
 import numpy as np
 import pandas as pd
 
@@ -26,9 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_monthly_rebalance import (
     get_conn, get_price, get_open_price,
     INIT_CAPITAL, INDEX_DISPLAY_NAME,
-    COMMISSION_RATE, COMMISSION_MIN, SLIPPAGE_RATE,
+    COMMISSION_RATE, COMMISSION_MIN, SLIPPAGE_RATE, compute_reality_discounts,
 )
 from run_backtest import calc_win_rate_from_trades
+from run_etf_rotation import PremiumGate
 
 # ETF显示名称（专供网格交易使用）
 ETF_DISPLAY_NAME = {
@@ -107,6 +112,30 @@ def _load_etf_adjusted(conn, ts_code, start_date, end_date):
     return df, "（已前复权：etf_adj_factor）"
 
 
+def _top10_concentration(conn, index_code, end):
+    """取该指数在 end(含)之前最近一个快照日前十大成分股权重之和(%)，量化"分散悄悄集中"风险。
+
+    与 show_index_etf_changes.py 同一口径：weight 字段本身为百分比（5.008 => 5.008%）。
+    返回百分比数值（如 62.3 表示前十大占 62.3%）；无 index_weight 数据返回 None。
+    """
+    row = conn.execute(
+        "SELECT MAX(trade_date) FROM index_weight "
+        "WHERE index_code = ? AND CAST(trade_date AS TEXT) <= ?",
+        (index_code, end),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    td = row[0]
+    weights = conn.execute(
+        "SELECT weight FROM index_weight WHERE index_code = ? AND trade_date = ? "
+        "ORDER BY weight DESC LIMIT 10",
+        (index_code, td),
+    ).fetchall()
+    if not weights:
+        return None
+    return sum(float(r[0]) for r in weights)
+
+
 # ── 网格专属费用模型 ──
 # 网格策略的标的只可能是 ETF 或指数（见下方 ETFS 菜单），二者均免收印花税：
 #   · ETF（场内交易型开放式指数基金）卖出不收印花税；
@@ -124,6 +153,9 @@ def calc_fee_grid(buy_or_sell, price, shares):
 # ── 默认参数 ──
 GRID_PCT = 0.02          # 每格百分比 (2%)
 PER_GRID_CASH = 5000     # 每格交易金额
+CENTER_MODE = "fixed"    # 网格中枢模式：fixed=旧版固定价位网格(通用稳健·默认)；ma=滚动MA中枢(震荡/深跌市更优·需主动开启)
+CENTER_MA_WINDOW = 60    # 中枢MA窗口(日)；仅 center_mode=ma 生效
+MA_GRID_LEVELS = 60      # MA模式每侧生成的格线层数(覆盖 ±60 档，足够宽)
 INIT_POSITION_PCT = 0.5  # 初始持仓比例（50%建仓）
 POS_MIN_FRAC = 0.0       # 持仓下限（占初始底仓比例）：设为0=移除硬下限。
                            # 原因：原 0.3 下限会在大涨市中把仓位 draining 到下限后，
@@ -164,7 +196,11 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
                       init_position_pct=INIT_POSITION_PCT, initial_capital=INIT_CAPITAL,
                       mode="symmetric", sell_pct=None,
                       trend_filter=False, ma_window=250,
-                      stop_loss=None, vol_filter=False, vol_window=20, vol_mult=2.5):
+                      stop_loss=None, vol_filter=False, vol_window=20, vol_mult=2.5,
+                      compare_buyhold=False, caveat=False,
+                      center_mode=CENTER_MODE, center_ma_window=CENTER_MA_WINDOW,
+                      interrupt_start=None, interrupt_months=0, interrupt_pct=0.0,
+                      premium_filter="qdii"):
     """
     百分比网格交易回测
 
@@ -186,6 +222,12 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     lot_size = 1 if is_index else 100  # 指数最少1份，ETF/股票最少1手100股
 
     display = INDEX_DISPLAY_NAME.get(ts_code, ETF_DISPLAY_NAME.get(ts_code, ts_code))
+
+    # ── 折溢价闸门（默认 qdii：跨境ETF≥8%溢价拦截；指数/国内ETF不拦）──
+    gate = PremiumGate([{"code": ts_code, "name": display}], mode=premium_filter)
+    if gate.enabled:
+        print(f"  折溢价过滤：开启 [{premium_filter}]（跨境≥8%溢价拦截，指数/国内放行）")
+
     print("=" * 70)
     print(f"百分比网格交易回测")
     print("=" * 70)
@@ -269,6 +311,16 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
                     bench_detail["idx_price_ret"] = (_i1 / _i0 - 1) * 100.0
         except Exception:
             bench_detail = {}
+
+    # 前十大权重集中度（"分散悄悄集中"风险量化，供 --caveat 硬提醒）。
+    # ETF 标的需先映射回基准指数（ETF本身无 index_weight），无映射/无数据则为 None。
+    conc_top10 = None
+    try:
+        _idx_code = ts_code if is_index else ETF_TO_INDEX.get(ts_code)
+        if _idx_code:
+            conc_top10 = _top10_concentration(conn, _idx_code, end_date)
+    except Exception:
+        conc_top10 = None
     conn.close()
 
     # ===== 1.5 趋势过滤用的 MA 序列（向前多取 ma_window 交易日作窗口）=====
@@ -318,6 +370,31 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
             print(f"  [WARN] 波动率关网计算失败，已关闭：{e}")
             vol_high = {}
 
+    # ===== 1.55 中枢网格用的滚动中枢序列（MA）=====
+    # 中枢 = 近期收盘价的滚动 MA；价格围绕中枢上下波动时，买/卖线挂在 中枢±gap。
+    # 向前多取历史窗口使回测首日即可得到有效中枢；窗口未填满前中枢退化为 base_price(=固定模式)。
+    center_series = {}
+    if center_mode == "ma" and center_ma_window and center_ma_window > 1:
+        try:
+            _sd2 = _dtmod.datetime.strptime(start_date, "%Y%m%d")
+            _ext_start2 = (_sd2 - _dtmod.timedelta(days=int(center_ma_window * 3))).strftime("%Y%m%d")
+            _c2 = get_conn()
+            if is_index:
+                _ext2 = pd.read_sql_query(
+                    "SELECT trade_date, close FROM index_daily "
+                    "WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ? ORDER BY trade_date",
+                    _c2, params=(ts_code, _ext_start2, end_date))
+            else:
+                _ext2, _ = _load_etf_adjusted(_c2, ts_code, _ext_start2, end_date)
+            _c2.close()
+            if not _ext2.empty:
+                _ext2["ma"] = _ext2["close"].rolling(int(center_ma_window)).mean()
+                center_series = {int(d): float(m) for d, m in zip(_ext2["trade_date"], _ext2["ma"]) if pd.notna(m)}
+        except Exception as e:
+            print(f"  [WARN] 中枢MA计算失败，退化为固定价位网格：{e}")
+            center_series = {}
+            center_mode = "fixed"
+
     if len(df) < 2:
         print(f"⚠️ 数据不足（{len(df)}条），无法回测")
         return None
@@ -327,23 +404,33 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     if adj_note:
         print(f"  {adj_note}")
 
-    # ===== 2. 固定价位·无限网格（经典网格，永不冻结）=====
-    # 相较「每日以前收为锚重挂单」版本的关键改进：
-    #   网格线钉在【绝对价格】上（base×(1±gap)^n），价格走到哪条线就在哪条线交易，
-    #   该线触发后保持有效（价格再次穿越仍可交易）。因此：
-    #     · 不依赖单日 ≥gap% 的剧烈波动 —— 价格每天只晃 1% 也能反复穿越固定格线被收割；
-    #     · 不会"跑一轮就废" —— 格线是穿越式持久触发点，而非用一次就废的标记，永不冻结。
+    # ===== 2. 网格中枢（升级：以滚动 MA 为中枢的中枢网格）=====
+    # 相较旧版「固定价位·无限网格」(线钉死在首日收盘价、永不移动)：
+    #   中枢网格把买/卖线挂在一个【滚动移动平均】上——中枢随市场下沉/回升而移动，
+    #   格线跟随中枢走。好处：单边下跌后反弹时，卖线会随中枢抬升而被价格触及(可卖出)，
+    #   而不是被钉死在周期顶永远够不到；买线也随中枢下移、把弹药沿整个下跌路径铺开，
+    #   而非在山顶区一次性打光。仍保留「穿越式·永不冻结」特性。
+    #   center_mode="fixed" 时退化为旧版(锚定首日收盘价)，用于对照。
     base_price = float(df.iloc[0]['close'])
 
     if mode == "asymmetric":
         sp = sell_pct if sell_pct is not None else grid_pct * 2.5
         buy_gap = grid_pct
         sell_gap = sp
-        print(f"  网格间距：非对称 买{buy_gap*100:.0f}% / 卖{sell_gap*100:.1f}%（固定价位·无限网格）")
     else:
         buy_gap = sell_gap = grid_pct
+
+    if center_mode == "ma":
+        print(f"  网格模式：滚动MA中枢网格（中枢=MA{center_ma_window}·穿越式·永不冻结）")
+        print(f"  网格间距：{buy_gap*100:.0f}%（买线随中枢下潜 / 卖线随中枢上浮）")
+        print(f"  初始中枢：MA{center_ma_window}(首段)≈{base_price:.2f} ｜ 卖线随中枢抬升、买线随中枢下移")
+    elif mode == "asymmetric":
+        print(f"  网格间距：非对称 买{buy_gap*100:.0f}% / 卖{sell_gap*100:.1f}%（固定价位·无限网格）")
+    else:
         print(f"  网格间距：{grid_pct*100:.0f}%（固定价位·无限网格）")
-    print(f"  初始挂单：买 {base_price*(1-buy_gap):.2f} / 卖 {base_price*(1+sell_gap):.2f}\n")
+    if center_mode != "ma":
+        print(f"  初始挂单：买 {base_price*(1-buy_gap):.2f} / 卖 {base_price*(1+sell_gap):.2f}")
+    print()
 
     # ===== 3. 初始化仓位（按金额，股票取整手）=====
     cash = initial_capital * (1 - init_position_pct)
@@ -362,12 +449,16 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     pos_min = units * POS_MIN_FRAC
     pos_max = units * POS_MAX_FRAC
 
-    # 生成固定网格线（绝对价格，向下/向上足够宽地延展，覆盖全程任意价格）
-    # 线为穿越式持久触发点：价格从上方跌破买入线即买一格、从下方涨破卖出线即卖一格，
-    # 每条线可被反复穿越，故永不冻结、可无限循环收割。
-    _N = 400
-    buy_lines  = sorted([base_price * (1 - buy_gap) ** k for k in range(1, _N + 1)], reverse=True)  # 由近及远向下
-    sell_lines = sorted([base_price * (1 + sell_gap) ** k for k in range(1, _N + 1)])               # 由近及远向上
+    # 生成网格线
+    # 固定模式：锚定首日收盘价的绝对价位线（永不移动，预计算一次）。
+    # MA中枢模式：线在循环内按「当日中枢」实时生成（中枢随MA移动 → 线随中枢走）。
+    if center_mode == "fixed":
+        _N = 400
+        buy_lines  = sorted([base_price * (1 - buy_gap) ** k for k in range(1, _N + 1)], reverse=True)  # 由近及远向下
+        sell_lines = sorted([base_price * (1 + sell_gap) ** k for k in range(1, _N + 1)])               # 由近及远向上
+        _precomp_lines = (buy_lines, sell_lines)
+    else:
+        _precomp_lines = None
 
     daily_vals = []
     trades = []
@@ -390,6 +481,15 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         lo = row['low']
         cl = row['close']
 
+        # ── 中枢网格：固定模式用预计算线；MA模式按当日中枢实时生成格线 ──
+        if center_mode == "fixed":
+            cur_buy_lines, cur_sell_lines = _precomp_lines
+            cur_center = base_price
+        else:
+            cur_center = center_series.get(td, base_price)
+            cur_buy_lines  = sorted([cur_center * (1 - buy_gap) ** k for k in range(1, MA_GRID_LEVELS + 1)], reverse=True)
+            cur_sell_lines = sorted([cur_center * (1 + sell_gap) ** k for k in range(1, MA_GRID_LEVELS + 1)])
+
         # ── 趋势过滤：价格站上 MA(ma_window) 上方 → 只持有不卖（抑制趋势踏空）──
         allow_sell_trend = True
         if trend_filter and ma_series:
@@ -397,10 +497,11 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
             if _ma is not None and cl > _ma:
                 allow_sell_trend = False
 
-        # 非对称：仅当价格高于基准（已处浮盈区）才允许收割，浮亏不割肉
+        # 非对称：仅当价格高于中枢（已处浮盈区）才允许收割，浮亏不割肉
         allow_sell = True
         if mode == "asymmetric":
-            allow_sell = prev_close > base_price
+            _ref = cur_center if center_mode == "ma" else base_price
+            allow_sell = prev_close > _ref
 
         # ── 风控闸门：总止损线(硬熔断) + 波动率关网(日级) ──
         # 任一触发则当日仅持有、不新建网格交易；其余逻辑不变。
@@ -416,7 +517,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         #   上涨日(close>prev_close) ：价格涨破 (prev_close, hi] 内的每条卖出线 → 逐格卖出
         # 按当日方向只处理一侧，避免单日 whipsaw 同时买卖刷单；每条线可被反复穿越。
         if grid_enabled and cl <= prev_close:
-            for line in buy_lines:
+            for line in cur_buy_lines:
                 if lo <= line < prev_close and units < pos_max:
                     buy_units = per_grid_cash / line if line > 0 else 0
                     if lot_size > 1:
@@ -437,7 +538,16 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
                                 buy_fee = calc_fee_grid('buy', line, buy_units)
                             else:
                                 buy_units = 0
-                        if buy_units > 0 and buy_cost + buy_fee <= cash:
+                    if buy_units > 0 and buy_cost + buy_fee <= cash:
+                        # ── 折溢价闸门（默认 qdii）：高溢价时跳过本次网格买入 ──
+                        do_buy = True
+                        if gate.enabled:
+                            allow, prem = gate.check(ts_code, td)
+                            if not allow:
+                                do_buy = False
+                                if verbose:
+                                    print(f"  🚫 折溢价拦截 {td} 格线{line:.2f}：{display} 溢价 {prem:+.2%} ≥ 阈值，跳过买入")
+                        if do_buy:
                             cash -= buy_cost + buy_fee
                             units += buy_units
                             buy_count += 1
@@ -448,7 +558,7 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
                             })
         elif grid_enabled:
             if allow_sell and allow_sell_trend and units > pos_min:
-                for line in sell_lines:
+                for line in cur_sell_lines:
                     if prev_close < line <= hi and units > pos_min:
                         sell_units = per_grid_cash / line
                         if lot_size > 1:
@@ -524,6 +634,27 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
     # ===== 6. 基准对比 =====
     idx_return = (float(df.iloc[-1]['close']) / float(df.iloc[0]['close']) - 1) * 100
 
+    # 网格 vs 买入持有 对照（文章《长期持有ETF的真相》方法论量化）：
+    # 同一笔钱、首日满仓买入并躺平到结束（不交易、不风控），与主动网格对照。
+    # 用与网格完全相同的价格口径（指数=裸价/ETF=前复权总回报），保证苹果对苹果。
+    bh_return = None
+    bh_regime = ""
+    if compare_buyhold:
+        _bh_first = float(df.iloc[0]['open'])
+        _bh_last = float(df.iloc[-1]['close'])
+        _bh_units = int(initial_capital / (_bh_first * lot_size)) * lot_size if lot_size > 0 else 0
+        _bh_left = initial_capital - _bh_units * _bh_first
+        _bh_final = _bh_units * _bh_last + _bh_left
+        bh_return = (_bh_final / initial_capital - 1) * 100 if initial_capital > 0 else 0.0
+        # 修正：0 笔卖出时不能声称"网格收割占优"——差异来自初始仓位暴露，非波段收割
+        if total_return > bh_return:
+            if sell_count == 0:
+                bh_regime = "网格未触发卖出（无波段收割）—— 差异来自仓位暴露，非网格策略贡献"
+            else:
+                bh_regime = "震荡/波段市 —— 网格收割占优"
+        else:
+            bh_regime = "单边趋势市 —— 买入持有占优"
+
     # ===== 7. 输出 =====
     print(f"\n{'=' * 70}")
     print(f"  网格交易回测结果")
@@ -555,6 +686,49 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
                 print(f"  基准指数 {_ic_name}({_ic}) 价格口径：{_ir:+.2f}%")
         print(f"  超额收益（策略 vs ETF总回报）：{total_return - idx_return:+.2f}%")
 
+    # ── 现实折扣三件套（扣通胀 / 定投拖累 / 中断模拟）──
+    disc = compute_reality_discounts(
+        daily_vals, initial_capital,
+        interrupt_start=interrupt_start,
+        interrupt_months=interrupt_months,
+        interrupt_pct=interrupt_pct,
+    )
+    if "real_total_return" in disc:
+        print(f"  ── 现实折扣（预期管理，不改收益计算）──")
+        print(f"  扣通胀真实总收益：{disc['real_total_return']:+.2f}% ｜ 真实年化：{disc['real_annual_return']:+.2f}%")
+    if "dca_drag_pct" in disc:
+        print(f"  定投对比(DCA)：一次性建仓较分12月定投 {disc['dca_drag_pct']:+.2f}%"
+              f"（正=一次性占优·负=定投占优）｜ 终值 一次性 {disc['dca_lump_final']:,.0f} / 定投 {disc['dca_dca_final']:,.0f}")
+    if "interrupt_loss_pct" in disc:
+        print(f"  中断模拟：{interrupt_start}起撤{interrupt_pct*100:.0f}%持有{interrupt_months}月，"
+              f"终值损失 {disc['interrupt_loss_pct']:+.2f}%（终值 {disc['interrupt_final']:,.0f}）")
+
+    # ===== 7b. 网格 vs 买入持有 对照（可选开关）=====
+    if compare_buyhold and bh_return is not None:
+        print(f"  ── 网格 vs 买入持有（文章方法论对照）──")
+        print(f"  买入持有（满仓躺平·{display}）：{bh_return:+.2f}%")
+        print(f"  网格策略：{total_return:+.2f}%")
+        print(f"  差额（网格 − 持有）：{total_return - bh_return:+.2f}%")
+        print(f"  市场形态判定：{bh_regime}")
+        if sell_count == 0:
+            print(f"    · 注意：本段网格 0 笔卖出，所谓优于持有来自初始仓位较低(少亏)，非波段收割贡献。")
+        else:
+            print(f"    · 长横盘/震荡市网格靠收割占优；单边牛市持有占优（文章：日经30年/纳指13年横盘最伤买入持有）")
+
+    # ===== 7c. 情景提示（可选开关）=====
+    if caveat:
+        print(f"\n  ── 情景提示（长期持有ETF文章的边界提醒）──")
+        print(f"  · 市场级幸存者偏差：本回测仅覆盖 A 股单市场，未含其他市场崩盘样本（文章：美国百年10%≠全球）")
+        print(f"  · 未来收益下行：历史高收益依赖过去市场环境，机构预测未来权益年化或降至 3-6%，复利差异巨大")
+        # 集中度：用前十大权重占比数据支撑，>40% 升级为硬提醒，无数据则保留定性提示
+        if conc_top10 is not None:
+            if conc_top10 > 40:
+                print(f"  · 集中度预警（数据支撑）：该指数前十大占比 {conc_top10:.1f}%，分散度偏低（被动'分散'悄悄集中，少数巨头决定走势）")
+            else:
+                print(f"  · 集中度（数据支撑）：该指数前十大占比 {conc_top10:.1f}%，分散度尚可（宽基效应仍在）")
+        else:
+            print(f"  · 集中度认知：若持有 科创50/上证50 等，权重高度集中于少数巨头，分散≠真分散（本标的无 index_weight 数据，无法量化）")
+
     # 保存
     csv_dir = "data/results/grid_backtest"
     os.makedirs(csv_dir, exist_ok=True)
@@ -563,6 +737,10 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         mode_tag = f"asym_b{grid_pct*100:.0f}_s{sp*100:.0f}"
     else:
         mode_tag = f"sym_{grid_pct*100:.0f}"
+    if center_mode == "ma":
+        mode_tag += f"_ma{center_ma_window}"
+    elif center_mode == "fixed":
+        mode_tag += "_fixed"
     if trend_filter:
         mode_tag += f"_tf{ma_window}"
     csv_path = f"{csv_dir}/grid_{ts_code.replace('.','_')}_{mode_tag}_{start_date}_{end_date}.csv"
@@ -578,6 +756,8 @@ def run_grid_backtest(ts_code="000300.SH", start_date="20200102", end_date="2025
         "buy_count": buy_count,
         "sell_count": sell_count,
         "idx_return": idx_return,
+        "buyhold_return": bh_return,
+        "regime": bh_regime,
         "daily_values": daily_vals,
     }
 
@@ -690,11 +870,21 @@ def _interactive_menu():
         vf = input("\n请选择 (1-2, 回车=关闭): ").strip()
         vol_on = (vf == "2")
 
+        # 文章《长期持有ETF的真相》借鉴开关（默认关）
+        bh = input("\n网格 vs 买入持有 对照 (1-2, 回车=关闭): ").strip()
+        bh_on = (bh == "2")
+        cv = input("\n情景提示[幸存者偏差/未来收益下行/集中度] (1-2, 回车=关闭): ").strip()
+        cv_on = (cv == "2")
+
         tag = f"{strat['name']}" + (f" + 趋势过滤(MA{ma_win})" if trend_on else "")
         if stop_on:
             tag += " + 止损线"
         if vol_on:
             tag += " + 波动率关网"
+        if bh_on:
+            tag += " + 对照持有"
+        if cv_on:
+            tag += " + 提示"
 
         # 起始日自动校正：若默认起始早于标的数据起点（如科创50/科创100/中证2000
         # 上市较晚），用数据起点作为回测开始，避免"数据不足"误报。
@@ -727,6 +917,8 @@ def _interactive_menu():
             vol_filter=vol_on,
             vol_window=20,
             vol_mult=2.5,
+            compare_buyhold=bh_on,
+            caveat=cv_on,
         )
         # 跑完返回选标的界面，可继续换标的/策略
 
@@ -757,7 +949,24 @@ if __name__ == "__main__":
                         help="波动率关网的回看窗口（默认20日）")
     parser.add_argument("--vol-mult", type=float, default=2.5,
                         help="波动率关网阈值倍数（默认2.5倍基准波动）")
+    parser.add_argument("--compare-buyhold", action="store_true",
+                        help="网格 vs 买入持有 对照（量化《长期持有ETF的真相》'满仓躺平'方法论）")
+    parser.add_argument("--center-mode", choices=["fixed", "ma"], default=CENTER_MODE,
+                        help="网格中枢模式：ma=滚动MA中枢网格(升级,默认)；fixed=旧版固定价位网格(锚定首日收盘价)")
+    parser.add_argument("--center-ma-window", type=int, default=CENTER_MA_WINDOW,
+                        help="中枢MA窗口(默认60日)；仅 center-mode=ma 生效")
+    parser.add_argument("--premium-filter", type=str, default="qdii",
+                        choices=["off", "uniform", "strict", "qdii", "rolling"],
+                        help="折溢价闸门(默认qdii)：跨境ETF≥8%%溢价拦截；off=关闭。依据BV1YP326jE7S(用NAV非IOPV)")
+    parser.add_argument("--caveat", action="store_true",
+                        help="打印情景提示：市场级幸存者偏差 / 未来收益下行 / 集中度（前十大占比>40%%时升级为数据支撑的硬提醒）")
     parser.add_argument("--menu", action="store_true", help="强制进入交互式菜单（选标的+选策略）")
+    parser.add_argument("--interrupt-start", type=str, default=None,
+                        help="现实折扣-中断模拟：从 YYYYMM 起撤出部分资金（配合 --interrupt-months/--interrupt-pct）")
+    parser.add_argument("--interrupt-months", type=int, default=0,
+                        help="中断模拟持续月数（默认0=关闭）")
+    parser.add_argument("--interrupt-pct", type=float, default=0.0,
+                        help="中断模拟撤出比例(0~1，如 0.5=撤一半)，默认0")
     args = parser.parse_args()
 
     # 无参数 / 显式 --menu → 进入交互菜单
@@ -774,10 +983,18 @@ if __name__ == "__main__":
             initial_capital=args.capital,
             mode=args.mode,
             sell_pct=args.sell_pct,
+            premium_filter=args.premium_filter,
             trend_filter=args.trend_filter,
             ma_window=args.ma_window,
             stop_loss=args.stop_loss,
             vol_filter=args.vol_filter,
             vol_window=args.vol_window,
             vol_mult=args.vol_mult,
+            compare_buyhold=args.compare_buyhold,
+            center_mode=args.center_mode,
+            center_ma_window=args.center_ma_window,
+            caveat=args.caveat,
+            interrupt_start=args.interrupt_start,
+            interrupt_months=args.interrupt_months,
+            interrupt_pct=args.interrupt_pct,
         )
