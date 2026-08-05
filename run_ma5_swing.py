@@ -86,6 +86,7 @@ def _build(code):
     if code in _ST_CACHE:
         return _ST_CACHE[code]
     conn = _get_conn()
+    LIM_UP, LIM_DN = _board_limit(code)   # 板块涨跌停阈值（修复#4：不再固定9.8%）
     if _DATA_LO is None:
         # 全历史路径（兼容独立诊断脚本）
         reg._load_code(code)
@@ -166,7 +167,7 @@ def _build(code):
             continue
         yang_body = (c[i] > o[i]) and (o[i] > 0) and ((c[i] - o[i]) / o[i] >= P_BODY)
         yang_vol = ma20vol_excl[i] > 0 and (v[i] >= P_VOL * ma20vol_excl[i])
-        limit_up = (pct[i] >= 9.8) if P_LIMITUP else False
+        limit_up = (pct[i] >= (LIM_UP - 1) * 100) if P_LIMITUP else False
         has_yang[i] = (yang_body and yang_vol) or limit_up
 
     # 20日均成交额（千元）— convolve 保证 20 日窗口
@@ -174,22 +175,42 @@ def _build(code):
     if n >= 20:
         amount20[19:] = np.convolve(amt, np.ones(20) / 20.0, mode="valid")
 
-    # 涨跌停（开盘即板，无法成交）
-    is_limit_up_open = (o == h) & (o >= prec * 1.098) & (prec > 0)
-    is_limit_down_open = (o == l) & (o <= prec * 0.902) & (prec > 0)
+    # 涨跌停（开盘即板，无法成交）— 按板块阈值（修复#4）
+    is_limit_up_open = (o == h) & (o >= prec * LIM_UP) & (prec > 0)
+    is_limit_down_open = (o == l) & (o <= prec * LIM_DN) & (prec > 0)
 
     idx_of = {d: i for i, d in enumerate(dates.tolist())}
     d = dict(dates=dates, ho=ho, hh=hh, hl=hl, hc=hc, vol=v, pct=pct,
              ma5=ma5, ma5_up=ma5_up, ma20vol_excl=ma20vol_excl,
              has_yang=has_yang, amount20=amount20, prec=prec,
              is_limit_up_open=is_limit_up_open, is_limit_down_open=is_limit_down_open,
-             idx_of=idx_of, n=n)
+             fac=fac, idx_of=idx_of, n=n)
     _ST_CACHE[code] = d
     return d
 
 
 # 模块级参数占位（_build 内引用，run 时填充）
 P_BODY = 0.05; P_VOL = 2.0; P_LIMITUP = True
+
+
+def _last_idx(d, td):
+    """停牌/退市日：取不晚于 td 的最近可得交易日索引（carry-forward 收盘价估值），
+    避免持仓在无数据的交易日市值被跳过=归零（虚假回撤/末日清算漏计）。"""
+    arr = d["dates"].tolist()
+    j = bisect.bisect_right(arr, td) - 1
+    if 0 <= j < d["n"]:
+        return j
+    return None
+
+
+def _board_limit(code):
+    """按代码前缀返回涨跌停阈值系数（开盘价 / 昨收）：
+    创业板(30)/科创板(688) ±20%，北交所(8/4) ±30%，其余（00/60）±10%。"""
+    if code.startswith(("30", "688")):
+        return 1.20, 0.80
+    if code.startswith(("8", "4")):
+        return 1.30, 0.70
+    return 1.098, 0.902
 
 
 def _universe(pool, asof):
@@ -276,7 +297,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
     blacklist_until = {}
 
     cash = float(capital)
-    positions = {}   # code -> dict(shares, buy_open_hfq, buy_date, tp_done, counter)
+    positions = {}   # code -> dict(shares, buy_open_raw, buy_date, tp_done, counter)
     # 待执行订单（昨日收盘决策 → 今日开盘执行）
     pend_buys = []       # list of code（按放量倍数排序后填充）
     pend_sells = {}      # code -> 'full' or ratio(float)
@@ -307,6 +328,7 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             if d["is_limit_down_open"][i]:
                 continue  # 跌停封死 → 卖出意图保留，下一交易日开盘重试
             hfq_open = d["ho"][i]
+            raw_open = hfq_open / d["fac"][i]   # 修复#5：手续费/盈亏按真实价口径
             pos = positions[code]
             if kind == "full":
                 sh = pos["shares"]
@@ -318,18 +340,18 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             if zero_cost:
                 fee = 0.0
             else:
-                fee = rmb.calc_fee("sell", hfq_open, sh, trade_date=int(td))
-            proceeds = sh * hfq_open - fee
+                fee = rmb.calc_fee("sell", raw_open, sh, trade_date=int(td))
+            proceeds = sh * raw_open - fee
             cash += proceeds
             executed.add(code)   # 标记已实际成交，用于保留跌停未成交的意图
             # 成本拆分
             if not zero_cost:
-                bd = rmb.calc_fee_breakdown("sell", hfq_open, sh, trade_date=int(td))
+                bd = rmb.calc_fee_breakdown("sell", raw_open, sh, trade_date=int(td))
                 aud["comm"] += bd["commission"]; aud["stamp"] += bd["stamp_duty"]
                 aud["slip"] += bd["slippage"]; aud["n_sell"] += 1
             if kind == "full":
-                # 记录完整交易盈亏
-                pnl = (hfq_open - pos["buy_open_hfq"]) * pos["shares"] - fee
+                # 记录完整交易盈亏（真实价口径）
+                pnl = (raw_open - pos["buy_open_raw"]) * pos["shares"] - fee
                 aud["gross_profit"] += pnl
                 aud["trades"] += 1
                 if pnl > 0:
@@ -369,24 +391,25 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             if d["is_limit_up_open"][i]:
                 continue  # 一字涨停买不进 → 放弃该笔
             hfq_open = d["ho"][i]
-            if hfq_open <= 0:
+            raw_open = hfq_open / d["fac"][i]   # 修复#5
+            if raw_open <= 0:
                 continue
             budget = min(capital / P["max_pos"], cash * (1 - P["reserve"]))
-            sh = int(budget / hfq_open / 100) * 100
+            sh = int(budget / raw_open / 100) * 100
             if sh <= 0:
                 continue
             if zero_cost:
                 fee = 0.0
             else:
-                fee = rmb.calc_fee("buy", hfq_open, sh, trade_date=int(td))
-            cost = sh * hfq_open + fee
+                fee = rmb.calc_fee("buy", raw_open, sh, trade_date=int(td))
+            cost = sh * raw_open + fee
             if cost > cash + 1e-6:
                 continue
             cash -= cost
-            positions[code] = dict(shares=sh, buy_open_hfq=hfq_open,
+            positions[code] = dict(shares=sh, buy_open_raw=raw_open,
                                    buy_date=td, tp_done=False, counter=0, buy_gi=gi)
             if not zero_cost:
-                bd = rmb.calc_fee_breakdown("buy", hfq_open, sh, trade_date=int(td))
+                bd = rmb.calc_fee_breakdown("buy", raw_open, sh, trade_date=int(td))
                 aud["comm"] += bd["commission"]; aud["slip"] += bd["slippage"]
                 aud["n_buy"] += 1
         pend_buys = []
@@ -459,8 +482,10 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
                 continue
             i = d["idx_of"].get(td)
             if i is None or i >= d["n"]:
-                continue
-            val += pos["shares"] * d["hc"][i]
+                i = _last_idx(d, td)   # 修复#1：停牌/退市日 carry-forward 最近收盘价
+                if i is None:
+                    continue
+            val += pos["shares"] * (d["hc"][i] / d["fac"][i])   # 修复#5：真实价口径
         daily_vals.append({"date": td, "value": val})
 
     # 末日清仓（计入成本/黑名单）
@@ -471,16 +496,18 @@ def run_backtest(start_date, end_date, pool="hs300", capital=1000000,
             continue
         i = d["idx_of"].get(last_td)
         if i is None or i >= d["n"]:
-            continue
-        hfq_close = d["hc"][i]
+            i = _last_idx(d, last_td)   # 修复#1
+            if i is None:
+                continue
+        raw_close = d["hc"][i] / d["fac"][i]   # 修复#5：真实价口径
         sh = positions[code]["shares"]
         if zero_cost:
             fee = 0.0
         else:
-            fee = rmb.calc_fee("sell", hfq_close, sh, trade_date=int(last_td))
-        cash += sh * hfq_close - fee
+            fee = rmb.calc_fee("sell", raw_close, sh, trade_date=int(last_td))
+        cash += sh * raw_close - fee
         if not zero_cost:
-            bd = rmb.calc_fee_breakdown("sell", hfq_close, sh, trade_date=int(last_td))
+            bd = rmb.calc_fee_breakdown("sell", raw_close, sh, trade_date=int(last_td))
             aud["comm"] += bd["commission"]; aud["stamp"] += bd["stamp_duty"]
             aud["slip"] += bd["slippage"]; aud["n_sell"] += 1
         # 末日平仓不算"放弃"，不进黑名单
