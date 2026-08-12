@@ -26,9 +26,9 @@ GLOBAL = {
 
     # 回测时间范围
 
-    "backtest_start": "20240903",
+    "backtest_start": "20200103",
 
-    "backtest_end": "20260803",
+    "backtest_end": "20260807",
 
 
 
@@ -712,6 +712,32 @@ STRATEGIES = {
         # ── 零轴过滤（可选，默认关）──
         # True=多头区额外要求 DIF>0（更确认的上行，减少假死叉 whipshaw）
         "zero_line": False,
+
+    },
+
+    "livermore": {
+
+        "enabled": True,
+
+        "name": "利弗莫尔关键点突破策略（市场环境+相对强度+关键点突破+失效退出）",
+
+        # ── 关键点窗口（前 N 日最高价突破）──
+        "lookback": 60,
+
+        # ── 相对强度代理（个股动量 > 沪深300 同期动量，≈视频"板块靠前"逐股近似）──
+        "mom_lookback": 60,
+
+        # ── 失效退出 MA ──
+        "ma_period": 20,
+
+        # ── 市场环境门控（沪深300 站上 MA 才开仓）──
+        "market_ma": 60,
+
+        # ── 硬止损（0=关闭，仅用"跌回突破位/跌破MA/市场转熊"退出）──
+        "stop_loss": 0.0,
+
+        # ── 市场转熊是否整批清仓（True=清仓, False=仅关新开）──
+        "market_exit": True,
 
     },
 

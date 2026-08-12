@@ -95,10 +95,10 @@ goto :menu
 cls
 echo.
 echo ========================================
-echo   ETF轮动策略
+echo   ETF轮动策略 [V6 + Regime兜底 · 生产版]
 echo ========================================
 echo.
-echo   标的池[20只精选ETF · 真实价格]：
+echo   标的池[20只精选ETF · 真实价格] + Regime牛熊识别(沪深300 MA200+市场宽度):
 echo     沪深300 - 上证50 - 中证500 - 中证1000
 echo     创业板50 - 科创50 - 证券 - 医药
 echo     消费 - 5G通信 - 新能源车 - 旅游
@@ -107,34 +107,36 @@ echo.
 echo   核心逻辑：
 echo     ROC动量×0.4 + 中期动量×0.4 - 波动率×0.2[手册推荐权重]
 echo     MA60过滤+追高保护+最小切换阈值[防抖动]
+echo     + RSRS质量分(可开关) + Regime兜底(牛市强制≥40%%宽基)
 echo     全部走弱时转货币基金避险，保留10%%现金缓冲
 echo.
 echo   回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
-echo   请选择调仓方法:
+echo   请选择运行模式:
 echo   ----------------
-echo   [1] 双动量法[默认·前2名等权·含风控·推荐]
-echo   [2] 单动量法[满仓第1名·激进]
-echo   [3] MA均线过滤法[默认周期·保守]
-echo   [4] MA200均线过滤法[长周期·更保守]
+echo   [1] V6+Regime生产版[默认·已替代原ETF轮动]  --rsrs 0
+echo   [2] V6+Regime+RSRS0.3[带质量分]
+echo   [3] V6合并版(无Regime·纯对照)  --regime off
+echo   [4] 原版平台ETF轮动(审计对照基线·保留)
 echo   [0] 返回主菜单
 echo.
-set ETF_METHOD=
 set ETF_POOL_ARG=
 set ETF_VAR_ARG=
 set ETF_TOPN_ARG=
 set ETF_VARSEL=
 set ETF_PREMIUM_ARG=
-set /p ETF_METHOD=请选择 (1-4, 默认1):
-
-if "%ETF_METHOD%"=="0" goto :menu
-if "%ETF_METHOD%"=="" set ETF_METHOD=1
-set ETF_METHOD_ARG=dual
 set ETF_MA_ARG=
-if "%ETF_METHOD%"=="2" set ETF_METHOD_ARG=single
-if "%ETF_METHOD%"=="3" set ETF_METHOD_ARG=ma_filter
-if "%ETF_METHOD%"=="4" set ETF_METHOD_ARG=ma_filter
-if "%ETF_METHOD%"=="4" set ETF_MA_ARG=--ma-period 200
+set ETF_MODE=
+set /p ETF_MODE=请选择 (1-4, 默认1):
+if "%ETF_MODE%"=="0" goto :menu
+if "%ETF_MODE%"=="" set ETF_MODE=1
+set ETF_REGIME=off
+set ETF_RSRS=0
+set ETF_LEGACY=0
+if "%ETF_MODE%"=="1" set ETF_REGIME=on
+if "%ETF_MODE%"=="2" (set ETF_REGIME=on & set ETF_RSRS=0.3)
+if "%ETF_MODE%"=="3" set ETF_REGIME=off
+if "%ETF_MODE%"=="4" set ETF_LEGACY=1
 goto :etf_var
 
 :etf_var
@@ -165,7 +167,11 @@ goto :etf_exec
 :etf_exec
 echo.
 echo   正在运行...
-"venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method %ETF_METHOD_ARG% %ETF_MA_ARG% %ETF_POOL_ARG% %ETF_TOPN_ARG% %ETF_VAR_ARG% %ETF_PREMIUM_ARG%
+if "%ETF_LEGACY%"=="1" (
+  "venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method dual %ETF_MA_ARG% %ETF_POOL_ARG% %ETF_TOPN_ARG% %ETF_VAR_ARG% %ETF_PREMIUM_ARG%
+) else (
+  "venv_ml\Scripts\python.exe" run_etf_rotation_v6_merged.py %BACKTEST_START% %BACKTEST_END% --method dual %ETF_MA_ARG% %ETF_POOL_ARG% %ETF_TOPN_ARG% %ETF_VAR_ARG% %ETF_PREMIUM_ARG% --rsrs-weight %ETF_RSRS% --regime %ETF_REGIME%
+)
 echo.
 echo   [返回主菜单]
 pause

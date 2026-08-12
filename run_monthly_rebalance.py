@@ -44,6 +44,8 @@ except (ImportError, Exception):
     value_area_pass = None
     vp_fakeout_reclaim = None
 
+from position_sizing import SCHEMES, compute_target_weights, rebalance_to_targets
+
 def get_top_n():
     """动态获取选股数量（优先从 config.SELECTION 读取）"""
     try:
@@ -445,17 +447,36 @@ def get_monthly_5th_trading_days(trade_dates):
 
 ZZ800_CACHE = None
 ZZ800_INDEX_CODE = None  # 缓存对应的指数代码
+_STALE_POOL_WARNED = set()  # 已告警过的指数，避免每个调仓日刷屏
 
-def get_index_constituents(index_code=None, trade_date=None):
+def get_index_constituents(index_code=None, trade_date=None,
+                           allow_stale_fallback=False):
     """
     获取指数成分股（支持动态指数 + 历史成分股）
 
-    优先取 trade_date 当天或之前最近的成分股快照；
-    若表中无历史快照，则 fallback 到全量最新成分股。
-    
+    取 trade_date 当天或之前最近的成分股快照（point-in-time，时点成分股）。
+
+    ⚠️ 关于「无历史快照」的处理（2026-08-07 修正，重要）
+    ---------------------------------------------------------------
+    旧实现：若 trade_date 之前查不到任何快照，会**静默 fallback 到全量最新
+    成分股**。这是一个隐蔽而致命的未来函数：
+      - 用 2026 年的成分股名单去跑 2015 年的回测，等于提前知道了
+        「哪些公司未来 10 年能活下来并涨进指数」→ 幸存者偏差；
+      - 实测：创业板指(399006.SZ) 库里仅 1 个快照(20260706)，动量策略
+        3 个月回测因此跑出 +1250% 的幻觉收益，而真实可验证的
+        中证800(000906.SH，88800 行时点快照) 同期动量是跑输基准的。
+    新实现：默认 **不再静默回退**，返回空集合并醒目告警，让回测显式失败，
+    而不是给出一个漂亮但虚假的数字。确需旧行为时显式传
+    allow_stale_fallback=True（例如只关心「当下选股」而非历史回测）。
+
+    缺数据的正解是补数据，不是回退：
+        python backfill_index_constituent.py --index 399006.SZ --start 2010
+
     Args:
         index_code: 指数代码（如 "000906.SH"），为None时从配置读取
         trade_date: 调仓日（YYYYMMDD），用于取历史成分股快照
+        allow_stale_fallback: 无时点快照时是否允许回退到最新成分股
+                              （默认 False；仅在非回测场景下可置 True）
     """
     global ZZ800_CACHE, ZZ800_INDEX_CODE
     
@@ -468,7 +489,7 @@ def get_index_constituents(index_code=None, trade_date=None):
         return None  # 调用方需要检查返回值
 
     # 构建缓存键（含日期以区分历史快照）
-    cache_key = (index_code, trade_date) if trade_date else (index_code, "latest")
+    cache_key = (index_code, trade_date or "latest", allow_stale_fallback)
     if ZZ800_CACHE is not None and ZZ800_INDEX_CODE == cache_key:
         return ZZ800_CACHE
     
@@ -491,13 +512,40 @@ def get_index_constituents(index_code=None, trade_date=None):
     conn.close()
 
     if len(rows) == 0 and trade_date:
-        # fallback：若历史快照为空，使用全量最新成分股
+        # trade_date 当天/之前无任何成分股快照
         conn2 = get_conn()
-        rows = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = ?",
+        cov = pd.read_sql_query(
+            "SELECT COUNT(DISTINCT trade_date) AS nd, MIN(trade_date) AS d0, "
+            "MAX(trade_date) AS d1 FROM index_constituent WHERE index_code = ?",
             conn2, params=(index_code,)
         )
-        conn2.close()
+        nd = int(cov.iloc[0]["nd"]) if len(cov) else 0
+        d0, d1 = (cov.iloc[0]["d0"], cov.iloc[0]["d1"]) if nd else (None, None)
+
+        if allow_stale_fallback:
+            rows = pd.read_sql_query(
+                "SELECT ts_code FROM index_constituent WHERE index_code = ?",
+                conn2, params=(index_code,)
+            )
+            conn2.close()
+            if index_code not in _STALE_POOL_WARNED:
+                _STALE_POOL_WARNED.add(index_code)
+                print(f"  ⚠️ [幸存者偏差] {index_code} 在 {trade_date} 无时点成分股快照，"
+                      f"已按调用方要求回退到最新名单({d0}~{d1})。历史回测结果不可信！")
+        else:
+            conn2.close()
+            if index_code not in _STALE_POOL_WARNED:
+                _STALE_POOL_WARNED.add(index_code)
+                print(f"\n  {'!' * 66}")
+                print(f"  ⚠️ 数据缺失：{index_code} 在 {trade_date} 之前没有成分股快照")
+                if nd:
+                    print(f"     库中该指数仅有 {nd} 个快照，区间 {d0}~{d1}")
+                else:
+                    print(f"     库中该指数没有任何成分股记录")
+                print(f"     已拒绝回退到「最新成分股」——那会引入幸存者偏差/未来函数，")
+                print(f"     跑出的漂亮收益是假的。本次调仓将跳过（空仓）。")
+                print(f"     修复：python backfill_index_constituent.py --index {index_code} --start 2010")
+                print(f"  {'!' * 66}\n")
     
     ZZ800_CACHE = set(rows["ts_code"].tolist()) if len(rows) > 0 else set()
     ZZ800_INDEX_CODE = cache_key
@@ -1354,14 +1402,25 @@ def select_momentum_stocks(trade_date, lookback_months=6, top_n=5, index_code=No
         print(f"  [选股] ⚠️ 无候选股票")
         return pd.DataFrame()
 
-    # ===== 4. 批量获取行情数据 =====
+    # ===== 4. 批量获取行情数据（后复权）=====
+    # ⚠️ 必须用复权价：daily.close 是不复权价，除权除息当天会凭空跳水
+    #    （10 派 5 的股票会"跌" 1~2%，10 送 10 直接"腰斩"）。
+    #    动量按区间涨幅排序，用不复权价等于系统性惩罚高分红/高送转股票，
+    #    信号被污染。区间收益只看首尾比值，adj_factor 的归一化常数会约掉，
+    #    因此直接用 close * adj_factor 即为正确的后复权收益。
     conn2 = get_conn()
-    all_data = pd.read_sql_query("""
-        SELECT ts_code, trade_date, close
-        FROM daily
-        WHERE trade_date >= ? AND trade_date <= ?
-        ORDER BY ts_code, trade_date
-    """, conn2, params=(start_date_str, end_date_str))
+    # 只拉候选股（zz800 约800只），不要在全市场日线上做 JOIN 再 Python 端过滤——
+    # 否则每次调用扫描全市场(~5000只×13个月)的 daily×adj_factor，单期需 30s。
+    cand_list = list(candidates)
+    placeholders = ",".join("?" * len(cand_list))
+    all_data = pd.read_sql_query(f"""
+        SELECT d.ts_code, d.trade_date, d.close * a.adj_factor AS close
+        FROM daily d
+        JOIN adj_factor a ON a.ts_code = d.ts_code AND a.trade_date = d.trade_date
+        WHERE d.trade_date >= ? AND d.trade_date <= ?
+          AND d.ts_code IN ({placeholders})
+        ORDER BY d.ts_code, d.trade_date
+    """, conn2, params=[start_date_str, end_date_str] + cand_list)
     conn2.close()
 
     if all_data.empty:
@@ -1412,6 +1471,124 @@ def select_momentum_stocks(trade_date, lookback_months=6, top_n=5, index_code=No
     return pd.DataFrame({'ts_code': result_codes})
 
 
+# ============ 突破赢家选股（月度可选策略）============
+# 信号定义复用 backtest_main_rise.build_signal 的 5 要件合成：
+#   放量创 L 日新高 + 站上MA20/MA60 且向上 + 跑赢沪深300 + 行业内动量前20% + 非ST/够龄/够流动性。
+# 信号构建为一次性重活（约40分钟），按 (L,VOL,end_date) 缓存到 data/cache/，进程内再复用。
+_BREAKOUT_SIGNAL = {}
+
+
+def _apply_backadjust(df, end_date):
+    """对齐平台动量选股(select_momentum_stocks)的后复权口径。
+
+    不复权价在除权除息日会凭空跳水，导致 build_signal 里的
+    『创L日新高』(close>rolling(L).max()) 与 『L日动量』(close/close.shift(L))
+    失真、产生虚假突破信号。这里把 close/pre_close 改为后复权(close*adj_factor)，
+    与动量一样用真实总回报口径。open 保持不复权（执行价用真实开盘）。
+    """
+    # 单查询取 df 实际日期范围内的 adj_factor（一次顺序扫描，比 to_sql 写临时表快几个数量级），
+    # 再用 pandas 哈希合并。注意：临时表方案有两类致命缺陷——
+    #   (1) 1345万行 to_sql 逐行写入极慢；(2) 临时表 trade_date 为 int、adj_factor 为 TEXT，
+    #       SQLite 中 int=TEXT 永不匹配 → 合并恒为空 → 静默不复权。故弃用。
+    lo = int(df["trade_date"].min())
+    hi = int(df["trade_date"].max())
+    con = get_conn()
+    adj = pd.read_sql_query(
+        "SELECT ts_code, trade_date, adj_factor FROM adj_factor "
+        "WHERE trade_date BETWEEN ? AND ?",
+        con, params=(lo, hi))
+    con.close()
+    if adj.empty:
+        print("[突破信号] ⚠️ adj_factor 为空，跳过复权（将用不复权价）", flush=True)
+        return df
+    adj["trade_date"] = adj["trade_date"].astype(int)
+    adj = adj.sort_values(["ts_code", "trade_date"])
+    df = df.copy()
+    # 统一 merge 键类型（daily.trade_date 可能为 TEXT 或 int，adj_factor 已转 int）
+    df["trade_date"] = df["trade_date"].astype(int)
+    merged = df.merge(adj[["ts_code", "trade_date", "adj_factor"]],
+                      on=["ts_code", "trade_date"], how="left")
+    na_rate = float(merged["adj_factor"].isna().mean())
+    if na_rate > 0.05:
+        # 匹配率异常时显式报警，绝不静默不调权
+        print(f"[突破信号] ⚠️ adj_factor 匹配缺失率 {na_rate:.1%}（异常），未匹配行按1.0填充", flush=True)
+    merged["adj_factor"] = merged["adj_factor"].fillna(1.0)
+    hfq_close = merged["close"].astype("float64") * merged["adj_factor"].astype("float64")
+    merged["close"] = hfq_close.astype("float32")
+    # pre_close 的后复权 = 前一日 hfq_close（df 已按 [ts_code,trade_date] 排序）。
+    # 必须在 DataFrame 上按 ts_code 分组 shift（Series.groupby("ts_code") 会 KeyError）。
+    merged["pre_close"] = merged.groupby("ts_code")["close"].shift(1).astype("float32")
+    merged.drop(columns=["adj_factor"], inplace=True)
+    return merged
+
+
+def load_breakout_signal(L=60, VOL_MULT=1.5, end_date="20260630"):
+    """构建/缓存「全市场突破信号」正样本表（供突破赢家选股按月计数）。
+
+    信号价基于后复权（见 _apply_backadjust），与平台动量选股口径一致。
+    """
+    key = (L, VOL_MULT, end_date, "adj")
+    if key in _BREAKOUT_SIGNAL:
+        return _BREAKOUT_SIGNAL[key]
+    cache_dir = os.path.join("data", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    # 缓存名带 _adj 标记：旧的不复权缓存(breakout_signal_L*_*.pkl / selection_ab/signal_cache.pkl)一律作废
+    cache_path = os.path.join(cache_dir, f"breakout_signal_L{L}_V{VOL_MULT}_{end_date}_adj.pkl")
+    if os.path.exists(cache_path):
+        df = pd.read_pickle(cache_path)
+        _BREAKOUT_SIGNAL[key] = df
+        print(f"[突破信号] 从缓存加载(后复权): {cache_path} ({len(df):,} 行)", flush=True)
+        return df
+    print(f"[突破信号] 构建全市场突破信号(后复权) L={L} VOL={VOL_MULT} 区间~{end_date} ... (重活,约40分钟)", flush=True)
+    from backtest_main_rise import load_data, add_base_features, build_signal
+    df, idx = load_data("20100101", end_date)
+    df = _apply_backadjust(df, end_date)
+    df = add_base_features(df)
+    df_sig = build_signal(df, idx, L, VOL_MULT)
+    df_pos = df_sig[df_sig["signal"] > 0][["ts_code", "trade_date", "signal"]].copy()
+    df_pos["trade_date"] = df_pos["trade_date"].astype(int)
+    df_pos.to_pickle(cache_path)
+    _BREAKOUT_SIGNAL[key] = df_pos
+    print(f"[突破信号] 完成: {len(df_pos):,} 行 → {cache_path}", flush=True)
+    del df, idx, df_sig
+    return df_pos
+
+
+def select_breakout_stocks(trade_date, top_n=15, index_code=None,
+                           pre_years=3, L=60, VOL_MULT=1.5, end_date="20260630"):
+    """
+    突破赢家选股：过去 pre_years 年「突破信号」次数排序，取前 top_n 只。
+    与 run_selection_ab_compare.select_breakout 同口径，但按平台 point-in-time 约定
+    用 prev_td（调仓日前一交易日）作为信号日，并限股票池成分股。
+
+    Returns:
+        DataFrame: 含 ts_code 列的选中股票表（与 select_momentum_stocks 同接口）
+    """
+    trade_date = str(trade_date)
+    df_sig = load_breakout_signal(L, VOL_MULT, end_date)
+    y = int(trade_date[:4])
+    start_i = int(f"{y - pre_years}0101")
+    end_i = int(trade_date)
+    win = df_sig[(df_sig["trade_date"] >= start_i) & (df_sig["trade_date"] < end_i)]
+    if win.empty:
+        return pd.DataFrame(columns=["ts_code"])
+    cnt = win.groupby("ts_code")["signal"].sum()
+    cnt = cnt[cnt > 0]
+    if index_code:
+        members = set(get_index_constituents(index_code, trade_date=trade_date))
+        cnt = cnt[cnt.index.isin(members)]
+    else:
+        # 全A模式：剔除科创板(688)/北交所(.BJ)，与平台动量全A口径一致
+        # （zz800 等指数池模式走上面 index_code 分支，成分股本就不含这两者）
+        mask = cnt.index.to_series().str.startswith("688") | cnt.index.to_series().str.endswith(".BJ")
+        cnt = cnt[~mask]
+    cnt = cnt.sort_values(ascending=False)
+    selected = cnt.head(top_n).index.tolist()
+    name_str = ', '.join([f"{c}({get_stock_name(c)})" for c in selected])
+    print(f"  [选股] 突破赢家{pre_years}年(L={L},V={VOL_MULT}) → 前{top_n}只：{name_str}")
+    return pd.DataFrame({'ts_code': selected})
+
+
 def select_by_method(method, trade_date, top_n=None, lookback_months=None,
                      value_mode="pobreak", value_size_neutral=False, value_pct=None,
                      leverage_filter=False, de_ratio_exclude_pct=5, icover_min=3,
@@ -1442,6 +1619,88 @@ def select_by_method(method, trade_date, top_n=None, lookback_months=None,
     else:  # value
         return select_stocks(trade_date, top_n, mode=value_mode,
                              size_neutral=value_size_neutral, value_pct=value_pct)
+
+
+# ============================================================
+#  年度盈亏窗口（按自然年切分权益曲线）
+# ============================================================
+
+def _print_annual_pnl(daily_vals, init_capital, benchmark_idx=None):
+    """
+    年度盈亏窗口：按自然年切分权益曲线，输出每年收益/盈亏/累计，并对标基准指数当年涨幅。
+
+    Args:
+        daily_vals:    run_backtest 产出的日度权益序列 [{"date":YYYYMMDD, "value":float}, ...]
+        init_capital:  初始资金（用于计算累计收益）
+        benchmark_idx: 基准指数代码（如 "000906.SH"），None 则不显示基准对比
+    Returns:
+        list[dict]: 每年一行，供调用方落盘 CSV
+    """
+    if not daily_vals:
+        return []
+    from collections import OrderedDict
+    years = OrderedDict()
+    for d in daily_vals:
+        y = str(d["date"])[:4]
+        years.setdefault(y, []).append(d)
+
+    # 基准指数逐年首末收盘价
+    bench_year = {}
+    if benchmark_idx:
+        conn = get_conn()
+        for y in years:
+            s = pd.read_sql_query(
+                "SELECT close FROM index_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC LIMIT 1",
+                conn, params=(benchmark_idx, f"{y}0101", f"{y}1231"))
+            e = pd.read_sql_query(
+                "SELECT close FROM index_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
+                conn, params=(benchmark_idx, f"{y}0101", f"{y}1231"))
+            if len(s) > 0 and len(e) > 0:
+                bench_year[y] = (float(s.iloc[0]["close"]), float(e.iloc[0]["close"]))
+        conn.close()
+
+    bench_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx) if benchmark_idx else "基准"
+
+    # 不完整年度判定：仅当该年是首年且起点非 0101，或末年年终点非 1231（避免把 12-30 收官误判为不完整）
+    first_ymd = str(daily_vals[0]["date"])[4:]
+    last_ymd = str(daily_vals[-1]["date"])[4:]
+    yr_keys = list(years.keys())
+    first_year = yr_keys[0]
+    last_year = yr_keys[-1]
+
+    print(f"\n{'='*70}")
+    print(f"  年度盈亏窗口（对标 {bench_name}）")
+    print(f"{'='*70}")
+    print(f"  {'年度':<6} | {'年初净值':>14} | {'年末净值':>14} | {'年度收益':>9} | {'年度盈亏':>13} | {'累计收益':>9} | {'基准当年':>9} | {'超额':>7}")
+    print("  " + "-"*92)
+    rows = []
+    for y, lst in years.items():
+        y_start = lst[0]["value"]
+        y_end = lst[-1]["value"]
+        y_ret = (y_end / y_start - 1) * 100 if y_start > 0 else 0.0
+        y_pnl = y_end - y_start
+        cum_ret = (y_end / init_capital - 1) * 100
+        b_ret = None
+        if y in bench_year:
+            bs, be = bench_year[y]
+            b_ret = (be / bs - 1) * 100 if bs > 0 else 0.0
+        excess = (y_ret - b_ret) if b_ret is not None else None
+        partial = ((y == first_year and first_ymd != "0101") or
+                   (y == last_year and last_ymd != "1231"))
+        ylabel = y + ("*" if partial else "")
+        b_str = f"{b_ret:+.2f}%" if b_ret is not None else "  -  "
+        ex_str = f"{excess:+.2f}%" if excess is not None else "  -  "
+        print(f"  {ylabel:<6} | {y_start:>14,.2f} | {y_end:>14,.2f} | {y_ret:>+9.2f}% | {y_pnl:>+13,.2f} | {cum_ret:>+9.2f}% | {b_str:>9} | {ex_str:>7}")
+        rows.append({
+            "year": ylabel, "start_value": round(y_start, 2), "end_value": round(y_end, 2),
+            "year_return_pct": round(y_ret, 2), "year_pnl": round(y_pnl, 2),
+            "cum_return_pct": round(cum_ret, 2),
+            "bench_year_return_pct": (round(b_ret, 2) if b_ret is not None else ""),
+            "excess_pct": (round(excess, 2) if excess is not None else ""),
+        })
+    print("  " + "-"*92)
+    print("  * = 区间内不完整年度（非整年，收益按实际持有天数计）")
+    return rows
 
 
 # ============================================================
@@ -2039,12 +2298,20 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
         print(f"  {benchmark_name}涨幅：{idx_return:+.2f}%")
         print(f"  策略{'跑赢' if outperf>0 else '跑输'}指数：{outperf:+.2f}%")
 
+    # 年度盈亏窗口
+    annual_rows = _print_annual_pnl(daily_vals, INIT_CAPITAL, benchmark_idx)
+
     # 保存结果
     csv_dir = "data/results/monthly_rebalance"
     os.makedirs(csv_dir, exist_ok=True)
     csv_path = f"{csv_dir}/backtest_{start_date}_{end_date}.csv"
     pd.DataFrame(daily_vals).to_csv(csv_path, index=False)
     print(f"\n  结果已保存：{csv_path}")
+
+    if annual_rows:
+        annual_path = f"{csv_dir}/annual_pnl_{start_date}_{end_date}.csv"
+        pd.DataFrame(annual_rows).to_csv(annual_path, index=False)
+        print(f"  年度盈亏明细已保存：{annual_path}")
 
     return {
         "total_return": total_return,
@@ -2222,7 +2489,11 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
                           skip_recent_months=1, trend_filter_ma=0,
                           var_control=0, var_maxdd=15.0, var_n=5,
                           var_lookback=120, var_method="hist",
-                          value_area=0, va_pct=70.0):
+                          value_area=0, va_pct=70.0,
+                          sizing="equal", sizing_alpha=0.5, sizing_gamma=1.0,
+                          sizing_beta=0.5, sizing_max_w_ratio=2.0,
+                          strategy="momentum", pre_years=3,
+                          breakout_L=60, breakout_vol=1.5):
     """
     动量效应轮动回测（支持灵活调仓频率 + ATR止损/固定比例止损 + 冷静期 + 跳近期反转）
 
@@ -2251,6 +2522,11 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         pool_display = "全A股"
     else:
         pool_display = INDEX_DISPLAY_NAME.get(stock_pool, stock_pool)
+
+    if strategy == "breakout":
+        strategy_name = "突破赢家"
+    else:
+        strategy_name = "动量"
 
     freq_label = f"每{rebalance_freq_months}个月" if rebalance_freq_months > 1 else "每月"
     
@@ -2288,13 +2564,27 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         va_label = ""
         va_detail = ""
 
+    # 仓位方案标签
+    if sizing and sizing != "equal":
+        _sz = SCHEMES.get(sizing, {})
+        sizing_label = f" | 仓位:{_sz.get('label', sizing)}"
+        sizing_detail = (f"  仓位方案：{_sz.get('label')}（按持仓盈亏调权重）"
+                         + (f"｜单票上限={sizing_max_w_ratio:.1f}×等权防爆仓"
+                            if sizing == 'martingale' else ""))
+    else:
+        sizing_label = ""
+        sizing_detail = ""
+
     print("=" * 70)
-    print(f"动量效应回测（动量{lookback_months}个月 × {freq_label}调仓{stop_label}{cooling_label}{trend_filter_label}{var_label}）")
+    print(f"{strategy_name}效应回测（{strategy_name}{('' if strategy=='breakout' else str(lookback_months)+'个月')} × {freq_label}调仓{stop_label}{cooling_label}{trend_filter_label}{var_label}{sizing_label}）")
     print("=" * 70)
     print(f"  股票池：{pool_display}")
     print(f"  持仓数量：{top_n}只（等权重）")
     print(f"  回测区间：{start_date} ~ {end_date}")
-    print(f"  形成期（J）：{lookback_months}个月" + (f"（跳过最近{skip_recent_months}个月）" if skip_recent_months > 0 else ""))
+    if strategy == "breakout":
+        print(f"  突破回望：过去{pre_years}年突破信号次数排序（L={breakout_L}, 量能倍数={breakout_vol}）")
+    else:
+        print(f"  形成期（J）：{lookback_months}个月" + (f"（跳过最近{skip_recent_months}个月）" if skip_recent_months > 0 else ""))
     print(f"  持有期（K）：{rebalance_freq_months}个月（{freq_label}调仓）")
     if trend_filter_ma > 0:
         print(f"  市场过滤：指数<{trend_filter_ma}日MA时空仓等待")
@@ -2304,6 +2594,8 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
             print(f"  冷静期：买入后{atr_cooling_days}个交易日内不触发止损")
     if var_detail:
         print(var_detail)
+    if sizing_detail:
+        print(sizing_detail)
     print(f"  佣金：万2.5（最低5元）| 印花税：千1 | 滑点：0.1% | 成分股：按调仓日历史快照\n")
 
     # === 获取交易日期 ===
@@ -2312,6 +2604,10 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
     # 按指定频率采样调仓日
     rebalance_set = set(list(monthly_rebalance)[::rebalance_freq_months])
     print(f"交易日总数：{len(trade_dates)}，调仓日：{len(rebalance_set)}次")
+
+    # 突破赢家策略：一次性构建/加载全市场突破信号（重活，仅一次）
+    if strategy == "breakout":
+        load_breakout_signal(breakout_L, breakout_vol, end_date)
 
     # === 初始化 ===
     positions = {}   # {code: {"shares": N, "buy_price": P, "highest_close": P, "stop_triggered": bool}}
@@ -2412,13 +2708,24 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
                 continue  # 跳过选股和买入
 
             # 选股（T-1日收盘数据）
-            stocks = select_momentum_stocks(
-                prev_td,
-                lookback_months=lookback_months,
-                top_n=top_n,
-                index_code=stock_pool,
-                skip_recent_months=skip_recent_months,
-            )
+            if strategy == "breakout":
+                stocks = select_breakout_stocks(
+                    prev_td,
+                    top_n=top_n,
+                    index_code=stock_pool,
+                    pre_years=pre_years,
+                    L=breakout_L,
+                    VOL_MULT=breakout_vol,
+                    end_date=end_date,
+                )
+            else:
+                stocks = select_momentum_stocks(
+                    prev_td,
+                    lookback_months=lookback_months,
+                    top_n=top_n,
+                    index_code=stock_pool,
+                    skip_recent_months=skip_recent_months,
+                )
             new_codes = stocks['ts_code'].tolist() if not stocks.empty else []
 
             # ===== 可选：价值区过滤（动量只接价值区内/上方）=====
@@ -2449,7 +2756,7 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
                 if current_codes == new_set:
                     print(f"\n调仓日 {td}：持仓不变")
                 else:
-                    print(f"\n调仓日 {td}：动量组合变更")
+                    print(f"\n调仓日 {td}：{strategy_name}组合变更")
                     print(f"  新选：{[f'{c}({get_name(c)})' for c in new_codes]}")
                     print(f"  旧仓：{[f'{c}({get_name(c)})' for c in positions.keys()]}")
 
@@ -2466,55 +2773,96 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
                             print(f"  ✅ 卖出 {code}({get_name(code)})：{pos['shares']}股 @ {open_price:.2f}")
                             trades.append({
                                 "date": td, "action": "SELL", "code": code, "name": get_name(code),
-                                "price": open_price, "shares": pos["shares"], "reason": "momentum_rebalance"
+                                "price": open_price, "shares": pos["shares"], "reason": f"{strategy}_rebalance"
                             })
                             del positions[code]
 
-                    # 买入新选中的股票（按new_to_buy均分现金，买不起跳过）
-                    new_to_buy = [c for c in new_codes if c not in positions]
-                    if new_to_buy:
-                        # === VaR 仓位缩放：反解投入比例 ===
+                    # ===== 仓位方案 (sizing) =====
+                    # 计算本期目标持仓自买入以来的盈亏（用调仓日开盘价）
+                    pnl = {}
+                    for c in new_codes:
+                        if c in positions:
+                            _op = get_open_price(c, td)
+                            if _op:
+                                _bp = positions[c].get("buy_price")
+                                pnl[c] = (_op - _bp) / _bp if _bp else 0.0
+                        else:
+                            pnl[c] = 0.0
+
+                    if sizing == "equal":
+                        # —— 原等权逻辑：仅买入新入选，均分现金（行为不变）——
+                        new_to_buy = [c for c in new_codes if c not in positions]
+                        if new_to_buy:
+                            # === VaR 仓位缩放：反解投入比例 ===
+                            invest_ratio = 1.0
+                            bvar = None
+                            hold_var = None
+                            if var_control and var_control > 0:
+                                bvar = estimate_basket_var(
+                                    new_to_buy, td, conf=var_control / 100.0,
+                                    lookback=var_lookback, method=var_method)
+                                if bvar and bvar > 0:
+                                    holding_days = max(1, rebalance_freq_months * 21)
+                                    hold_var = bvar * (holding_days ** 0.5)  # 持有期VaR(sqrt-time)
+                                    risk_budget = (var_maxdd / 100.0) / max(1, var_n)
+                                    invest_ratio = min(1.0, risk_budget / hold_var)
+                            cash_per_stock = (cash * invest_ratio) / len(new_to_buy)
+                            if var_control and var_control > 0:
+                                bv_pct = f"{bvar * 100:.2f}%" if bvar is not None else "n/a"
+                                hv_pct = f"{hold_var * 100:.2f}%" if hold_var is not None else "n/a"
+                                print(f"  🛡️ VaR缩放(var={var_control}%): 篮子日VaR损={bv_pct} → 持有期VaR={hv_pct} "
+                                      f"→ 投入比例={invest_ratio * 100:.0f}%（预留现金{(1 - invest_ratio) * 100:.0f}%）")
+                            for ts_code in new_to_buy:
+                                open_price = get_open_price(ts_code, td)
+                                if open_price is None:
+                                    continue
+                                max_shares = int(cash_per_stock / open_price / 100) * 100
+                                if max_shares < 100:
+                                    continue
+                                cost = max_shares * open_price
+                                fee = calc_fee('buy', open_price, max_shares)
+                                if cost + fee <= cash:
+                                    cash -= cost + fee
+                                    positions[ts_code] = {
+                                        "shares": max_shares,
+                                        "buy_price": open_price,
+                                        "buy_idx": i,
+                                        "highest_close": open_price,
+                                        "stop_triggered": False,
+                                    }
+                                    print(f"  ✅ 买入 {ts_code}({get_name(ts_code)})：{max_shares}股 @ {open_price:.2f}")
+                                    trades.append({
+                                        "date": td, "action": "BUY", "code": ts_code, "name": get_name(ts_code),
+                                        "price": open_price, "shares": max_shares, "reason": f"{strategy}_rebalance"
+                                    })
+                    else:
+                        # —— 目标权重再平衡（金字塔/倒金字塔/马丁格尔）——
+                        from position_sizing import compute_target_weights, rebalance_to_targets
                         invest_ratio = 1.0
                         bvar = None
                         hold_var = None
                         if var_control and var_control > 0:
                             bvar = estimate_basket_var(
-                                new_to_buy, td, conf=var_control / 100.0,
+                                new_codes, td, conf=var_control / 100.0,
                                 lookback=var_lookback, method=var_method)
                             if bvar and bvar > 0:
                                 holding_days = max(1, rebalance_freq_months * 21)
-                                hold_var = bvar * (holding_days ** 0.5)  # 持有期VaR(sqrt-time)
+                                hold_var = bvar * (holding_days ** 0.5)
                                 risk_budget = (var_maxdd / 100.0) / max(1, var_n)
                                 invest_ratio = min(1.0, risk_budget / hold_var)
-                        cash_per_stock = (cash * invest_ratio) / len(new_to_buy)
-                        if var_control and var_control > 0:
-                            bv_pct = f"{bvar * 100:.2f}%" if bvar is not None else "n/a"
-                            hv_pct = f"{hold_var * 100:.2f}%" if hold_var is not None else "n/a"
-                            print(f"  🛡️ VaR缩放(var={var_control}%): 篮子日VaR损={bv_pct} → 持有期VaR={hv_pct} "
-                                  f"→ 投入比例={invest_ratio * 100:.0f}%（预留现金{(1 - invest_ratio) * 100:.0f}%）")
-                        for ts_code in new_to_buy:
-                            open_price = get_open_price(ts_code, td)
-                            if open_price is None:
-                                continue
-                            max_shares = int(cash_per_stock / open_price / 100) * 100
-                            if max_shares < 100:
-                                continue
-                            cost = max_shares * open_price
-                            fee = calc_fee('buy', open_price, max_shares)
-                            if cost + fee <= cash:
-                                cash -= cost + fee
-                                positions[ts_code] = {
-                                    "shares": max_shares,
-                                    "buy_price": open_price,
-                                    "buy_idx": i,
-                                    "highest_close": open_price,
-                                    "stop_triggered": False,
-                                }
-                                print(f"  ✅ 买入 {ts_code}({get_name(ts_code)})：{max_shares}股 @ {open_price:.2f}")
-                                trades.append({
-                                    "date": td, "action": "BUY", "code": ts_code, "name": get_name(ts_code),
-                                    "price": open_price, "shares": max_shares, "reason": "momentum_rebalance"
-                                })
+                        weights = compute_target_weights(
+                            sizing, new_codes, pnl=pnl,
+                            alpha=sizing_alpha, gamma=sizing_gamma,
+                            beta=sizing_beta, max_w_ratio=sizing_max_w_ratio)
+                        weights = {c: w * invest_ratio for c, w in weights.items()}
+                        positions, cash, _sz_trades = rebalance_to_targets(
+                            positions, cash, weights, td,
+                            get_open_price, calc_fee, lot=100, buy_idx_default=i)
+                        trades.extend(_sz_trades)
+                        if _sz_trades:
+                            print(f"  🔧 [{sizing}] 目标权重再平衡：{len(_sz_trades)} 笔"
+                                  f"（首笔 {_sz_trades[0]['code']} {_sz_trades[0]['action']}"
+                                  f" {_sz_trades[0]['shares']}股）")
 
         # ========== 每日市值记录（Bug #2修复：调仓日后记录，反映当日实际持仓）==========
         total_value = cash
@@ -2580,7 +2928,11 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
 
     # === 输出 ===
     print(f"\n{'=' * 70}")
-    print(f"  动量{lookback_months}个月 × {freq_label}调仓 回测结果")
+    if strategy == "breakout":
+        _result_title = f"  {strategy_name} × {freq_label}调仓 回测结果"
+    else:
+        _result_title = f"  {strategy_name}{lookback_months}个月 × {freq_label}调仓 回测结果"
+    print(_result_title)
     print(f"{'=' * 70}")
     profit_amount = final_value - INIT_CAPITAL
     print(f"  初始资金：{INIT_CAPITAL:,.2f}")
@@ -2602,11 +2954,18 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     if atr_stop_multiple > 0 or trailing_stop_pct > 0:
         print(f"  止损次数：{stop_count}")
-    print(f"  中证800涨幅：{idx_return:+.2f}%")
+    # 基准名称跟随实际 benchmark_idx，避免用中证800的标签套在创业板等其它指数上
+    _bench_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx)
+    print(f"  {_bench_name}涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
 
-    # 保存结果
-    csv_dir = "data/results/momentum_rebalance"
+    # 保存结果（按策略分目录，避免 momentum/breakout 结果混用同一文件）
+    if strategy == "breakout":
+        csv_dir = "data/results/breakout_rebalance"
+        prefix = "breakout"
+    else:
+        csv_dir = "data/results/momentum_rebalance"
+        prefix = "momentum"
     os.makedirs(csv_dir, exist_ok=True)
     freq_suffix = f"_{rebalance_freq_months}m_rebal"
     if atr_stop_multiple > 0:
@@ -2616,7 +2975,10 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
     else:
         stop_suffix = ""
     cooling_suffix = f"_cool{atr_cooling_days}" if atr_cooling_days > 0 else ""
-    csv_path = f"{csv_dir}/momentum_{lookback_months}m{freq_suffix}{stop_suffix}{cooling_suffix}_{start_date}_{end_date}.csv"
+    if strategy == "breakout":
+        csv_path = f"{csv_dir}/{prefix}_{pre_years}y{freq_suffix}{stop_suffix}{cooling_suffix}_{start_date}_{end_date}.csv"
+    else:
+        csv_path = f"{csv_dir}/{prefix}_{lookback_months}m{freq_suffix}{stop_suffix}{cooling_suffix}_{start_date}_{end_date}.csv"
     pd.DataFrame(daily_vals).to_csv(csv_path, index=False)
     print(f"\n  结果已保存：{csv_path}")
 
@@ -2828,9 +3190,15 @@ def select_reversal_stocks(trade_date, lookback_days=5, top_n=5, index_code=None
 
     conn2 = get_conn()
     start_str = (dt - timedelta(days=lookback_days + 15)).strftime("%Y%m%d")
+    # 同动量：用后复权价，否则窗口内除权除息会被误读成"跌"，
+    # 逆转策略专挑跌得多的买 → 会系统性买进刚分红的股票（假信号）。
+    # 另：必须 ORDER BY，SQLite 不保证返回顺序，否则 closes[0]/[-1] 可能取反。
     all_data = pd.read_sql_query("""
-        SELECT ts_code, trade_date, close FROM daily
-        WHERE trade_date >= ? AND trade_date <= ?
+        SELECT d.ts_code, d.trade_date, d.close * a.adj_factor AS close
+        FROM daily d
+        JOIN adj_factor a ON a.ts_code = d.ts_code AND a.trade_date = d.trade_date
+        WHERE d.trade_date >= ? AND d.trade_date <= ?
+        ORDER BY d.ts_code, d.trade_date
     """, conn2, params=(start_str, trade_date))
     conn2.close()
 
@@ -3173,8 +3541,8 @@ if __name__ == "__main__":
     parser.add_argument("end_date", nargs="?", default="20251231", help="结束日期 YYYYMMDD")
     parser.add_argument("--top-n", type=int, default=None, help="选股数量")
     parser.add_argument("--selection-method", type=str, default="value",
-                        choices=["value", "div_low_vol", "momentum", "reversal", "div_low_vol_quality"],
-                        help="选股策略(div_low_vol_quality=红利低波质量复合·季度调仓)")
+                        choices=["value", "div_low_vol", "momentum", "breakout", "reversal", "div_low_vol_quality"],
+                        help="选股策略(momentum=动量, breakout=突破赢家, div_low_vol_quality=红利低波质量复合·季度调仓)")
     parser.add_argument("--dlvq-mode", type=str, default="official_compact",
                         choices=["official", "official_improved", "official_compact"],
                         help="div_low_vol_quality 模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)")
@@ -3182,6 +3550,12 @@ if __name__ == "__main__":
                         help="只选股，不回测")
     parser.add_argument("--lookback", type=int, default=6,
                         choices=[3, 6, 12], help="动量回看月数（仅 momentum 模式）")
+    parser.add_argument("--pre-years", type=int, default=3,
+                        help="突破赢家突破回望年数（仅 breakout 模式，默认3）")
+    parser.add_argument("--breakout-L", type=int, default=60,
+                        help="突破赢家突破窗口L日（仅 breakout 模式，默认60）")
+    parser.add_argument("--breakout-vol", type=float, default=1.5,
+                        help="突破赢家量能倍数（仅 breakout 模式，默认1.5）")
     parser.add_argument("--compare", action="store_true",
                         help="对比模式：依次跑3/6/12个月动量回测")
     parser.add_argument("--stock-pool", type=str, default=None,
@@ -3219,6 +3593,18 @@ if __name__ == "__main__":
                         help="价值区过滤回看天数: 0=关闭 | >0=启用(对动量/反转生效，默认0)")
     parser.add_argument("--va-pct", type=float, default=70.0,
                         help="价值区覆盖成交量比例(%%)，默认70")
+    parser.add_argument("--sizing", type=str, default="equal",
+                        choices=["equal", "pyramid", "inverted", "martingale"],
+                        help="仓位方案(动量模式): equal=等权基线 | pyramid=正金字塔(赢家加注) "
+                             "| inverted=倒金字塔(越涨越加) | martingale=马丁格尔(越亏越补,单票上限防爆仓)")
+    parser.add_argument("--sizing-alpha", type=float, default=0.5,
+                        help="pyramid 赢家倾斜强度(默认0.5)")
+    parser.add_argument("--sizing-gamma", type=float, default=1.0,
+                        help="inverted 赢家倾斜强度(默认1.0)")
+    parser.add_argument("--sizing-beta", type=float, default=0.5,
+                        help="martingale 输家倾斜强度(默认0.5)")
+    parser.add_argument("--sizing-max-w", type=float, default=2.0,
+                        help="martingale 单票权重上限 = 此值 × 等权(默认2.0, 防爆仓)")
     parser.add_argument("--fakeout-reclaim", action="store_true", default=False,
                         help="反转优先'扫止损→快速收回'标的（仅 reversal 模式）")
     parser.add_argument("--interrupt-start", type=str, default=None,
@@ -3257,7 +3643,39 @@ if __name__ == "__main__":
                 trend_filter_ma=args.trend_filter,
                 value_area=args.value_area,
                 va_pct=args.va_pct,
+                sizing=args.sizing,
+                sizing_alpha=args.sizing_alpha,
+                sizing_gamma=args.sizing_gamma,
+                sizing_beta=args.sizing_beta,
+                sizing_max_w_ratio=args.sizing_max_w,
             )
+    elif args.selection_method == "breakout":
+        # 突破赢家月度轮动（复用动量引擎：sizing/止损/VaR/趋势过滤）
+        # 默认15只（已验证口径：突破赢家选法 top_n=10~15 精选才有效），用户显式--top-n则尊重
+        top_n = args.top_n if args.top_n is not None else 15
+        run_momentum_backtest(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            top_n=top_n,
+            stock_pool=args.stock_pool,
+            rebalance_freq_months=args.rebalance_freq,
+            atr_stop_multiple=args.atr_stop,
+            atr_cooling_days=args.atr_cooling,
+            trailing_stop_pct=args.trailing_stop,
+            skip_recent_months=args.skip_recent,
+            trend_filter_ma=args.trend_filter,
+            value_area=args.value_area,
+            va_pct=args.va_pct,
+            sizing=args.sizing,
+            sizing_alpha=args.sizing_alpha,
+            sizing_gamma=args.sizing_gamma,
+            sizing_beta=args.sizing_beta,
+            sizing_max_w_ratio=args.sizing_max_w,
+            strategy="breakout",
+            pre_years=args.pre_years,
+            breakout_L=args.breakout_L,
+            breakout_vol=args.breakout_vol,
+        )
     elif args.selection_method == "reversal":
         # 短期逆转策略
         print(f"短期逆转效应回测")

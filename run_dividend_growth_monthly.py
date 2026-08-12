@@ -28,6 +28,8 @@ import pandas as pd
 import numpy as np
 
 import config
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest"))
+from atr_stop_loss import ATRStopLoss
 from run_monthly_rebalance import (
     get_conn, get_trade_dates, get_monthly_5th_trading_days, calc_fee,
     get_open_price, COMMISSION_RATE, SLIPPAGE_RATE,
@@ -96,13 +98,17 @@ def load_fina(end):
     return df
 
 
-def load_pick_daily(codes, start, end):
+def load_pick_daily(codes, start, end, warmup_days=0):
+    """持仓标的行情。warmup_days>0 时查询起点前移（供 ATR 计算 warmup）。"""
     conn = get_conn()
     ph = ",".join("?" for _ in codes)
+    q_start = start
+    if warmup_days > 0:
+        q_start = (pd.Timestamp(start) - pd.Timedelta(days=warmup_days)).strftime("%Y%m%d")
     df = pd.read_sql_query(
-        f"SELECT ts_code, trade_date, close, pre_close FROM daily "
+        f"SELECT ts_code, trade_date, high, low, close, pre_close FROM daily "
         f"WHERE ts_code IN ({ph}) AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
-        conn, params=(*codes, start, end))
+        conn, params=(*codes, q_start, end))
     conn.close()
     df["pct"] = (df["close"] - df["pre_close"]) / df["pre_close"] * 100
     return df
@@ -265,15 +271,38 @@ def run_window(start, end, cfg):
     if not codes:
         print(f"  [跳过] {start}-{end} 全程无选股"); return None
 
-    # 持仓标的行情/复权因子
-    daily_df = load_pick_daily(codes, start, end)
-    close_map, pct_map2 = {}, {}
+    stop_loss = float(cfg.get("stop_loss", 0.0))   # 0=无止损; 0.15=跌破买入价15%卖出
+    atr_stop = float(cfg.get("atr_stop", 0.0))     # 0=关闭; >0=ATR动态止损(倍数, period14)
+    atr_period = int(cfg.get("atr_period", 14))
+
+    # 持仓标的行情/复权因子（warmup 400 自然日供 ATR 计算）
+    daily_df = load_pick_daily(codes, start, end, warmup_days=400)
+    close_map, pct_map2, high_map, atr_map = {}, {}, {}, {}
     for c in codes:
         close_map[c] = {}
         pct_map2[c] = {}
+        high_map[c] = {}
+        atr_map[c] = {}
     for _, r in daily_df.iterrows():
-        close_map[str(r["ts_code"])][str(r["trade_date"])] = float(r["close"])
-        pct_map2[str(r["ts_code"])][str(r["trade_date"])] = float(r["pct"])
+        ck = str(r["ts_code"])
+        close_map[ck][str(r["trade_date"])] = float(r["close"])
+        pct_map2[ck][str(r["trade_date"])] = float(r["pct"])
+        if atr_stop > 0:
+            high_map[ck][str(r["trade_date"])] = float(r["high"])
+    if atr_stop > 0:
+        for c in codes:
+            sub = daily_df[daily_df["ts_code"] == c].sort_values("trade_date")
+            if len(sub) < 3:
+                continue
+            h = sub["high"].astype(float).to_numpy()
+            l = sub["low"].astype(float).to_numpy()
+            cl = sub["close"].astype(float).to_numpy()
+            tmp = ATRStopLoss(atr_period=atr_period)
+            arr = tmp.calc_atr(h, l, cl)
+            ds = sub["trade_date"].astype(str).tolist()
+            for d_, a in zip(ds, arr):
+                if a > 0:
+                    atr_map[c][d_] = float(a)
     adj_df = load_adj(codes, start, end)
     adj_map = {c: {} for c in codes}
     for _, r in adj_df.iterrows():
@@ -287,15 +316,34 @@ def run_window(start, end, cfg):
     cash = CAPITAL
     positions = {}     # code -> shares
     buy_adj = {}       # code -> adj_factor(买入日)
+    entry_price = {}   # code -> 首次买入价（硬止损基准, setdefault 语义）
+    sl_dict = {}       # code -> ATRStopLoss 实例（ATR 动态止损模式）
+    pending_stops = {}     # code -> True: 当日收盘触发止损, 次日成交价(get_open_price)执行卖出
+    recently_stopped = set()  # 当日止损减持, 避免同一次调仓日立刻回补
     nav_raw, nav_hfq = [], []
-    n_rebal_sells = n_daily_sells = 0
+    n_rebal_sells = n_daily_sells = n_stop_sells = 0
     rebal_dict = dict(picks)
 
     for idx, d in enumerate(all_dates):
         d_int = int(d)
+        # 0.5) 执行上一交易日触发的止损: 以"当日成交价"(2026-07-06前=开盘价, 后=收盘价)
+        #      卖出。信号来自 T 日收盘, 成交落在 T+1 日, 与引擎约定一致, 杜绝同日开盘进/收盘出
+        if (stop_loss > 0 or atr_stop > 0) and pending_stops:
+            for code in list(pending_stops.keys()):
+                px = get_open_price(code, d)
+                if px:
+                    sh = positions.get(code)
+                    if sh:
+                        proceeds = px * sh - calc_fee("sell", px, sh)
+                        cash += proceeds
+                        del positions[code]; buy_adj.pop(code, None)
+                        entry_price.pop(code, None); sl_dict.pop(code, None)
+                        n_stop_sells += 1
+                        recently_stopped.add(code)
+                pending_stops.pop(code, None)
         # 1) 调仓日: 开盘价执行等权再平衡
         if d in rebal_dict:
-            target = rebal_dict[d]
+            target = [c for c in rebal_dict[d] if c not in recently_stopped]
             def epx(code):
                 return get_open_price(code, d)
             mv = cash
@@ -321,6 +369,15 @@ def run_window(start, end, cfg):
                         if code not in buy_adj:
                             a = _ffill(adj_map, code, d, all_dates, idx)
                             buy_adj[code] = a if a else 1.0
+                        # 止损状态：硬止损记录首次买入价；ATR 初始防线用 T-1 ATR
+                        if stop_loss > 0:
+                            entry_price.setdefault(code, px)
+                        if atr_stop > 0 and code not in sl_dict:
+                            atr_t1 = atr_map.get(code, {}).get(all_dates[max(0, idx - 1)])
+                            if atr_t1 and atr_t1 > 0:
+                                sl_dict[code] = ATRStopLoss(atr_period=atr_period,
+                                                            atr_mult=atr_stop, trail_mult=atr_stop)
+                                sl_dict[code].on_entry(px, atr_t1)
                 elif diff < 0:
                     sell = -diff
                     proceeds = px * sell - calc_fee("sell", px, sell)
@@ -329,6 +386,8 @@ def run_window(start, end, cfg):
                     n_rebal_sells += 1
                     if positions[code] == 0:
                         del positions[code]; buy_adj.pop(code, None)
+                        entry_price.pop(code, None); sl_dict.pop(code, None)
+            recently_stopped.clear()   # 止损冷却仅覆盖本次调仓, 下次调仓可重新入选
 
         # 2) 日规则: 昨涨停 且 今未封 → 当日收盘卖出
         if d != all_dates[0]:
@@ -346,7 +405,34 @@ def run_window(start, end, cfg):
                         proceeds = px * sell - calc_fee("sell", px, sell)
                         cash += proceeds
                         del positions[code]; buy_adj.pop(code, None)
+                        entry_price.pop(code, None); sl_dict.pop(code, None)
                         n_daily_sells += 1
+
+        # 2.5) 止损信号: 仅"当日收盘"触发判定; 实际卖出在次日成交价(get_open_price)执行,
+        #      由步骤 0.5 完成 → 与引擎成交价约定完全一致, 且杜绝同日开盘进/收盘出的未来函数式偏差
+        #   硬止损 = 收盘 < 首次买入价 × (1 - stop_loss)
+        #   ATR止损 = 收盘 < 防线（入场价-ATR×mult 起步, 最高价-ATR×trail 追踪, 只升不降）
+        if (stop_loss > 0 or atr_stop > 0) and positions:
+            for code in list(positions.keys()):
+                cur_close = close_map.get(code, {}).get(d)
+                if cur_close is None:
+                    continue
+                should = False
+                if atr_stop > 0:
+                    sl = sl_dict.get(code)
+                    if sl is not None:
+                        hi = high_map.get(code, {}).get(d)
+                        atr_t = atr_map.get(code, {}).get(d)
+                        if hi is not None and atr_t and atr_t > 0:
+                            sl.update(hi, atr_t)
+                        should, stop_px, _ = sl.check_stop(cur_close)
+                else:
+                    ep = entry_price.get(code)
+                    if ep is not None:
+                        stop_px = ep * (1.0 - stop_loss)
+                        should = cur_close < stop_px
+                if should and code not in pending_stops:
+                    pending_stops[code] = True   # 次日成交价卖出, 见步骤 0.5
 
         # 3) 估值（收盘）
         mv_r, mv_h = cash, cash
@@ -426,7 +512,8 @@ def run_window(start, end, cfg):
             f"{RES_DIR}/targets_{start}_{end}.csv", index=False)
 
     return dict(start=start, end=end, picks=picks, n_rebal_sells=n_rebal_sells,
-                n_daily_sells=n_daily_sells, m_raw=m_raw, m_hfq=m_hfq,
+                n_daily_sells=n_daily_sells, n_stop_sells=n_stop_sells,
+                m_raw=m_raw, m_hfq=m_hfq,
                 m_b300=m_b300, m_b932=m_b932, y_raw=y_raw, y_hfq=y_hfq, y_b=y_b,
                 nav_raw=nav_raw, nav_hfq=nav_hfq, nav_b300=nav_b300)
 
@@ -441,7 +528,7 @@ def print_window(r, show_yearly=False):
     if r is None:
         return
     print(f"===== {r['start']} → {r['end']} =====")
-    print(f"  选股 {len(r['picks'])} 期 / 调仓卖出 {r['n_rebal_sells']} 笔 / 日规则卖出 {r['n_daily_sells']} 笔")
+    print(f"  选股 {len(r['picks'])} 期 / 调仓卖出 {r['n_rebal_sells']} 笔 / 日规则卖出 {r['n_daily_sells']} 笔 / 止损卖出 {r.get('n_stop_sells', 0)} 笔")
     m = r["m_raw"]; mh = r["m_hfq"]; mb = r["m_b300"]
     print(f"  NAV(raw, 纯价): 总收益 {fmt_pct(m['total'])} / 年化 {fmt_pct(m['ann'])} / 最大回撤 {fmt_pct(m['mdd'])} / 夏普 {m['sharpe']:.3f}")
     print(f"  NAV(hfq, 含分红): 总收益 {fmt_pct(mh['total'])} / 年化 {fmt_pct(mh['ann'])} / 最大回撤 {fmt_pct(mh['mdd'])} / 夏普 {mh['sharpe']:.3f}")
@@ -474,12 +561,18 @@ def main():
     ap.add_argument("--roe-min", type=float, default=3.0)
     ap.add_argument("--rev-min", type=float, default=5.0)
     ap.add_argument("--np-min", type=float, default=11.0)
+    ap.add_argument("--stop-loss", type=float, default=0.0,
+                    help="硬止损：收盘 < 买入价×(1-x) 卖出，如 0.15=15%%；0=关闭(默认)")
+    ap.add_argument("--atr-stop", type=float, default=0.0,
+                    help="ATR动态止损倍数(period14)：入场价-ATR×x 起步，最高价-ATR×x 追踪；0=关闭(默认)")
+    ap.add_argument("--atr-period", type=int, default=14)
     ap.add_argument("--yearly", action="store_true")
     args = ap.parse_args()
 
     cfg = dict(top_n=args.top_n, top_pct=args.top_pct, pe_max=args.pe_max,
                peg_min=args.peg_min, peg_max=args.peg_max, roe_min=args.roe_min,
-               rev_min=args.rev_min, np_min=args.np_min)
+               rev_min=args.rev_min, np_min=args.np_min,
+               stop_loss=args.stop_loss, atr_stop=args.atr_stop, atr_period=args.atr_period)
 
     if args.windows:
         wins = [w.split("-") for w in args.windows.split(",")]
