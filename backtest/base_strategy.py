@@ -4,6 +4,7 @@
 import pandas as pd
 import sqlite3
 from pathlib import Path
+from backtest.kelly_sizer import KellySizer
 
 # 数据库路径（共享）—— 统一指向平台唯一主库（2026-07-08 修正：原 data/stock_db.db 不存在）
 DB_PATH = r"D:\tu-shareData\astock_daily.db"
@@ -35,6 +36,26 @@ class BaseStrategy:
         self.avg_cost = 0.0    # 平均持仓成本
         self.cash = capital     # 可用资金
 
+        # ── 凯利公式控仓（总持仓封顶模式）──
+        # use_kelly=True 时，约束「持仓市值 ≤ kelly_cap × 总资金」。
+        # kelly_cap 来自 KellySizer（全凯利 f* × 半凯利折扣 × 安全折扣，夹在[min,max]）。
+        # 这是平台已有 kelly_sizer 框架的统一推广：所有择时策略（除买入持有）共用，
+        # 买入持有不读此段 → 天然排除。
+        self.use_kelly = bool(cfg.get("use_kelly", False))
+        if self.use_kelly:
+            self.kelly = KellySizer(
+                estimated_win_rate=cfg.get("kelly_win_rate", 0.55),
+                estimated_win_loss_ratio=cfg.get("kelly_win_loss_ratio", 1.5),
+                kelly_fraction=cfg.get("kelly_fraction", 0.5),
+                max_position_pct=cfg.get("kelly_max_position", 0.25),
+                min_position_pct=cfg.get("kelly_min_position", 0.05),
+                safety_discount=cfg.get("kelly_safety_discount", 0.8),
+            )
+            self.kelly_cap = self.kelly.get_position_pct()  # 封顶比例（0.05~0.25）
+        else:
+            self.kelly = None
+            self.kelly_cap = None  # None ⇒ 不封顶（等价于封顶比例为1.0）
+
     def run(self, df, start_idx=0):
         """
         运行策略（子类必须实现）
@@ -53,6 +74,53 @@ class BaseStrategy:
             }
         """
         raise NotImplementedError("子类必须实现 run() 方法")
+
+    @staticmethod
+    def cap_by_kelly(capital, position, cash, kelly_cap, price, intended_shares):
+        """
+        按凯利「总持仓封顶」缩放意图买入股数。
+
+        约束：买入后持仓市值 ≤ kelly_cap × capital。
+        - kelly_cap 为 None（未启用凯利）或 >= 1.0 时不封顶，直接返回意图股数。
+        - 当前已持仓市值用 (position × price) 估算；剩余空间 = 上限 − 已持仓。
+        - 最终取 min(意图金额, 剩余空间, 可用现金)，再向下取整到百股。
+        """
+        if kelly_cap is None or kelly_cap >= 1.0:
+            return intended_shares
+        if price is None or price <= 0 or intended_shares <= 0:
+            return 0
+        cap_value = kelly_cap * capital
+        cur_value = position * price
+        room_value = cap_value - cur_value
+        if room_value <= 0:
+            return 0
+        intended_value = intended_shares * price
+        allowed_value = min(intended_value, room_value, cash)
+        if allowed_value <= 0:
+            return 0
+        return max(0, int(allowed_value / price / 100) * 100)
+
+    def kelly_room_shares(self, price, intended_shares):
+        """
+        返回经凯利总持仓封顶后的实际可买股数。
+        供「自管现金」类策略（如网格）使用：它们不调 self.buy()，
+        需自行用返回值缩放后维护 cash/position。
+        """
+        return BaseStrategy.cap_by_kelly(
+            self.capital, self.position, self.cash,
+            self.kelly_cap if self.use_kelly else None,
+            price, intended_shares,
+        )
+
+    def _kelly_buy(self, date, price, intended_shares, reason=""):
+        """
+        带凯利总持仓封顶的买入。封顶后委托基类 buy() 执行。
+        所有「调 self.buy() 开仓」的插件统一改用本方法即可自动受凯利控仓约束。
+        """
+        sh = self.kelly_room_shares(price, intended_shares)
+        if sh > 0:
+            return self.buy(date, price, sh, reason)
+        return False
 
     def buy(self, date, price, shares, reason=""):
         """买入操作（子类可调用）"""

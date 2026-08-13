@@ -188,7 +188,7 @@ class LivermorePlugin(BaseStrategy):
                 sh = int(budget / co / 100) * 100
                 if sh > 0:
                     self.entry_key = key_level[prev]   # 记录入场突破位
-                    self.buy(date, co, sh, "利弗莫尔关键点突破买入")
+                    self._kelly_buy(date, co, sh, "利弗莫尔关键点突破买入")
 
             if not np.isnan(cc):
                 last_valid = cc

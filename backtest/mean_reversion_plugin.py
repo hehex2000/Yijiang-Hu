@@ -177,7 +177,7 @@ class MeanReversionStrategyPlugin(BaseStrategy):
                 if shares > 0:
                     z_val = float(prev_z.iloc[i]) if i < len(prev_z) else 0
                     rsi_val = float(prev_rsi.iloc[i]) if i < len(prev_rsi) else 0
-                    success = self.buy(
+                    success = self._kelly_buy(
                         date, open_price, shares,
                         reason=f"均值回归入场(Z={z_val:.2f},RSI={rsi_val:.1f})"
                     )

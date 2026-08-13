@@ -233,7 +233,7 @@ class DualMAStrategyPlugin(BaseStrategy):
         shares = int(cash_to_use / price / 100) * 100
         
         if shares > 0:
-            success = self.buy(date, price, shares, reason)
+            success = self._kelly_buy(date, price, shares, reason)
             
             if success:
                 logger.debug(f"Dual MA buy: {date}, price={price:.2f}, shares={shares}")

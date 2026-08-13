@@ -287,11 +287,8 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
 
             # === 买入逻辑 ===
             if self.position == 0 and bool(data.iloc[i]['buy_signal']):
-                # 计算仓位
-                if self.use_kelly:
-                    position_pct = self.kelly.get_position_pct()
-                else:
-                    position_pct = 0.95 if self.position_mode == 'full' else 0.50
+                # 意图仓位（半仓/全仓），凯利作为「总持仓封顶」统一约束（见基类 _kelly_buy）
+                position_pct = 0.95 if self.position_mode == 'full' else 0.50
 
                 if position_pct <= 0:
                     v = self.cash
@@ -302,11 +299,12 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
                 shares = int(buy_amount / open_price / 100) * 100
                 if shares > 0:
                     rsi_val = float(prev_rsi.iloc[i]) if i < len(prev_rsi) else 0
+                    cap_str = f",凯利封顶={self.kelly_cap:.1%}" if self.use_kelly else ""
                     entry_reason = (
-                        f"RSI超卖+下轨(RSI={rsi_val:.1f},"
-                        f"仓位={position_pct:.1%})"
+                        f"RSI超卖+下轨(RSI={rsi_val:.1%},"
+                        f"意图={position_pct:.1%}{cap_str})"
                     )
-                    success = self.buy(date, open_price, shares, reason=entry_reason)
+                    success = self._kelly_buy(date, open_price, shares, reason=entry_reason)
                     if success and self.use_atr_sl:
                         self.atr_sl.on_entry(entry_price=open_price, atr_val=atr_arr[i])
 

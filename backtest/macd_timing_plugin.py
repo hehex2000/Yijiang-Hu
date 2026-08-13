@@ -138,7 +138,7 @@ class MacdTimingPlugin(BaseStrategy):
                     budget = self.cash * 0.98
                     sh = int(budget / co / 100) * 100
                     if sh > 0:
-                        self.buy(date, co, sh, "MACD金叉买入")
+                        self._kelly_buy(date, co, sh, "MACD金叉买入")
             elif (not long_now) and prev_long:
                 # 死叉 → 开盘卖出（清仓）
                 if self.position > 0:

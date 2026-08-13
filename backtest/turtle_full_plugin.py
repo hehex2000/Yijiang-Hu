@@ -225,7 +225,7 @@ class TurtleFullStrategyPlugin(BaseStrategy):
                                 buy_amount = min(unit_shares * open_price[i+1], self.cash * 0.5)  # 首次最多用50%资金
                                 shares = int(buy_amount / open_price[i+1] / 100) * 100
                                 if shares > 0:
-                                    self.buy(df.iloc[i+1]["trade_date"], open_price[i+1], shares, reason=f"短期突破({self.short_period}日)")
+                                    self._kelly_buy(df.iloc[i+1]["trade_date"], open_price[i+1], shares, reason=f"短期突破({self.short_period}日)")
                                     self.entry_atr = atr_val
                                     self.stop_price = p_close - self.stop_atr_mult * atr_val
                                     self.trail_price = p_close
@@ -258,7 +258,7 @@ class TurtleFullStrategyPlugin(BaseStrategy):
                                 buy_amount = min(unit_shares * open_price[i+1], self.cash * 0.5)
                                 shares = int(buy_amount / open_price[i+1] / 100) * 100
                                 if shares > 0:
-                                    self.buy(df.iloc[i+1]["trade_date"], open_price[i+1], shares, reason=f"长期突破({self.long_period}日)")
+                                    self._kelly_buy(df.iloc[i+1]["trade_date"], open_price[i+1], shares, reason=f"长期突破({self.long_period}日)")
                                     self.entry_atr = atr_val
                                     self.stop_price = p_close - self.stop_atr_mult * atr_val
                                     self.trail_price = p_close
@@ -283,7 +283,7 @@ class TurtleFullStrategyPlugin(BaseStrategy):
                     if add_shares > 0 and self.cash > add_shares * open_price[i]:
                         # 用次日开盘价加仓（避免未来函数）
                         if i + 1 < n:
-                            self.buy(df.iloc[i+1]["trade_date"], open_price[i+1], add_shares, reason=f"金字塔加仓({self.n_adds+1}/{self.max_adds})")
+                            self._kelly_buy(df.iloc[i+1]["trade_date"], open_price[i+1], add_shares, reason=f"金字塔加仓({self.n_adds+1}/{self.max_adds})")
                             self.n_adds += 1
                             # 重置止损价（加仓后重新计算）
                             self.stop_price = p_close - self.stop_atr_mult * atr_val

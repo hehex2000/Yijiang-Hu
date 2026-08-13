@@ -142,6 +142,9 @@ class GridTimingPlugin(BaseStrategy):
                         # 计算这档的买入金额（均分）
                         lot_amount = self.capital * self.invest_ratio / self.grid_levels
                         shares = int(lot_amount / co / 100) * 100
+                        # 凯利总持仓封顶（自管现金策略用 kelly_room_shares 缩放；
+                        # 多档累计到上限后自动停买，保留网格档位结构）
+                        shares = self.kelly_room_shares(co, shares)
                         if shares < 100:
                             continue
                         cost = shares * co

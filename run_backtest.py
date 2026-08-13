@@ -32,6 +32,26 @@ from config import (
 # 印花税率：复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5），保证全平台一致
 from run_monthly_rebalance import stamp_duty_rate
 
+# 凯利公式控仓（总持仓封顶）：让内置回测函数与插件策略共用同一套 kelly_sizer 框架
+from backtest.base_strategy import BaseStrategy
+
+
+def _make_kelly_cap(cfg):
+    """读取 cfg 的 kelly 段，返回封顶比例（0.05~0.25）；未启用 use_kelly 返回 None。"""
+    if not cfg.get("use_kelly", False):
+        return None
+    from backtest.kelly_sizer import KellySizer
+    _k = KellySizer(
+        estimated_win_rate=cfg.get("kelly_win_rate", 0.55),
+        estimated_win_loss_ratio=cfg.get("kelly_win_loss_ratio", 1.5),
+        kelly_fraction=cfg.get("kelly_fraction", 0.5),
+        max_position_pct=cfg.get("kelly_max_position", 0.25),
+        min_position_pct=cfg.get("kelly_min_position", 0.05),
+        safety_discount=cfg.get("kelly_safety_discount", 0.8),
+    )
+    return _k.get_position_pct()
+
+
 DB_PATH = DATA["local_db_path"]
 
 
@@ -555,6 +575,7 @@ def backtest_buy_hold(df, capital, cfg, start_idx=0):
 def backtest_rsi(df, capital, cfg, start_idx=0):
     """RSI超卖买入 / 超买卖出"""
     period = cfg.get("rsi_period", 14)
+    kelly_cap = _make_kelly_cap(cfg)  # 凯利总持仓封顶（None=不封顶）
     ovs = cfg.get("oversold", 40)
     ovb = cfg.get("overbought", 60)
     tp = cfg.get("take_profit", 0.50)
@@ -584,8 +605,8 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
         prev_rsi = rsi[i-1] if i > 0 else 50
         
         if pos == 0 and prev_rsi < ovs:
-            amt = cash * 0.5
-            pos = int(amt / p / 100) * 100
+            intended = int(cash * 0.5 / p / 100) * 100
+            pos = BaseStrategy.cap_by_kelly(capital, 0, cash, kelly_cap, p, intended)
             if pos > 0:
                 cash -= pos * p * 1.0002
                 cost = p
@@ -610,6 +631,7 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
 def backtest_bollinger(df, capital, cfg, start_idx=0):
     """布林带：跌破下轨买，突破上轨卖"""
     period = cfg.get("period", 20)
+    kelly_cap = _make_kelly_cap(cfg)  # 凯利总持仓封顶（None=不封顶）
     std_n = cfg.get("std", 2)
     tp, sl = cfg.get("take_profit", 0.50), cfg.get("stop_loss", 0.15)
     close = df["close"].values
@@ -633,8 +655,8 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
             continue
         p = close[i]
         if i >= period and pos == 0 and p <= lower[i] > 0:
-            amt = cash * 0.5
-            pos = int(amt / p / 100) * 100
+            intended = int(cash * 0.5 / p / 100) * 100
+            pos = BaseStrategy.cap_by_kelly(capital, 0, cash, kelly_cap, p, intended)
             if pos > 0:
                 cash -= pos * p * 1.0002
                 cost = p
@@ -667,6 +689,8 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
     1% 风险原则：每笔交易风险 ≤ 总资金 × 1%
     """
     import numpy as np
+
+    kelly_cap = _make_kelly_cap(cfg)  # 凯利总持仓封顶（None=不封顶）
 
     # ── 解析配置 ──────────────────────────────────────────
     short_period = cfg.get("short_period", 20)
@@ -838,6 +862,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     risk_capital = capital * risk_pct  # 用初始总资金，不是当前现金
                     unit_shares = int(risk_capital / atr_i) if atr_i > 0 else 0
                     unit_shares = max((unit_shares // 100) * 100, 100)  # 取整到100股，最少100股
+                    unit_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
                     if unit_shares > 0:
                         cost = unit_shares * p * buy_cost
                         if cost <= cash:
@@ -863,6 +888,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     else:
                         add_shares = max(int(capital * risk_pct / atr_i) // 100 * 100, 100)
                     add_shares = max(add_shares, 100)
+                    add_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
                     cost = add_shares * p * buy_cost
                     if add_shares > 0 and cost <= cash:
                         cash -= cost
@@ -892,6 +918,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     risk_capital = capital * risk_pct  # 用初始总资金
                     unit_shares = int(risk_capital / atr_i) if atr_i > 0 else 0
                     unit_shares = max((unit_shares // 100) * 100, 100)  # 取整到100股，最少100股
+                    unit_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
                     if unit_shares > 0:
                         cost = unit_shares * p * buy_cost
                         if cost <= cash:
@@ -915,6 +942,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     else:
                         add_shares = s2_pos
                     add_shares = max(add_shares, 100)
+                    add_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
                     cost = add_shares * p * buy_cost
                     if add_shares > 0 and cost <= cash:
                         cash -= cost

@@ -418,6 +418,14 @@ STRATEGIES = {
 
         "trail_mult": 3.0,         # 追踪止损倍数
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.55,         # 均值回归类胜率保守估计
+        "kelly_win_loss_ratio": 1.5,    # 盈亏比（赚1.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     # ── bollinger 布林带策略（已改造-加入凯利仓位）──
@@ -462,13 +470,13 @@ STRATEGIES = {
 
         "kelly_win_loss_ratio": 1.8,     # 盈亏比（赚1.8元亏1元）
 
-        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_fraction": 1.0,           # 半凯利
 
         "kelly_max_position": 0.20,      # 最大仓位20%
 
         "kelly_min_position": 0.05,      # 最小仓位5%
 
-        "kelly_safety_discount": 0.8,    # 参数不确定性再打8折
+        "kelly_safety_discount": 1.0,    # 参数不确定性再打8折
 
     },
 
@@ -524,13 +532,13 @@ STRATEGIES = {
 
         "kelly_win_loss_ratio": 1.5,     # 估计盈亏比
 
-        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_fraction": 1.0,           # 半凯利
 
         "kelly_max_position": 0.20,      # 最大仓位20%
 
         "kelly_min_position": 0.05,      # 最小仓位5%
 
-        "kelly_safety_discount": 0.8,    # 参数不确定性再打8折
+        "kelly_safety_discount": 1.0,    # 参数不确定性再打8折
 
     },
 
@@ -594,13 +602,13 @@ STRATEGIES = {
 
         "kelly_win_loss_ratio": 1.5,
 
-        "kelly_fraction": 0.5,           # 半凯利
+        "kelly_fraction": 1.0,           # 半凯利
 
         "kelly_max_position": 0.20,
 
         "kelly_min_position": 0.05,
 
-        "kelly_safety_discount": 0.8,
+        "kelly_safety_discount": 1.0,
 
         # ── 市场状态门控（regime gate，可选，默认关闭）──
 
@@ -664,6 +672,14 @@ STRATEGIES = {
 
         "position_mode": "half",     # "half"=半仓,"full"=全仓
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.55,         # 均值回归类胜率保守估计
+        "kelly_win_loss_ratio": 1.5,    # 盈亏比（赚1.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     # ── 网格择时策略（固定中枢+趋势保护版）──
@@ -692,6 +708,14 @@ STRATEGIES = {
 
         "total_stop_loss": 0.08,       # 总止损8%（从峰值计算回撤）
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.55,         # 均值回归类胜率保守估计
+        "kelly_win_loss_ratio": 1.5,    # 盈亏比（赚1.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     # ── MACD 趋势跟随择时策略（金叉买入·死叉卖出，DIF>DEA 多头区）──
@@ -713,6 +737,14 @@ STRATEGIES = {
         # True=多头区额外要求 DIF>0（更确认的上行，减少假死叉 whipshaw）
         "zero_line": False,
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     "livermore": {
@@ -739,6 +771,14 @@ STRATEGIES = {
         # ── 市场转熊是否整批清仓（True=清仓, False=仅关新开）──
         "market_exit": True,
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     "turtle": {
@@ -799,6 +839,14 @@ STRATEGIES = {
 
         "system_weight": [0.5, 0.5],  # 短期/长期系统资金分配权重
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     "turtle_full": {
@@ -859,6 +907,14 @@ STRATEGIES = {
 
         "system_weight": [0.5, 0.5],  # 短期/长期系统资金分配权重
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     "rsi_trend": {
@@ -887,6 +943,14 @@ STRATEGIES = {
 
         "position_mode": "half",   # 半仓操作（50%资金）
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     # ── 定投策略（已禁用）──
@@ -951,6 +1015,14 @@ STRATEGIES = {
 
         "trail_mult": 3.0,
 
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
     # ── 能量指标策略 ──

@@ -242,7 +242,7 @@ class RSITrendPlugin(BaseStrategy):
         if shares <= 0:
             return
 
-        self.buy(date, price, shares, "RSI上穿中心")
+        self._kelly_buy(date, price, shares, "RSI上穿中心")
 
     def _sell(self, date, price, reason=""):
         """卖出操作（复用基类 sell()，含手续费+印花税）"""
