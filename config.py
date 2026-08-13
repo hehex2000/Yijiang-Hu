@@ -747,40 +747,6 @@ STRATEGIES = {
         "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
     },
 
-    "livermore": {
-
-        "enabled": True,
-
-        "name": "利弗莫尔关键点突破策略（市场环境+相对强度+关键点突破+失效退出）",
-
-        # ── 关键点窗口（前 N 日最高价突破）──
-        "lookback": 60,
-
-        # ── 相对强度代理（个股动量 > 沪深300 同期动量，≈视频"板块靠前"逐股近似）──
-        "mom_lookback": 60,
-
-        # ── 失效退出 MA ──
-        "ma_period": 20,
-
-        # ── 市场环境门控（沪深300 站上 MA 才开仓）──
-        "market_ma": 60,
-
-        # ── 硬止损（0=关闭，仅用"跌回突破位/跌破MA/市场转熊"退出）──
-        "stop_loss": 0.0,
-
-        # ── 市场转熊是否整批清仓（True=清仓, False=仅关新开）──
-        "market_exit": True,
-
-        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
-        "use_kelly": True,
-        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
-        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
-        "kelly_fraction": 1.0,          # 半凯利
-        "kelly_max_position": 0.20,     # 最大仓位20%
-        "kelly_min_position": 0.05,     # 最小仓位5%
-        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
-    },
-
     "turtle": {
 
         "enabled": False,  # ← 禁用简化版，使用完整版
