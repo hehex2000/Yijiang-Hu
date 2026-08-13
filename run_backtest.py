@@ -606,7 +606,7 @@ def backtest_rsi(df, capital, cfg, start_idx=0):
         
         if pos == 0 and prev_rsi < ovs:
             intended = int(cash * 0.5 / p / 100) * 100
-            pos = BaseStrategy.cap_by_kelly(capital, 0, cash, kelly_cap, p, intended)
+            pos = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), 0, cash, kelly_cap, p, intended)
             if pos > 0:
                 cash -= pos * p * 1.0002
                 cost = p
@@ -656,7 +656,7 @@ def backtest_bollinger(df, capital, cfg, start_idx=0):
         p = close[i]
         if i >= period and pos == 0 and p <= lower[i] > 0:
             intended = int(cash * 0.5 / p / 100) * 100
-            pos = BaseStrategy.cap_by_kelly(capital, 0, cash, kelly_cap, p, intended)
+            pos = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), 0, cash, kelly_cap, p, intended)
             if pos > 0:
                 cash -= pos * p * 1.0002
                 cost = p
@@ -862,7 +862,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     risk_capital = capital * risk_pct  # 用初始总资金，不是当前现金
                     unit_shares = int(risk_capital / atr_i) if atr_i > 0 else 0
                     unit_shares = max((unit_shares // 100) * 100, 100)  # 取整到100股，最少100股
-                    unit_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
+                    unit_shares = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
                     if unit_shares > 0:
                         cost = unit_shares * p * buy_cost
                         if cost <= cash:
@@ -888,7 +888,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     else:
                         add_shares = max(int(capital * risk_pct / atr_i) // 100 * 100, 100)
                     add_shares = max(add_shares, 100)
-                    add_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
+                    add_shares = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
                     cost = add_shares * p * buy_cost
                     if add_shares > 0 and cost <= cash:
                         cash -= cost
@@ -918,7 +918,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     risk_capital = capital * risk_pct  # 用初始总资金
                     unit_shares = int(risk_capital / atr_i) if atr_i > 0 else 0
                     unit_shares = max((unit_shares // 100) * 100, 100)  # 取整到100股，最少100股
-                    unit_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
+                    unit_shares = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), s1_pos + s2_pos, cash, kelly_cap, p, unit_shares)
                     if unit_shares > 0:
                         cost = unit_shares * p * buy_cost
                         if cost <= cash:
@@ -942,7 +942,7 @@ def backtest_turtle(df, capital, cfg, start_idx=0):
                     else:
                         add_shares = s2_pos
                     add_shares = max(add_shares, 100)
-                    add_shares = BaseStrategy.cap_by_kelly(capital, s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
+                    add_shares = BaseStrategy.cap_by_kelly(cfg.get("total_capital", capital), s1_pos + s2_pos, cash, kelly_cap, p, add_shares)
                     cost = add_shares * p * buy_cost
                     if add_shares > 0 and cost <= cash:
                         cash -= cost
@@ -1824,6 +1824,8 @@ def run_backtest(stocks):
                 # ── 优先使用插件（类方式，自动发现 backtest/*_plugin.py）───
                 if skey in plugins:
                     strategy_class = plugins[skey]
+                    scfg = dict(scfg)
+                    scfg["total_capital"] = _total_capital  # 凯利封顶按组合总资金算，避免高价股被禁仓
                     strategy = strategy_class(capital, scfg)
                     result = strategy.run(df, start_idx)
                     ret = result.get("returns", 0.0)

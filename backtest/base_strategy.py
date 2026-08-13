@@ -56,6 +56,10 @@ class BaseStrategy:
             self.kelly = None
             self.kelly_cap = None  # None ⇒ 不封顶（等价于封顶比例为1.0）
 
+        # 凯利封顶基准：多股分仓时按「组合总资金」封顶（避免每票切片太小把高价股禁仓），
+        # 单股回测时 total_capital 未设 → 退化为 self.capital，行为不变。
+        self.total_capital = cfg.get("total_capital", self.capital)
+
     def run(self, df, start_idx=0):
         """
         运行策略（子类必须实现）
@@ -107,7 +111,7 @@ class BaseStrategy:
         需自行用返回值缩放后维护 cash/position。
         """
         return BaseStrategy.cap_by_kelly(
-            self.capital, self.position, self.cash,
+            self.total_capital, self.position, self.cash,
             self.kelly_cap if self.use_kelly else None,
             price, intended_shares,
         )

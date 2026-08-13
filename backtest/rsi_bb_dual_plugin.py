@@ -89,6 +89,9 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
             trail_mult=cfg.get("trail_mult", 2.0),
         )
 
+        # ── 意图仓位模式（half=50% / full=95%，凯利仅作封顶，意图仓位始终需要）──
+        self.position_mode = cfg.get("position_mode", "half")
+
         # ── 凯利公式仓位 ----
         self.use_kelly = cfg.get("use_kelly", True)
         if self.use_kelly:
@@ -100,8 +103,6 @@ class RsiBbDualStrategyPlugin(BaseStrategy):
                 min_position_pct=cfg.get("kelly_min_position", 0.05),
                 safety_discount=cfg.get("kelly_safety_discount", 0.8),
             )
-        else:
-            self.position_mode = cfg.get("position_mode", "half")
 
         logger.info(
             f"RsiBbDualStrategyPlugin initialized: "
