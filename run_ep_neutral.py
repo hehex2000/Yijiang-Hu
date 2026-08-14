@@ -13,7 +13,7 @@
 
 防偏措施（与平台其它策略一致）：
   · T-1 数据选股、T 日开盘执行，杜绝日内前视
-  · 剔除 ST / 688(科创板) / .BJ(北交所) / 金融 / 公用事业 / 上市<60天
+  · 剔除 ST / .BJ(北交所) / 金融 / 公用事业 / 上市<60天
   · pe_ttm 来自 daily_basic 的 T-1 交易日，point-in-time 无前视
 
 口径说明：
@@ -101,7 +101,7 @@ def _load_basic():
         name = str(r["name"]) if pd.notna(r["name"]) else ""
         ind = str(r["industry"]) if pd.notna(r["industry"]) else None
         ld = str(r["list_date"]) if pd.notna(r["list_date"]) else ""
-        excluded = (code.startswith("688") or code.endswith(".BJ")
+        excluded = (code.endswith(".BJ")
                     or "ST" in name.upper() or name.startswith("*"))
         m[code] = {"name": name, "industry": ind, "list_date": ld,
                    "excluded": excluded}
@@ -306,7 +306,7 @@ def select_ep_neutral(rebalance_date, top_n=TOP_N, prev_date=None,
             continue
         info = basic.get(c)
         if info is None:
-            if c.startswith("688") or c.endswith(".BJ"):
+            if c.endswith(".BJ"):
                 continue
             eligible.add(c)
             continue
@@ -409,7 +409,7 @@ def run_backtest(start_date="20100101", end_date="20260715",
     print(f"  区间：{start_date} ~ {end_date}")
     cap_note = f"{top_n}只等权" if top_n else "全部G5等权"
     print(f"  持仓：{cap_note} | 调仓：每月第5交易日（行业中性 G5）")
-    print(f"  剔除：ST / 688 / .BJ / 金融 / 公用事业 / 上市<60天")
+    print(f"  剔除：ST / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  因子：EP=1/PE_TTM，全局1/99缩尾，行业内5分组取G5")
     if var_stop:
         print(f"  VAR动态止损（动量月度同款）：ATR追踪{atr_mult}倍 | 冷静期{atr_cooling}日 "

@@ -15,7 +15,7 @@
   ① 财务数据用 ann_date（公告日）≤ 选股日，杜绝前视偏差
   ② 取最新「年报」(end_date LIKE '%1231')，确保口径一致
   ③ T-1 日数据选股、T 日开盘执行，杜绝日内前视
-  ④ 剔除 ST / 688(科创板) / .BJ(北交所) / 金融 / 公用事业 / 上市<60天
+  ④ 剔除 ST / .BJ(北交所) / 金融 / 公用事业 / 上市<60天
   ⑤ 仅用 EBIT>0 且 ROC、EY 分母>0 的票，避免指标无意义
 
 说明：financials 字段在库中为 TEXT 类型，统一 float() 转换。
@@ -70,7 +70,7 @@ _RAW_INC    = None   # ts_code -> list of {end_date, ann_date, ebit}
 #  基础数据
 # ════════════════════════════════════════════════════════════
 def _load_basic():
-    """加载股票基础信息（含行业、ST/688/BJ 标记）。"""
+    """加载股票基础信息（含行业、ST / BJ 标记）。"""
     global _BASIC
     if _BASIC is not None:
         return _BASIC
@@ -84,7 +84,7 @@ def _load_basic():
         name = str(r["name"]) if pd.notna(r["name"]) else ""
         ind = str(r["industry"]) if pd.notna(r["industry"]) else None
         ld = str(r["list_date"]) if pd.notna(r["list_date"]) else ""
-        excluded = (code.startswith("688") or code.endswith(".BJ")
+        excluded = (code.endswith(".BJ")
                     or "ST" in name.upper() or name.startswith("*"))
         m[code] = {"name": name, "industry": ind, "list_date": ld,
                    "excluded": excluded}
@@ -292,8 +292,8 @@ def select_magic_formula(rebalance_date, top_n=TOP_N, prev_date=None, verbose=Tr
             continue
         info = basic.get(c)
         if info is None:
-            # 退市股（不在 stock_basic）：按代码剔除 688/.BJ，保留其余
-            if c.startswith("688") or c.endswith(".BJ"):
+            # 退市股（不在 stock_basic）：按代码剔除 .BJ，保留其余
+            if c.endswith(".BJ"):
                 continue
             eligible.add(c)
             continue
@@ -381,7 +381,7 @@ def run_backtest(start_date="20140101", end_date="20260715",
     print("=" * 72)
     print(f"  区间：{start_date} ~ {end_date}")
     print(f"  持仓：{top_n}只等权 | 调仓：每年{REBALANCE_MONTH}月第5交易日")
-    print(f"  剔除：ST / 688 / .BJ / 金融 / 公用事业 / 上市<60天")
+    print(f"  剔除：ST / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  财务口径：ann_date（公告日）取最新年报")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
           f"印花税千1→千0.5(2023-08-28起) 滑点{SLIPPAGE_RATE*100:.1f}%")

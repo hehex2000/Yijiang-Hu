@@ -102,7 +102,7 @@ class DogsOfMarketSelector:
             # all模式：全市场（排除北交所与科创板，科创板门槛对散户不友好）
             conn = self._get_conn()
             df = pd.read_sql_query(
-                "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' AND ts_code NOT LIKE '688%'",
+                "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ'",
                 conn,
             )
             conn.close()
@@ -133,7 +133,7 @@ class DogsOfMarketSelector:
             result = set()
             if snap is not None:
                 df = pd.read_sql_query(
-                    "SELECT ts_code FROM index_constituent WHERE index_code = ? AND ts_code NOT LIKE '688%' AND CAST(trade_date AS INTEGER) = CAST(? AS INTEGER)",
+                    "SELECT ts_code FROM index_constituent WHERE index_code = ? AND CAST(trade_date AS INTEGER) = CAST(? AS INTEGER)",
                     conn, params=(index_code, snap),
                 )
                 result = set(df["ts_code"].tolist()) if len(df) > 0 else set()
@@ -327,7 +327,7 @@ class DogsOfMarketSelector:
         print(f"  [狗股策略] 基础条件过滤后：{len(df)} 只（PE>0, PB>0, DV_TTM>0）")
 
         # 全局屏蔽科创板(688开头)与北交所(.BJ后缀)：投资门槛对散户不友好，本平台统一剔除
-        df = df[~df["ts_code"].str.startswith("688") & ~df["ts_code"].str.endswith(".BJ")]
+        df = df[~df["ts_code"].str.endswith(".BJ")]
 
         if df.empty:
             conn.close()

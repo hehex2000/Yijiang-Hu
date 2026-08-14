@@ -52,12 +52,12 @@ def ensure_table(conn):
 
 
 def get_pool_stocks(conn, pools):
-    """返回需要下载的 ts_code 集合（合并多池成分股，剔除 688/.BJ）"""
+    """返回需要下载的 ts_code 集合（合并多池成分股，剔除 .BJ）"""
     codes = set()
     for p in pools:
         if p == "all":
             df = conn.execute(
-                "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '688%' AND ts_code NOT LIKE '%.BJ'"
+                "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ'"
             ).fetchall()
             return {r[0] for r in df}
         idx = POOL_CODES.get(p)
@@ -65,7 +65,7 @@ def get_pool_stocks(conn, pools):
             continue
         df = conn.execute(
             "SELECT ts_code FROM index_constituent WHERE index_code = ? "
-            "AND ts_code NOT LIKE '688%' AND ts_code NOT LIKE '%.BJ'",
+            "AND ts_code NOT LIKE '%.BJ'",
             (idx,),
         ).fetchall()
         codes |= {r[0] for r in df}

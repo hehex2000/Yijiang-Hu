@@ -55,8 +55,7 @@ _PRICE = {}  # ts_code -> {trade_date: close}
 def _preload_hs300_prices():
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code='000300.SH' "
-        "AND ts_code NOT LIKE '688%'",
+        "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code='000300.SH' ",
         conn)
     codes = [str(c) for c in df["ts_code"].tolist()]
     print(f"[preload] hs300 成分股(去重): {len(codes)} 只")
@@ -99,8 +98,8 @@ def _preload_pool_prices(pool):
     idx = STOCK_POOL_INDEX[pool]
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code=? "
-        "AND ts_code NOT LIKE '688%'", conn, params=(idx,))
+        "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code=? ",
+        conn, params=(idx,))
     codes = [str(c) for c in df["ts_code"].tolist()]
     print(f"[preload] {pool}({idx}) 成分股(去重): {len(codes)} 只")
     if codes:

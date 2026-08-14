@@ -46,7 +46,7 @@ def limit_pct(code: str, date_int: int) -> float:
     """各板块涨停阈值（%）。ST 已被剔除。"""
     if code.startswith("688"):
         return 19.9
-    if code.startswith("300"):
+    if code.startswith("300") or code.startswith("301"):  # 创业板(300/301) 20%
         return 19.9 if date_int >= 20200824 else 9.9
     return 9.9
 
@@ -158,7 +158,8 @@ def select_picks(rebal_dates, all_dates, cfg, basic_map, pct_map, fina):
             latest[r["ts_code"]] = (r["roe"], r["netprofit_yoy"], r["tr_yoy"])
         prev_ann = ann_cut
 
-        b = basic_map[sel_date]
+        # daily_basic 个别交易日整日缺失(如 20180105)→ 该期无选股数据，跳过(无未来函数)
+        b = basic_map.get(sel_date)
         if b is None or len(b) == 0:
             picks.append((rb, [])); continue
         b = b[(b["dv_ttm"] > 0) & (b["pe_ttm"] > 0) & (b["total_mv"] > 0)].copy()

@@ -17,7 +17,7 @@ RSI+布林带双确认策略 —— 逐改动归因 A/B 完整回测
   C3  +MA200门控    : RSI(14)/kelly0.57/MA200门控
   C4  +ADX门控      : RSI(14)/kelly0.57/ADX(14)<25门控
 
-固定：股票池(沪深300快照前40，剔除688)、期间、每支本金、行情/手续费口径。
+固定：股票池(沪深300快照前40，剔除.BJ)、期间、每支本金、行情/手续费口径。
 """
 import os
 import sys
@@ -55,13 +55,13 @@ def build_universe(n: int = TOP_N) -> list[str]:
     ).fetchone()[0]
     rows = conn.execute(
         "SELECT ts_code FROM index_constituent "
-        "WHERE index_code=? AND REPLACE(trade_date,'-','')=? AND ts_code NOT LIKE '688%' "
+        "WHERE index_code=? AND REPLACE(trade_date,'-','')=? "
         "ORDER BY ts_code",
         (BENCH, snap),
     ).fetchall()
     conn.close()
     codes = [r[0] for r in rows][:n]
-    print(f"[股票池] 沪深300 快照 {snap} → 取 {len(codes)} 只（剔除688）")
+    print(f"[股票池] 沪深300 快照 {snap} → 取 {len(codes)} 只（剔除.BJ）")
     return codes
 
 

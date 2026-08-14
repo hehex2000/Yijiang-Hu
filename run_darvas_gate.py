@@ -155,7 +155,7 @@ def run_backtest(start_date="20180101", end_date="20251231", base=BASE, top_n=TO
         if td in rebalance_set:
             prev_int = int(trade_dates[trade_dates.index(td) - 1]) if trade_dates.index(td) > 0 else int(td)
             all_codes.update(get_base_selection(base, prev_int, top_n))
-    all_codes = sorted(c for c in all_codes if not str(c).startswith("688"))
+    all_codes = sorted(all_codes)
     print(f"基础策略={base} 调仓 {len(rebalance_set)} 次；出现过 {len(all_codes)} 只候选股")
     price = _load_ohlc(all_codes, pre_start, end_date)
 

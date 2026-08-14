@@ -1052,14 +1052,14 @@ def _get_all_stocks_from_db():
         # 存活股（当前上市）
         alive = pd.read_sql_query(
             "SELECT ts_code, name, COALESCE(industry, '未知') AS industry "
-            "FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' AND ts_code NOT LIKE '688%'",
+            "FROM stock_basic WHERE ts_code NOT LIKE '%.BJ'",
             conn,
         )
         # 退市股（在 daily 有历史成交，但已不在 stock_basic）→ 纳入以消除幸存者偏差
         delisted = pd.read_sql_query(
             "SELECT DISTINCT d.ts_code, COALESCE(sb.name, d.ts_code) AS name, '未知' AS industry "
             "FROM daily d LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code "
-            "WHERE sb.ts_code IS NULL AND d.ts_code NOT LIKE '%.BJ' AND d.ts_code NOT LIKE '688%'",
+            "WHERE sb.ts_code IS NULL AND d.ts_code NOT LIKE '%.BJ'",
             conn,
         )
         df = pd.concat([alive, delisted], ignore_index=True)
@@ -1073,7 +1073,7 @@ def _get_all_stocks_from_db():
         df = pd.read_sql_query(
             "SELECT DISTINCT d.ts_code, COALESCE(sb.name, d.ts_code) AS name, '未知' AS industry "
             "FROM index_constituent d LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code "
-            "WHERE d.index_code IN ('000300.SH','000905.SH') AND d.ts_code NOT LIKE '688%' "
+            "WHERE d.index_code IN ('000300.SH','000905.SH') "
             "AND d.trade_date = (SELECT MAX(trade_date) FROM index_constituent)",
             conn,
         )
@@ -1157,7 +1157,7 @@ def _get_index_constituents_from_db(index_code: str, as_of_date: str = None) -> 
 
         # 查询该快照日成分股（用 REPLACE 兼容两种日期格式）
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code=? AND REPLACE(trade_date, '-', '')=? AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code=? AND REPLACE(trade_date, '-', '')=?",
             conn,
             params=(index_code, query_date)
         )
@@ -1987,9 +1987,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--source", "-s",
         type=str,
-        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance", "sc_rotation", "dca_etf", "macd_regime"],
+        choices=["multi", "value", "div_low_vol", "dogs", "dogs_annual", "csv", "manual", "monthly_rebalance", "sc_rotation", "sc_kara", "dca_etf", "macd_regime"],
         default=None,
-        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓) / sc_rotation(小市值轮动) / dca_etf(ETF定投·单产品/宽基篮子·月/周)"
+        help="选股策略来源: multi(多因子) / value(价值投资) / div_low_vol(红利低波) / dogs(狗股策略) / dogs_annual(年度调仓) / csv(指定文件) / manual(手动列表) / monthly_rebalance(月度调仓) / sc_rotation(小市值轮动·周频止损版) / sc_kara(Kara小市值轮动·纯最小市值月频零过滤) / dca_etf(ETF定投·单产品/宽基篮子·月/周)"
     )
     parser.add_argument(
         "--start-date", type=str, default=None,
@@ -2194,6 +2194,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sc-no-detail", action="store_true",
         help="小市值轮动(single模式)·不导出文本+CSV回测明细(默认会同时生成明细+HTML)"
+    )
+    parser.add_argument(
+        "--kara-exclude-688", action="store_true",
+        help="Kara小市值轮动(sc_kara): 剔除科创板(688)，用于对照加科创板选股的贡献"
     )
     # ── 定投 ETF（dca_etf）专用参数 ──
     parser.add_argument(
@@ -2653,6 +2657,27 @@ if __name__ == "__main__":
                 detail_path=_sc_detail_path, no_html=args.sc_no_html,
                 var_control=args.var_control, var_maxdd=args.var_maxdd, var_n=args.var_n,
             )
+        sys.exit(0)
+
+    elif args.source == "sc_kara":
+        # Kara 小市值轮动（纯最小市值·月频·等权·零过滤器·无止损）— 平台集成入口
+        # 引擎复用 backtest_kara_small_cap.run_backtest（与 sc_rotation 周频止损版是两类东西）
+        from backtest_kara_small_cap import run_backtest as kara_run, _print_report as kara_print
+        _hold = args.hold_count if args.hold_count is not None else 20
+        _pool = args.sc_pool_mode  # cyb / zz2000 / zz1000
+        print(f"\n  Kara 小市值轮动策略 · 回测（纯最小市值·月频·等权·零过滤器）")
+        print(f"  区间: {BACKTEST['start_date']} ~ {BACKTEST['end_date']}  | 持仓: {_hold} 只")
+        print(f"  选股宇宙: {_pool}（屏蔽老三板/北交所，含科创板）")
+        print(f"  剔除科创板(688): {'是' if args.kara_exclude_688 else '否'}")
+        print(f"  流动性门槛: {args.min_avg_amount_k if args.min_avg_amount_k is not None else '默认(3000万)'} 千元")
+        print(f"  {'='*60}")
+        _kara_res = kara_run(
+            start=BACKTEST["start_date"], end=BACKTEST["end_date"],
+            hold_count=_hold, pool_mode=_pool,
+            min_avg_amount_k=args.min_avg_amount_k,
+            exclude_688=args.kara_exclude_688,
+        )
+        kara_print(_kara_res)
         sys.exit(0)
 
     elif args.source == "csv":

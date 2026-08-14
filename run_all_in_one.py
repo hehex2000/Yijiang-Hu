@@ -167,7 +167,6 @@ def build_universe(raw_data, as_of_dt):
     df['name'] = df['ts_code'].map(nm).fillna('')
     df = df[~df['name'].str.contains('ST', case=False, na=False)]   # 修正 bug3：精确 ST
     df = df[~df['ts_code'].str.endswith('.BJ')]
-    df = df[~df['ts_code'].str.startswith('688')]   # 屏蔽科创板(688)：投资门槛对散户不友好
 
     # 流动性过滤（基于区间起始日的滚动成交额，单位千元需 ×1000）
     if LIQUIDITY_MIN_AVG_AMOUNT > 0:

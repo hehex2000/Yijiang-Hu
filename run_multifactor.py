@@ -104,7 +104,7 @@ def select_multifactor(rebalance_date, prev_date, top_n=TOP_N,
     if pool_set is not None and verbose:
         print(f"  [股票池] {stock_pool} 时点成分 {len(pool_set)} 只（asof {prev_date}）")
 
-    # 1) 资格过滤（同 run_ep_neutral：剔除 ST/688/.BJ/金融/公用事业/上市<60天）
+    # 1) 资格过滤（同 run_ep_neutral：剔除 ST / .BJ/金融/公用事业/上市<60天）
     rows = pd.read_sql_query(
         "SELECT DISTINCT ts_code FROM daily WHERE trade_date = ?",
         conn, params=(prev_date,))
@@ -117,7 +117,7 @@ def select_multifactor(rebalance_date, prev_date, top_n=TOP_N,
             continue
         info = basic.get(c)
         if info is None:
-            if c.startswith("688") or c.endswith(".BJ"):
+            if c.endswith(".BJ"):
                 continue
             eligible.add(c)
             continue
@@ -288,7 +288,7 @@ def run_backtest(start_date="20120401", end_date="20260715", top_n=TOP_N,
     print(f"  区间：{start_date} ~ {end_date}")
     cap_note = f"{top_n}只等权" if top_n else "全部等权"
     print(f"  持仓：{cap_note} | 调仓：{cadence_note}")
-    print(f"  剔除：ST / 688 / .BJ / 金融 / 公用事业 / 上市<60天")
+    print(f"  剔除：ST / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  因子：{fac_str}，各截面pct等权平均")
     ex = "开盘价" if EXEC_PRICE == "open" else "日级VWAP代理(amount×10/vol)"
     print(f"  成交价假设：{ex} | 涨跌停约束：{'开(涨停买不进/跌停卖不出)' if LIMIT_ON else '关'} "

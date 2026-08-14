@@ -118,6 +118,7 @@ echo   [1] V6+Regime生产版[默认·已替代原ETF轮动]  --rsrs 0
 echo   [2] V6+Regime+RSRS0.3[带质量分]
 echo   [3] V6合并版(无Regime·纯对照)  --regime off
 echo   [4] 原版平台ETF轮动(审计对照基线·保留)
+echo   [5] (V6 4只版) 红利/创业50/纳指/黄金 · 纯RSRS+动量
 echo   [0] 返回主菜单
 echo.
 set ETF_POOL_ARG=
@@ -127,7 +128,7 @@ set ETF_VARSEL=
 set ETF_PREMIUM_ARG=
 set ETF_MA_ARG=
 set ETF_MODE=
-set /p ETF_MODE=请选择 (1-4, 默认1):
+set /p ETF_MODE=请选择 (1-5, 默认1):
 if "%ETF_MODE%"=="0" goto :menu
 if "%ETF_MODE%"=="" set ETF_MODE=1
 set ETF_REGIME=off
@@ -167,6 +168,13 @@ goto :etf_exec
 :etf_exec
 echo.
 echo   正在运行...
+if "%ETF_MODE%"=="5" (
+  "venv_ml\Scripts\python.exe" run_etf_rotation_v6.py
+  echo.
+  echo   [返回主菜单]
+  pause
+  goto :menu
+)
 if "%ETF_LEGACY%"=="1" (
   "venv_ml\Scripts\python.exe" run_etf_rotation.py %BACKTEST_START% %BACKTEST_END% --method dual %ETF_MA_ARG% %ETF_POOL_ARG% %ETF_TOPN_ARG% %ETF_VAR_ARG% %ETF_PREMIUM_ARG%
 ) else (
@@ -272,11 +280,11 @@ echo   [A] 动量+网格择时 [方案①·网格作为市场温度计]
 echo   [B] ETF轮动策略[动量轮动·纯国内资产]
 echo   [C] 配对套利[均值回归·多头轮动]
 echo   [D] 指数/ETF 涨跌一览[回测周期表现]
-echo   [E] 小市值轮动 [创业板最小流通市值·无前视+流动性+三层止损]
+echo   [E] 小市值轮动 [①周频止损版 ②Kara纯最小市值月频版]
 echo   [F] ETF定投 [单产品/宽基篮子·月/周对比]
 echo   [0] 退出
 echo.
-set /p CHOICE=请选择 (1-9/A-G, 0退出):
+set /p CHOICE=请选择 (1-9/A-F, 0退出):
 echo.
 
 if "%CHOICE%"=="1" goto :run_all
@@ -922,6 +930,24 @@ goto :menu
 cls
 echo.
 echo ================
+echo   小市值轮动策略 · 版本选择
+echo ================
+echo.
+echo   请选择要运行的小市值策略版本：
+echo   [1] 周频止损版 (原 sc_rotation · 周频换仓 + 三层止损 + VaR仓位缩放)
+echo   [2] Kara 纯最小市值月频版 (sc_kara · 月频等权 + 零过滤器 + 含科创板)
+echo   [0] 返回主菜单
+echo.
+set /p SC_VER=  选择 (1/2/0):
+if "%SC_VER%"=="1" goto :sc_rotation_run
+if "%SC_VER%"=="2" goto :sc_kara
+if "%SC_VER%"=="0" goto :menu
+goto :sc_rotation
+
+:sc_rotation_run
+cls
+echo.
+echo ================
 echo   小市值轮动策略[全市场小市值·中证2000风格]
 echo ================
 echo.
@@ -1002,9 +1028,9 @@ echo   正在运行...
 echo.
 "venv_ml\Scripts\python.exe" run_backtest.py --source sc_rotation --start-date %BACKTEST_START% --end-date %BACKTEST_END% --capital %TOTAL_CAPITAL% %SC_ARGS% %SC_OUT% %SC_VAR%
 echo.
-echo   [返回主菜单]
+echo   [返回小市值策略菜单]
 pause
-goto :menu
+goto :sc_rotation
 
 :sc_compare
 set SC_ARGS=--hold-count %SC_HOLD% --sc-pool-mode %SC_POOL% --sc-mode size_quintile
@@ -1013,9 +1039,52 @@ echo   正在运行...
 echo.
 "venv_ml\Scripts\python.exe" run_backtest.py --source sc_rotation --start-date %BACKTEST_START% --end-date %BACKTEST_END% --capital %TOTAL_CAPITAL% %SC_ARGS% --sc-no-detail
 echo.
-echo   [返回主菜单]
+echo   [返回小市值策略菜单]
 pause
-goto :menu
+goto :sc_rotation
+
+:sc_kara
+cls
+echo.
+echo ================
+echo   Kara 小市值轮动策略[全市场最小流通市值·月频等权·零过滤器]
+echo ================
+echo.
+echo   规则：全市场(剔除老三板/北交所·含科创板)按流通市值升序取最小N只，每月第5交易日等权换仓，零过滤器、无止损。
+echo   来源：B站 UP Kara说量化(BV15X5t6rE12) 极简最小市值策略的平台适配版，已用平台成本/滑点/历史印花税模型复现。
+echo   实测(2020-2026)：含科创板 +80.47%% 跑赢中证2000(+9.53pp)；远不及原版声称135%%(其含北交所+幸存者偏差+窗口美化)。
+echo.
+echo   当前配置:
+echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   请设置持仓只数[默认20，回车=20]:
+set KARA_HOLD=20
+set /p KARA_HOLD_INPUT=  持仓只数:
+if not "%KARA_HOLD_INPUT%"=="" set KARA_HOLD=%KARA_HOLD_INPUT%
+echo.
+echo   选择「选股宇宙」？
+echo   [1] 中证2000风格[默认，全市场流通市值最小2000只·含微盘尾·含科创板]
+echo   [2] 纯创业板 (300/301)
+echo   [4] 中证1000风格[市值排名801-1800·剔除微盘尾]
+set KARA_POOL=zz2000
+set /p KARA_POOL_INPUT=  选择 (1/2/4, 默认1):
+if "%KARA_POOL_INPUT%"=="2" set KARA_POOL=cyb
+if "%KARA_POOL_INPUT%"=="4" set KARA_POOL=zz1000
+echo.
+echo   是否「剔除科创板(688)」？(用于对照加科创板选股的贡献，默认含科创板)
+echo   [1] 含科创板[默认]   [2] 剔除科创板
+set KARA_X688=
+set /p KARA_X688_INPUT=  选择 (1/2, 默认1含688):
+if "%KARA_X688_INPUT%"=="2" set KARA_X688=--kara-exclude-688
+echo.
+echo   配置: 宇宙=%KARA_POOL% 持仓%KARA_HOLD%只 剔除688=%KARA_X688%
+echo   正在运行...
+echo.
+"venv_ml\Scripts\python.exe" run_backtest.py --source sc_kara --start-date %BACKTEST_START% --end-date %BACKTEST_END% --hold-count %KARA_HOLD% --sc-pool-mode %KARA_POOL% %KARA_X688%
+echo.
+echo   [返回小市值策略菜单]
+pause
+goto :sc_rotation
 
 :macd_timing
 cls

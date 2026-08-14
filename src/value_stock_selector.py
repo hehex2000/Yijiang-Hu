@@ -85,7 +85,7 @@ def _vsel_pool_ts_set(pool, conn, trade_date):
     if sd is not None:
         df = pd.read_sql_query(
             "SELECT ts_code FROM index_constituent "
-            "WHERE index_code=? AND ts_code NOT LIKE '688%' AND CAST(trade_date AS INTEGER)=CAST(? AS INTEGER)",
+            "WHERE index_code=? AND CAST(trade_date AS INTEGER)=CAST(? AS INTEGER)",
             conn, params=(idx, int(sd)),   # int() 避免 numpy 类型绑定失败
         )
         return set(df["ts_code"].tolist())
@@ -179,7 +179,7 @@ def select_value_stocks(trade_date, top_n=5, stock_pool="zz800",
     if pool_set is not None:
         df = df[df["ts_code"].isin(pool_set)]
     # 全局剔除科创板(688)与北交所(.BJ后缀)，对散户更友好
-    df = df[~df["ts_code"].str.startswith("688") & ~df["ts_code"].str.endswith(".BJ")]
+    df = df[~df["ts_code"].str.endswith(".BJ")]
     if df.empty:
         conn.close()
         return pd.DataFrame(columns=["ts_code", "code", "name", "pb", "pe_ttm",

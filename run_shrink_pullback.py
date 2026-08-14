@@ -114,8 +114,8 @@ def load_universe_data(pool, start_date, end_date):
     if cons is None or len(cons) == 0:
         cons = get_index_constituents(pool, trade_date=start_date, allow_stale_fallback=True)
     pre_start = str(int(start_date) - PRE_START_YEARS * 10000)
-    codes = sorted(c for c in cons if not str(c).startswith("688"))
-    print(f"股票池 {pool} {INDEX_DISPLAY_NAME.get(pool, '')} 成分股(剔除688): {len(codes)} 只")
+    codes = sorted(cons)
+    print(f"股票池 {pool} {INDEX_DISPLAY_NAME.get(pool, '')} 成分股(剔除.BJ): {len(codes)} 只")
 
     conn = get_conn()
     meta = pd.read_sql_query(

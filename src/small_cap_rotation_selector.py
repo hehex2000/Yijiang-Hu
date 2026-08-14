@@ -93,8 +93,8 @@ def limit_down_ratio(ts_code, trade_date):
 #     按 circ_mv 排名的 point-in-time 近似，比套官方成分股更适合回测。
 POOL_MODES = {
     "cyb":     {"desc": "创业板 (300/301)",                            "universe": "cyb",     "pool": 2000, "offset": 0},
-    "zz2000":  {"desc": "中证2000风格 (流通市值最小2000只·含微盘尾·剔除北交所)", "universe": "all",     "pool": 2000, "offset": 0},
-    "zz1000":  {"desc": "中证1000风格 (市值排名801-1800·剔除微盘尾·剔除北交所)", "universe": "all",     "pool": 1000, "offset": 800},
+    "zz2000":  {"desc": "中证2000风格 (流通市值最小2000只·含微盘尾·屏蔽老三板/北交所·含科创板)", "universe": "all",     "pool": 2000, "offset": 0},
+    "zz1000":  {"desc": "中证1000风格 (市值排名801-1800·剔除微盘尾·屏蔽老三板/北交所·含科创板)", "universe": "all",     "pool": 1000, "offset": 800},
 }
 POOL_DESC = {k: v["desc"] for k, v in POOL_MODES.items()}
 
@@ -107,6 +107,7 @@ class SmallCapRotationSelector:
         min_avg_amount_k=MIN_AVG_AMOUNT_K,
         fundamental_filter=False,
         exclude_delisted=False,
+        exclude_st=True,
         pool_mode="zz2000",
         pool_offset=None,
         quality_filter=False,
@@ -115,6 +116,8 @@ class SmallCapRotationSelector:
         vol_filter=False,
         vol_window=60,
         vol_quantile=0.95,
+        industry_cap=0,
+        exclude_688=False,
         order="ASC",
     ):
         if pool_mode not in POOL_MODES:
@@ -145,9 +148,19 @@ class SmallCapRotationSelector:
         self.vol_quantile = min(0.99, max(0.5, float(vol_quantile)))
         # 剔除已退市股（仅保留 stock_basic 中当前上市的票）→ 用于量化幸存者偏差
         self.exclude_delisted = exclude_delisted
+        # ST/退市 名称护栏（默认开）：剔除 ST、*ST、退市(名称含'退'字)等风险警示名。
+        #   —— 排雷用，非追 alpha：不改动市值排序逻辑，只把最易暴雷的票移出候选池。
+        #   仅按名称排除；已退市且 name=NULL 的票由 exclude_delisted 控制（默认False=保留，
+        #   因 daily 表要求 snapshot_date 当日有成交，选股时本就只含活跃票）。
+        self.exclude_st = bool(exclude_st)
         self.pool_mode = pool_mode            # 选股宇宙模式
         self.universe = preset["universe"]    # cyb / all
         self.order = order                    # 排序方向：ASC=最小市值优先 / DESC=最大市值优先(用于分位组对照的大桶)
+        # 维度4·行业分散上限（视频"屎里淘金"②：行业要分散，否则没分散）：
+        # 同一行业持仓不超过 industry_cap 只（0=不限制）。直接缓解"集中困境微盘尾+单一行业暴雷"双重病灶。
+        self.industry_cap = max(0, int(industry_cap))
+        # 可选：剔除科创板(688)——用于量化「加科创板选股」的独立贡献对照（默认不开，平台已放行688）
+        self.exclude_688 = bool(exclude_688)
 
     def select_stocks(self, snapshot_date):
         """返回快照日 snapshot_date 选出的 ts_code 列表（流通市值最小 hold_count 只）。
@@ -209,9 +222,11 @@ class SmallCapRotationSelector:
         # 选股宇宙：按 pool_mode 切换（涨跌停逻辑在 Python 层按代码前缀自动区分，此处无需区分）
         if self.universe == "cyb":
             universe_cond = "AND (d.ts_code LIKE '300%' OR d.ts_code LIKE '301%')"
-        else:  # all：全市场最小N只，剔除北交所/老三板/科创板(688对散户不友好)
+        else:  # all：全市场最小N只，屏蔽老三板(4xx)与北交所(8xx/920)，放行科创板(688)
             universe_cond = ("AND d.ts_code NOT LIKE '8%' AND d.ts_code NOT LIKE '4%' "
-                             "AND d.ts_code NOT LIKE '920%' AND d.ts_code NOT LIKE '688%'")
+                             "AND d.ts_code NOT LIKE '920%'")
+            if self.exclude_688:
+                universe_cond += " AND d.ts_code NOT LIKE '688%'"
 
         # ── 参数按 SQL 文本出现顺序收集（保证 ? 顺序 === SQL 中 ? 出现顺序）──
         params = []
@@ -229,6 +244,14 @@ class SmallCapRotationSelector:
         params.append(self.selection_pool)          # LIMIT ?
         params.append(self.pool_offset)             # OFFSET ?
 
+        # ST/退市 名称护栏（exclude_st 默认开）：按名称剔除风险警示股。
+        #   - 开：保留 (name IS NULL) 或 (不含'ST'且不含'退') 的票。
+        #   - 关：恒真（不排除 ST），用于对照实验。
+        if self.exclude_st:
+            st_cond = "(s.name IS NULL OR (s.name NOT LIKE '%ST%' AND s.name NOT LIKE '%退%'))"
+        else:
+            st_cond = "(s.name IS NULL OR 1=1)"
+
         q = f"""
         SELECT d.ts_code, db.circ_mv, d.close, d.pre_close{vol_select}{extra_cols}
         FROM daily d
@@ -242,7 +265,7 @@ class SmallCapRotationSelector:
         WHERE d.trade_date = ?
           {universe_cond}
           AND d.amount > 0                                        -- 剔除停牌(无成交)
-          AND (s.name IS NULL OR s.name NOT LIKE '%ST%')          -- 剔除ST(退市股name=NULL则保留)
+          AND {st_cond}                                           -- ST/*ST/退市 名称护栏(exclude_st)
           AND (s.list_date IS NULL OR s.list_date <= ?)           -- 剔除次新股(有记录才判)
           AND d.close >= ? AND d.close <= ?                       -- 2元<=价<=100元
           AND db.circ_mv > 0                                      -- 有流通市值
@@ -256,6 +279,17 @@ class SmallCapRotationSelector:
         LIMIT ? OFFSET ?
         """
         rows = conn.execute(q, params).fetchall()
+
+        # ── 维度4·行业分散上限：在 conn 关闭前批量取行业 ──
+        ind_map = {}
+        if self.industry_cap and rows:
+            _ph = ",".join("?" for _ in rows)
+            _ind = conn.execute(
+                f"SELECT ts_code, industry FROM stock_basic WHERE ts_code IN ({_ph})",
+                [r[0] for r in rows],
+            ).fetchall()
+            ind_map = {ts: (ind or "UNKNOWN") for ts, ind in _ind}
+
         conn.close()
 
         # ── 维度3·极端波动过滤：剔除 _vol(近 vol_window 日收益率方差) 最高的 vol_quantile 分位 ──
@@ -285,9 +319,10 @@ class SmallCapRotationSelector:
         else:
             ranked = rows
 
-        # 无前视 + 涨跌停判定（按板块前缀区分幅度，仅用开盘/收盘价，不参考盘中）：
-        # 对候选序列逐个检查，跳过涨停(买不进)/跌停(卖不出续持)，取前 hold_count 只。
+        # 无前视 + 涨跌停判定 + 行业分散上限（按板块前缀区分幅度，仅用开盘/收盘价）。
+        # 对候选序列逐个检查，跳过涨停(买不进)/跌停(卖不出续持)/超行业上限，取前 hold_count 只。
         codes = []
+        ind_count = {}
         for r in ranked:
             ts_code, close, pre_close = r[0], r[2], r[3]
             if pre_close and pre_close > 0:
@@ -297,6 +332,12 @@ class SmallCapRotationSelector:
                     continue
                 if close / pre_close <= down_r + 1e-9:  # 跌停，卖不出(续持)
                     continue
+            # 维度4·行业分散上限：同一行业持仓不超过 industry_cap 只（0=不限制）
+            if self.industry_cap:
+                ind = ind_map.get(ts_code, "UNKNOWN")
+                if ind_count.get(ind, 0) >= self.industry_cap:
+                    continue
+                ind_count[ind] = ind_count.get(ind, 0) + 1
             codes.append(ts_code)
             if len(codes) >= self.hold_count:
                 break

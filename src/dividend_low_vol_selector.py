@@ -99,7 +99,7 @@ class DividendLowVolSelector:
             return self._zz800_cache
         conn = self._get_conn()
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = '000906.SH' AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000906.SH'",
             conn,
         )
         conn.close()
@@ -112,7 +112,7 @@ class DividendLowVolSelector:
             return self._hs300_cache
         conn = self._get_conn()
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = '000300.SH' AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000300.SH'",
             conn,
         )
         conn.close()
@@ -125,7 +125,7 @@ class DividendLowVolSelector:
             return self._zz500_cache
         conn = self._get_conn()
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = '000905.SH' AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000905.SH'",
             conn,
         )
         conn.close()
@@ -138,7 +138,7 @@ class DividendLowVolSelector:
             return self._zz1000_cache
         conn = self._get_conn()
         df = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = '000852.SH' AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code = '000852.SH'",
             conn,
         )
         conn.close()
@@ -146,13 +146,13 @@ class DividendLowVolSelector:
         return self._zz1000_cache
 
     # [已移除] _get_kcb_cyb_constituents：科创板+创业板(高风险) 股票池已按需求删除
-    # （科创板投资门槛对散户不友好，本回测平台统一剔除 688 开头股票）
+    # （科创板投资门槛对散户不友好，本回测平台统一屏蔽北交所(.BJ)）
 
     def _get_all_stocks(self) -> set:
         """获取全A股股票列表（从 stock_basic 表）"""
         conn = self._get_conn()
         df = pd.read_sql_query(
-            "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ' AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM stock_basic WHERE ts_code NOT LIKE '%.BJ'",
             conn,
         )
         conn.close()
@@ -467,7 +467,7 @@ class DividendLowVolSelector:
             print(f"  [红利低波] 估值+{pool_name}过滤后：{len(df)} 只")
 
         # 全局屏蔽科创板(688开头)与北交所(.BJ后缀)：投资门槛对散户不友好，本平台统一剔除
-        df = df[~df["ts_code"].str.startswith("688") & ~df["ts_code"].str.endswith(".BJ")]
+        df = df[~df["ts_code"].str.endswith(".BJ")]
 
         # ---- 第二步之附：红利质量·能力+意愿+前瞻（视频《红利个股DIY》框架）----
         _any_new = (self.forward_yield_min > 0 or self.consecutive_div_years_min > 0

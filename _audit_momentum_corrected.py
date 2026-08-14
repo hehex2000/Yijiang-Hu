@@ -32,7 +32,7 @@ def load_stocks():
     series = {}
     n = 0
     for code in codes:
-        if code in st or code.startswith('688') or code.endswith('.BJ'):
+        if code in st or code.endswith('.BJ'):
             continue
         con = get_conn(); cur = con.cursor()
         cur.execute("""SELECT d.trade_date, d.close, a.adj_factor

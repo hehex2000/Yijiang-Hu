@@ -14,7 +14,7 @@ v2 相对 v1(首版)的四处改进（对应首版回测暴露的三大结构问
   - 动量：过去 6 个月收益率（跳过最近 1 个月）> 0
   - 价值：0 < pe_ttm <= 40 且 0 < pb <= 6
   - 成长：营业利润同比 op_yoy > 0 或 basic_eps_yoy > 0
-  - 流动性：total_mv >= 30 亿；上市 >= 1 年；排除 ST / *ST；排除 科创板(688)
+  - 流动性：total_mv >= 30 亿；上市 >= 1 年；排除 ST / *ST；排除 北交所(.BJ)
 
 费用：完全复用引擎 calc_fee（佣金万2.5最低5元 + 印花税历史分段 + 滑点0.1%损失向）。
 基准：股票池对应指数（默认 中证800 000906.SH）。
@@ -93,8 +93,8 @@ def load_universe_data(pool, start_date, end_date):
         cons = get_index_constituents(pool, trade_date=start_date,
                                       allow_stale_fallback=True)
     pre_start = str(int(start_date) - PRE_START_YEARS * 10000)
-    codes = sorted(c for c in cons if not str(c).startswith("688"))
-    print(f"股票池 {pool} {INDEX_DISPLAY_NAME.get(pool, '')} 成分股(剔除688): {len(codes)} 只")
+    codes = sorted(cons)
+    print(f"股票池 {pool} {INDEX_DISPLAY_NAME.get(pool, '')} 成分股(剔除.BJ): {len(codes)} 只")
 
     conn = get_conn()
     meta = pd.read_sql_query(

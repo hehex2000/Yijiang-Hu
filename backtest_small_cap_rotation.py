@@ -230,6 +230,7 @@ def run_backtest(
     quality_filter=False,
     growth_tilt=False,
     vol_filter=False,
+    industry_cap=0,
     style_switch=False,
     detail_path=None,
     no_html=False,
@@ -255,6 +256,7 @@ def run_backtest(
         quality_filter=quality_filter,
         growth_tilt=growth_tilt,
         vol_filter=vol_filter,
+        industry_cap=industry_cap,
     )
 
     trade_dates = get_trade_dates(start_date, end_date)
@@ -272,6 +274,7 @@ def run_backtest(
     print(f"  A档质量门禁: {'开(roe>0 & bps>0 & 资产负债率<70% & 每股经营现金流>0)' if quality_filter else '关'}")
     print(f"  B档成长倾斜: {'开(最小市值桶内 净利润同比>0 优先 + roe 降序)' if growth_tilt else '关'}")
     print(f"  维度3极端波动过滤: {'开(剔除近60日收益率方差最高5%%)' if vol_filter else '关'}")
+    print(f"  维度4行业分散上限: {'开(单行业≤%d只)' % industry_cap if industry_cap else '关'}")
     print(f"  维度5风格切换: {'开(沪深300连续20日跑赢中证1000→空仓)' if style_switch else '关'}")
     print(f"  成本: 佣金万2.5(最低5) + 印花税千1→千0.5(2023-08-28起,卖)")
     print(f"  滑点: 流动性自适应 = base{int(BASE_SLIP*1e4)}bp + {int(SLIP_IMPACT*100)}%×参与度, 上限{int(MAX_SLIP*1e4)}bp")
@@ -1019,7 +1022,7 @@ def run_survivor_bias_comparison(
     start_date="20200102", end_date="20251231", hold_count=7,
     capital=None, benchmark="932000.SH", empty_jan_apr=False,
     enable_stop_loss=False, fundamental_filter=False, pool_mode="zz2000",
-    quality_filter=False, growth_tilt=False,
+    quality_filter=False, growth_tilt=False, industry_cap=0,
 ):
     """对照：含退市股(LEFT JOIN) vs 剔除退市股(INNER JOIN)，量化幸存者偏差幅度。"""
     print(f"\n{'='*70}")
@@ -1032,12 +1035,14 @@ def run_survivor_bias_comparison(
                           benchmark=benchmark, empty_jan_apr=empty_jan_apr,
                           enable_stop_loss=enable_stop_loss, fundamental_filter=fundamental_filter,
                           exclude_delisted=False, pool_mode=pool_mode, quiet=False,
-                          quality_filter=quality_filter, growth_tilt=growth_tilt)
+                          quality_filter=quality_filter, growth_tilt=growth_tilt,
+                          industry_cap=industry_cap)
     r_without = run_backtest(start_date, end_date, hold_count=hold_count, capital=capital,
                              benchmark=benchmark, empty_jan_apr=empty_jan_apr,
                              enable_stop_loss=enable_stop_loss, fundamental_filter=fundamental_filter,
                              exclude_delisted=True, pool_mode=pool_mode, quiet=True,
-                             quality_filter=quality_filter, growth_tilt=growth_tilt)
+                             quality_filter=quality_filter, growth_tilt=growth_tilt,
+                             industry_cap=industry_cap)
 
     if r_with is None or r_without is None:
         print("  [ERROR] 对照运行失败")
@@ -1073,7 +1078,7 @@ def run_sensitivity(
     start_date="20200102", end_date="20251231", capital=None, benchmark="932000.SH",
     empty_jan_apr=False, enable_stop_loss=False, fundamental_filter=False,
     hold_grid=(5, 7, 10, 15), liq_grid=(30000, 50000, 80000, 100000), pool_mode="zz2000",
-    quality_filter=False, growth_tilt=False,
+    quality_filter=False, growth_tilt=False, industry_cap=0,
 ):
     """参数敏感性：持仓数 × 流动性门槛网格回测。"""
     import csv, os
@@ -1091,7 +1096,8 @@ def run_sensitivity(
                              benchmark=benchmark, empty_jan_apr=empty_jan_apr,
                              enable_stop_loss=enable_stop_loss, fundamental_filter=fundamental_filter,
                              min_avg_amount_k=liq_k, pool_mode=pool_mode, quiet=True,
-                             quality_filter=quality_filter, growth_tilt=growth_tilt)
+                             quality_filter=quality_filter, growth_tilt=growth_tilt,
+                             industry_cap=industry_cap)
             if r is None:
                 continue
             table.append({
@@ -1261,6 +1267,8 @@ if __name__ == "__main__":
                    help="[A档] 质量门禁升级: roe>0 & bps>0(未资不抵债) & debt_to_assets<70 & ocfps>0 (与 --fundamental 互斥时优先; 数据缺失则保留)")
     p.add_argument("--growth-tilt", action="store_true",
                    help="[B档] 成长倾斜: 最小市值桶(hold*3)内按 净利润同比>0 优先 + roe 降序 重排取前N (size为底+成长增强)")
+    p.add_argument("--industry-cap", type=int, default=0,
+                   help="[维度4] 行业分散上限: 同一行业最多持仓只数(0=不限制). 直接缓解'集中困境微盘尾+单一行业暴雷'")
     p.add_argument("--exclude-delisted", action="store_true", help="剔除已退市股(INNER JOIN, 用于幸存者偏差对照)")
     p.add_argument("--min-avg-amount-k", type=float, default=None, help="流动性门槛(日均成交额,千元), 默认30000(=3000万)")
     p.add_argument("--pool-mode", choices=list(POOL_DESC.keys()), default="zz2000",
@@ -1301,6 +1309,7 @@ if __name__ == "__main__":
             fundamental_filter=args.fundamental, exclude_delisted=args.exclude_delisted,
             min_avg_amount_k=args.min_avg_amount_k, pool_mode=args.pool_mode,
             quality_filter=args.quality_filter, growth_tilt=args.growth_tilt,
+            industry_cap=args.industry_cap,
             pool_order=bucket_order, pool_offset=bucket_offset, bucket_label=bucket_label,
             detail_path=detail_path, no_html=args.no_html,
         )
@@ -1310,6 +1319,7 @@ if __name__ == "__main__":
             capital=args.capital, benchmark=args.benchmark,
             empty_jan_apr=args.empty_jan_apr, enable_stop_loss=args.stop_loss,
             fundamental_filter=args.fundamental, pool_mode=args.pool_mode,
+            industry_cap=args.industry_cap,
         )
     elif args.mode == "sensitivity":
         run_sensitivity(
@@ -1318,5 +1328,5 @@ if __name__ == "__main__":
             enable_stop_loss=args.stop_loss, fundamental_filter=args.fundamental,
             hold_grid=[int(x) for x in args.hold_grid.split(",")],
             liq_grid=[float(x) for x in args.liq_grid.split(",")],
-            pool_mode=args.pool_mode,
+            pool_mode=args.pool_mode, industry_cap=args.industry_cap,
         )

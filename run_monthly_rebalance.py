@@ -498,15 +498,15 @@ def get_index_constituents(index_code=None, trade_date=None,
         # 取调仓日当天或之前最近的成分股快照
         rows = pd.read_sql_query("""
             SELECT ts_code FROM index_constituent
-            WHERE index_code = ? AND ts_code NOT LIKE '688%' AND trade_date <= ?
+            WHERE index_code = ? AND trade_date <= ?
             AND trade_date = (
                 SELECT MAX(trade_date) FROM index_constituent
-                WHERE index_code = ? AND ts_code NOT LIKE '688%' AND trade_date <= ?
+                WHERE index_code = ? AND trade_date <= ?
             )
         """, conn, params=(index_code, trade_date, index_code, trade_date))
     else:
         rows = pd.read_sql_query(
-            "SELECT ts_code FROM index_constituent WHERE index_code = ? AND ts_code NOT LIKE '688%'",
+            "SELECT ts_code FROM index_constituent WHERE index_code = ?",
             conn, params=(index_code,)
         )
     conn.close()
@@ -940,7 +940,7 @@ def select_dividend_growth_stocks(trade_date, top_n=None,
     def _lim(code):
         if code.startswith("688"):
             return 19.9
-        if code.startswith("300"):
+        if code.startswith("300") or code.startswith("301"):  # 创业板(300/301) 20%
             return 19.9 if d_int >= 20200824 else 9.9
         return 9.9
 
@@ -1384,8 +1384,8 @@ def select_momentum_stocks(trade_date, lookback_months=6, top_n=5, index_code=No
                 SELECT MAX(trade_date) FROM daily WHERE trade_date <= ?
             )
         """, conn, params=(trade_date,))
-        # 屏蔽科创板(688)与北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
-        stock_set = {c for c in rows['ts_code'].tolist() if not c.startswith('688') and not c.endswith('.BJ')}
+        # 屏蔽北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
+        stock_set = {c for c in rows['ts_code'].tolist() if not c.endswith('.BJ')}
 
     # ===== 3. 排除ST股票 =====
     st_codes = pd.read_sql_query(
@@ -1578,9 +1578,9 @@ def select_breakout_stocks(trade_date, top_n=15, index_code=None,
         members = set(get_index_constituents(index_code, trade_date=trade_date))
         cnt = cnt[cnt.index.isin(members)]
     else:
-        # 全A模式：剔除科创板(688)/北交所(.BJ)，与平台动量全A口径一致
+        # 全A模式：剔除北交所(.BJ)，与平台动量全A口径一致
         # （zz800 等指数池模式走上面 index_code 分支，成分股本就不含这两者）
-        mask = cnt.index.to_series().str.startswith("688") | cnt.index.to_series().str.endswith(".BJ")
+        mask = cnt.index.to_series().str.endswith(".BJ")
         cnt = cnt[~mask]
     cnt = cnt.sort_values(ascending=False)
     selected = cnt.head(top_n).index.tolist()
@@ -1904,7 +1904,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                 if p_prev is None or p_cur is None:
                     continue
                 _lim = 19.9 if code.startswith("688") else (
-                    19.9 if (code.startswith("300") and int(td) >= 20200824) else 9.9)
+                    19.9 if ((code.startswith("300") or code.startswith("301")) and int(td) >= 20200824) else 9.9)
                 if p_prev >= _lim - 0.1 and p_cur < _lim - 0.1:
                     px = get_price(code, td)
                     if px is None:
@@ -3161,8 +3161,8 @@ def select_reversal_stocks(trade_date, lookback_days=5, top_n=5, index_code=None
             SELECT DISTINCT d.ts_code FROM daily d
             WHERE d.trade_date = (SELECT MAX(trade_date) FROM daily WHERE trade_date <= ?)
         """, conn, params=(trade_date,))
-        # 屏蔽科创板(688)与北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
-        stock_set = {c for c in rows['ts_code'].tolist() if not c.startswith('688') and not c.endswith('.BJ')}
+        # 屏蔽北交所(.BJ)：投资门槛对散户不友好，本平台统一剔除
+        stock_set = {c for c in rows['ts_code'].tolist() if not c.endswith('.BJ')}
 
     st_codes = pd.read_sql_query(
         "SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%' OR name LIKE '%*%'", conn)

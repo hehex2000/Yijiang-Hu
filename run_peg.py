@@ -160,7 +160,7 @@ def _load_basic():
         name = str(r["name"]) if pd.notna(r["name"]) else ""
         ind = str(r["industry"]) if pd.notna(r["industry"]) else None
         ld = str(r["list_date"]) if pd.notna(r["list_date"]) else ""
-        excluded = (code.startswith("688") or code.endswith(".BJ")
+        excluded = (code.endswith(".BJ")
                     or "ST" in name.upper() or name.startswith("*"))
         m[code] = {"name": name, "industry": ind, "list_date": ld,
                    "excluded": excluded}
@@ -328,7 +328,7 @@ def select_peg(rebalance_date, top_n=TOP_N, prev_date=None, verbose=True,
             continue
         info = basic.get(c)
         if info is None:
-            if c.startswith("688") or c.endswith(".BJ"):
+            if c.endswith(".BJ"):
                 continue
             eligible.add(c)
             continue
@@ -453,7 +453,7 @@ def run_backtest(start_date="20140101", end_date="20260715",
     print(f"  持仓：{top_n}只{wstr} | 调仓：{freq}(月{REBALANCE_MONTH}第5交易日) | "
           f"护栏③连续正增长年数：{stab_years}")
     print(f"  叠加层：{overlay_str}")
-    print(f"  剔除：ST / 688 / .BJ / 金融 / 公用事业 / 上市<60天")
+    print(f"  剔除：ST / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
           f"印花税千1→千0.5(2023-08-28起) 滑点{SLIPPAGE_RATE*100:.1f}%")
     print(f"  初始资金：{_CAPITAL:,.0f}\n")

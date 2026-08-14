@@ -286,7 +286,7 @@ class MLStockSelector:
         return X, y
     
     # [已移除] _get_kcb_cyb_components：科创板+创业板(高风险) 股票池已按需求删除
-    # （科创板投资门槛对散户不友好，本回测平台统一剔除 688 开头股票）
+    # （科创板投资门槛对散户不友好，本回测平台统一屏蔽北交所(.BJ)）
 
     def _prepare_single_period(self, date, lookback_days=20, stock_pool="hs300"):
         """准备单个时间点的训练数据"""
@@ -311,7 +311,7 @@ class MLStockSelector:
         
         stock_codes = stocks_df["code"].tolist()
         # 全局屏蔽科创板(688开头)与北交所(.BJ后缀)：投资门槛对散户不友好，本平台统一剔除
-        stock_codes = [c for c in stock_codes if not (isinstance(c, str) and (c.startswith("688") or c.endswith(".BJ")))]
+        stock_codes = [c for c in stock_codes if not (isinstance(c, str) and (c.endswith(".BJ")))]
 
         # 计算因子（指定基准日期）
         factors_df = self.factor_calculator.calculate_all_factors(
@@ -627,7 +627,7 @@ class MLStockSelector:
             
             stock_codes_list = stocks_df["code"].tolist()
             # 全局屏蔽科创板(688开头)与北交所(.BJ后缀)：投资门槛对散户不友好，本平台统一剔除
-            stock_codes_list = [c for c in stock_codes_list if not (isinstance(c, str) and (c.startswith("688") or c.endswith(".BJ")))]
+            stock_codes_list = [c for c in stock_codes_list if not (isinstance(c, str) and (c.endswith(".BJ")))]
 
         # 计算因子
         factors_df = self.factor_calculator.calculate_all_factors(

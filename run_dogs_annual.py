@@ -270,7 +270,7 @@ def _ep_load_basic():
         name = str(r["name"]) if pd.notna(r["name"]) else ""
         ind = str(r["industry"]) if pd.notna(r["industry"]) else None
         ld = str(r["list_date"]) if pd.notna(r["list_date"]) else ""
-        excluded = (code.startswith("688") or code.endswith(".BJ")
+        excluded = (code.endswith(".BJ")
                     or "ST" in name.upper() or name.startswith("*"))
         m[code] = {"name": name, "industry": ind, "list_date": ld, "excluded": excluded}
     return m
@@ -403,7 +403,7 @@ def select_ep_neutral_annual(prev_td, top_n=None, obv_filter=None, stock_pool=No
             continue
         info = basic.get(c)
         if info is None:
-            if c.startswith("688") or c.endswith(".BJ"):
+            if c.endswith(".BJ"):
                 continue
             eligible.add(c)
             continue
@@ -560,7 +560,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     def do_select(prev_td):
         if strategy == "magic":
             # 神奇公式：复用 run_magic_formula 的选股逻辑（point-in-time 财务+
-            # 市值，剔除 ST/688/BJ/金融/公用）。T-1 日(prev_td)数据选股、T 日开盘执行。
+            # 市值，剔除 ST / BJ/金融/公用）。T-1 日(prev_td)数据选股、T 日开盘执行。
             from run_magic_formula import select_magic_formula
             return select_magic_formula(prev_td, top_n=top_n, prev_date=prev_td,
                                        verbose=True, stock_pool=SELECTION.get("stock_pool", "all"))

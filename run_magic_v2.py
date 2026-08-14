@@ -247,7 +247,7 @@ def select_magic_v2(prev_date, top_n=15, industry_cap=2, ebit_years=3,
             continue
         info = basic.get(code)
         if info is None:
-            if code.startswith("688") or code.endswith(".BJ"):
+            if code.endswith(".BJ"):
                 continue
             eligible.add(code)
             continue

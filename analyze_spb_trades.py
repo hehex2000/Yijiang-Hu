@@ -23,7 +23,11 @@ DB = "D:/tu-shareData/astock_daily.db"
 
 
 def _limit_down_price(pre_close, code):
-    """主板/创业板/科创板跌停价（四舍五入到分）。688 已被策略排除。"""
+    """主板/创业板/科创板跌停价（四舍五入到分）。
+    - 创业板(300/301)/科创板(688)：±20% → 0.80
+    - 北交所(8xx/4xx)：±30% → 0.70（本平台已屏蔽，兜底）
+    - 主板：±10% → 0.90
+    """
     if code.startswith("30"):      # 创业板 20%
         f = 0.80
     elif code.startswith("688"):   # 科创板 20%
