@@ -28,7 +28,7 @@ GLOBAL = {
 
     "backtest_start": "20200103",
 
-    "backtest_end": "20260807",
+    "backtest_end": "20260815",
 
 
 

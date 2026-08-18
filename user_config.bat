@@ -1,8 +1,8 @@
 set P_BACKTEST_START=20200103
-set P_BACKTEST_END=20260807
+set P_BACKTEST_END=20260815
 set P_TOP_N=5
 set P_TOTAL_CAPITAL=200000
-set P_SELECTION_METHOD=div_low_vol
-set P_VALUE_ENHANCED=
-set P_VALUE_QGATES=off
+set P_SELECTION_METHOD=value
+set P_VALUE_ENHANCED=--value-mode pure_bm --value-pct 0.3 --value-size-neutral
+set P_VALUE_QGATES=on
 set P_PAIRS_CAPITAL=200000

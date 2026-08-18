@@ -28,6 +28,7 @@ import talib as ta
 
 import run_macd_regime as mr          # 复用底层 machinery
 import run_magic_formula as mf        # 复用 _get_pool_constituents
+import config                          # 复用平台全局股票池设置 SELECTION["stock_pool"]
 
 
 def _timing_one(code, start, end, idx_code, P):
@@ -102,7 +103,10 @@ def _timing_one(code, start, end, idx_code, P):
             if shares == 0:
                 px = raw_open                       # 原始开盘价
                 budget = cash * 0.98
-                sh = int(budget / px / 100) * 100
+                # 子账户等权用分数股表达(notional)：1/N 资金≈52元远买不起整手(100股)，
+                # 若按整手取整 sh 恒为 0 → 全市场无任何持仓 → 净值恒等于初始资金(满仓现金)。
+                # 故此处用分数股满仓，忠实表达「逐股等权 timing 信号」的平均收益。
+                sh = budget / (px * mr.BUY_MULT)
                 if sh > 0:
                     cost = sh * px * mr.BUY_MULT
                     if cost <= cash:
@@ -246,7 +250,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="MACD 趋势跟随择时策略（无KDJ·顶替旧macd_kdj）")
     ap.add_argument("start_date", nargs="?", default="20140101")
     ap.add_argument("end_date", nargs="?", default="20260731")
-    ap.add_argument("--pool", default="hs300", help="hs300/zz500/zz800/zz1000/all(全A，基准000985.SH)")
+    ap.add_argument("--pool", default=config.SELECTION.get("stock_pool", "zz800"),
+                    help="hs300/zz500/zz800/zz1000/all(全A，基准000985.SH)；"
+                         "默认跟随 config.py 全局 stock_pool=%s" % config.SELECTION.get("stock_pool", "zz800"))
     ap.add_argument("--capital", type=int, default=1000000)
     ap.add_argument("--fast", type=int, default=12)
     ap.add_argument("--slow", type=int, default=26)
