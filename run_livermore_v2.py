@@ -438,7 +438,10 @@ def run_window(start, end, cfg, layers):
             total_market_pass += len(prev_market)
             
             cand = prev_market - set(positions) - pending_sell
-            cand = list(cand)
+            # 确定性修复: set→list 的迭代顺序受 PYTHONHASHSEED 随机化影响,
+            # 导致 cand[:slots] 截取的候选随进程变化→选股/NAV 非确定(同参数多次回测结果不同)。
+            # 显式 sorted 固定顺序, 消除非确定性(不影响策略逻辑/收益口径)。
+            cand = sorted(cand)
             # 改进D: 仅保留"突破前box_len日窄幅横盘"的候选(最小阻力线前置, 排除一路新高接盘)
             if sq_arr is not None and prev_i < sq_arr.shape[0]:
                 cand = [c for c in cand if (c in code2idx and sq_arr[prev_i, code2idx[c]])]
