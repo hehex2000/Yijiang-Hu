@@ -433,10 +433,14 @@ def get_monthly_5th_trading_days(trade_dates):
     集合转 list 的顺序每个进程都不同 → 调仓日程漂移 → 回测结果不可复现。
     """
     df = pd.DataFrame({"trade_date": trade_dates})
-    # 修正: trade_dates 为 Timestamp, astype(str)='2020-01-03', [:6]='2020-0' 会把1-9月并成一组
+    # 修正1: trade_dates 为 Timestamp, astype(str)='2020-01-03', [:6]='2020-0' 会把1-9月并成一组
     # (10-12月截成'2020-1'), 导致每年只产出 1月+10月 2个决策日, 2-9月调仓全部丢失。
     # 改用 strftime('%Y%m') 正确取 YYYYMM, 恢复每月第5交易日。
-    df["ym"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y%m")
+    # 修正2(2026-08-18): 部分调用方(run_etf_rotation.py / run_etf_rotation_v6_merged.py)
+    # 的本地 get_trade_dates 返回 **int** 日期(如20200102)。pd.to_datetime(int) 会把它当
+    # 纳秒时间戳 → 塌缩到1970 → 每月并成一组 → 只剩1个决策日/年(回归!)。必须 astype(str)
+    # 后再解析: int 20200102 → '20200102' → 正确解析为 2020-01-02。
+    df["ym"] = pd.to_datetime(df["trade_date"].astype(str)).dt.strftime("%Y%m")
     _days = []
     for _, g in df.groupby("ym"):
         dates = g["trade_date"].tolist()
