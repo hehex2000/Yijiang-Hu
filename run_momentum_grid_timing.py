@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_monthly_rebalance import (
     get_conn, get_price, get_open_price, calc_fee,
     get_trade_dates, get_monthly_5th_trading_days,
-    get_stock_pool_index, get_stock_name,
+    get_stock_pool_index, STOCK_POOL_INDEX, get_stock_name,
     select_momentum_stocks, is_above_ma,
     INIT_CAPITAL, INDEX_DISPLAY_NAME, calc_win_rate, compute_reality_discounts,
 )
@@ -395,7 +395,7 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
         # ===== 调仓日 =====
         if td in rebalance_set:
             # 市场趋势过滤
-            benchmark_idx = stock_pool if stock_pool else "000906.SH"
+            benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
             market_ok = True
             if trend_filter_ma > 0:
                 market_ok = is_above_ma(benchmark_idx, td, period=trend_filter_ma, is_index=True)
@@ -540,7 +540,7 @@ def run_momentum_with_grid_timing(start_date="20200101", end_date="20251231",
         sharpe = 0.0
 
     # === 基准指数 ===
-    benchmark_idx = stock_pool if stock_pool else "000906.SH"
+    benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
     conn = get_conn()
     b_start = pd.read_sql_query(
         "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date >= ? ORDER BY trade_date ASC LIMIT 1",

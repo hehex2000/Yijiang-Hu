@@ -117,6 +117,198 @@ def _preload_pool_prices(pool):
     return codes
 
 
+# ──────────────────────────────────────────────────────────────
+# 红利通道仓位 overlay（P0 实验）：用 000922 中证红利低波 的「通道位置」
+# 决定权益仓位系数 k∈[k_min,k_max]。便宜(通道底)→满仓(k_max)；贵(通道顶)→减仓(k_min)。
+# 通道位置严格因果（仅用 sel_date 之前的数据），无前视。
+# ──────────────────────────────────────────────────────────────
+_IDX922 = {}   # trade_date -> close (000922.SH)
+
+
+def _preload_index_channel(ts_code="000922.SH"):
+    """一次性把指数收盘价载入内存（与 _preload_pool_prices 同款内存加速）。"""
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT trade_date, close FROM index_daily WHERE ts_code=? ORDER BY trade_date",
+        conn, params=(ts_code,))
+    conn.close()
+    for _, r in df.iterrows():
+        _IDX922[str(r["trade_date"])] = float(r["close"])
+    print(f"[channel] {ts_code} 预载 {len(_IDX922)} 行")
+    return ts_code
+
+
+def _latest_trade_date():
+    """库里日线数据的最新交易日（真正的『今天』），用于 live-forward 前向选股。"""
+    conn = get_conn()
+    d = pd.read_sql_query("SELECT MAX(trade_date) AS d FROM daily", conn)["d"].iloc[0]
+    conn.close()
+    return str(d)
+
+
+def _channel_pos(sel_date, mode="rolling", window=756, bottom=None, top=None):
+    """000922 红利通道位置 pos∈[0,1]（0=通道底/便宜，1=通道顶/贵）。
+    - rolling: sel_date 前 window 个交易日内 min/max 构成的通道（因果无前视）；
+    - fixed:   固定 bottom/top 线。
+    历史不足或 min==max（无展开）→ 返回 None（调用方视作不动作，k=k_max 满仓）。"""
+    if mode == "fixed":
+        if bottom is None or top is None or top <= bottom:
+            return None
+        c = _IDX922.get(sel_date)
+        if c is None:
+            return None
+        return max(0.0, min(1.0, (c - bottom) / (top - bottom)))
+    # rolling
+    dates = sorted(d for d in _IDX922 if d <= sel_date)
+    if len(dates) < min(252, window):
+        return None
+    vals = [_IDX922[d] for d in dates[-window:]]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-6:
+        return None
+    c = _IDX922.get(sel_date)
+    if c is None:
+        return None
+    return max(0.0, min(1.0, (c - lo) / (hi - lo)))
+
+
+def _make_coef_fn(overlay, mode="rolling", window=756, bottom=None, top=None,
+                  k_min=0.5, k_max=1.0):
+    """返回 coef_fn(sel_date)->k。overlay 关闭时恒为 1.0（满仓，与基线完全等价）。"""
+    if not overlay:
+        return lambda sel_date: 1.0
+
+    def coef(sel_date):
+        pos = _channel_pos(sel_date, mode, window, bottom, top)
+        if pos is None:
+            return 1.0
+        return k_max - (k_max - k_min) * pos   # 便宜(pos→0)→k_max；贵(pos→1)→k_min
+
+    return coef
+
+
+def _sel_date_of(all_dates, idx):
+    """调仓日 d=all_dates[idx] 对应的选股日（前一日，与 select_targets 口径一致）。"""
+    return all_dates[idx - 1] if idx > 0 else all_dates[idx]
+
+
+def _print_live_signal(targets, weights_map, sel_log, coef_fn, all_dates, capital,
+                       channel_mode, channel_window, channel_bottom, channel_top,
+                       k_min, k_max, overlay):
+    """--live：打印最近一期调仓的可执行买列表（通道系数缩放 + 现金比例）。
+    仅做历史最近一期调仓的「可读化」，不重新选股、不含前视。"""
+    last = next((t for t in reversed(targets) if t[1]), None)
+    if last is None:
+        print("[live] 无有效调仓记录，无法生成买列表")
+        return
+    rb_last, codes = last
+    idx = all_dates.index(rb_last) if rb_last in all_dates else len(all_dates) - 1
+    sel_date = _sel_date_of(all_dates, idx)
+    k = coef_fn(sel_date)
+    wmap = weights_map.get(str(rb_last), {})
+    name_map = {str(r[2]): str(r[3]) for r in sel_log if str(r[0]) == str(rb_last)}
+    print("\n" + "=" * 72)
+    print(f"【LIVE 买列表 · 最近一期调仓 {rb_last}（选股日 {sel_date}）】")
+    print(f"通道系数 k = {k:.3f}  →  权益 {k*100:.1f}% / 现金 {(1-k)*100:.1f}%")
+    if capital:
+        print(f"初始资金 {capital:,.0f}  →  投入权益 {capital*k:,.0f} / 留现金 {capital*(1-k):,.0f}")
+    print("-" * 72)
+    print(f"{'代码':<10}{'名称':<12}{'股息权重':>10}{'目标权益权重':>16}{'目标金额':>14}")
+    for c in codes:
+        w = wmap.get(c, 0.0)
+        wk = w * k
+        amt = capital * wk if capital else None
+        nm = name_map.get(c, "")
+        amt_s = f"{amt:>12,.0f}" if amt is not None else f"{'':>14}"
+        print(f"{c:<10}{nm:<12}{w*100:>9.2f}%{wk*100:>15.2f}%{amt_s:>14}")
+    if overlay and _IDX922:
+        latest = max(_IDX922)
+        pos_now = _channel_pos(latest, channel_mode, channel_window, channel_bottom, channel_top)
+        if pos_now is not None:
+            k_now = k_max - (k_max - k_min) * pos_now
+            trend = "更贵" if k_now < k else ("更便宜" if k_now > k else "持平")
+            print("-" * 72)
+            print(f"※ 当前通道(最新 {latest})：pos={pos_now:.2f} → 若今日调仓 k={k_now:.3f}(权益{k_now*100:.1f}%)")
+            print(f"  对比上次调仓 k={k:.3f}：通道较那时{trend}")
+    print("=" * 72)
+    print("[live] 上表为最近一期『历史』调仓，非今日前瞻选股；实操请以最新一期重选为准。")
+
+
+def _forward_select(mode, pool, top_n, as_of_date):
+    """前向选股：以 as_of_date 为选股日重跑 selector（不写历史 partial、不影响回测）。
+    返回 (picks_df, sel_date)；无候选返回 (None, as_of_date)。"""
+    spec = MODE_SPECS.get(mode, MODE_SPECS["official_compact"])
+    pool = pool or config.GLOBAL.get("stock_pool", "hs300")
+    if top_n is None:
+        top_n = spec["top_n"]
+    else:
+        top_n = int(top_n)
+    buffer_n = max(top_n * 4, top_n + 8)      # 候选缓冲（供行业 cap 后取前 top_n）
+    cfg = build_cfg(mode)
+    cfg["stock_pool"] = pool                  # ★ 走系统设置的股票池
+    cfg["top_n"] = buffer_n
+    cfg["final_top_n"] = top_n
+    sel_inst = DividendLowVolSelector(cfg, None)
+    sel_inst._calc_volatility = _patched_vol.__get__(sel_inst)
+    sel_inst._is_macd_golden = _patched_macd.__get__(sel_inst)
+    sel_inst.top_n = buffer_n
+    sel_inst.date = as_of_date
+    sel = sel_inst.select_stocks(date=as_of_date)
+    if sel is None or len(sel) == 0:
+        return None, as_of_date
+    if spec["ind_cap"] > 0:
+        sel = sel_inst._cap_industry(sel, spec["ind_cap"])
+    picks_df = sel.head(top_n)                # 最终持仓 = 全局选股数（可实操）
+    return picks_df, as_of_date
+
+
+def _print_live_signal_forward(mode, pool, top_n, capital, coef_fn, as_of_date,
+                               channel_mode, channel_window, channel_bottom, channel_top,
+                               k_min, k_max, overlay):
+    """--live-forward：以 as_of_date(今日) 为选股日重跑 selector，打印真正『今天该买什么』。"""
+    picks_df, sel_date = _forward_select(mode, pool, top_n, as_of_date)
+    if picks_df is None or len(picks_df) == 0:
+        print(f"\n[live-forward] 以 {as_of_date} 为选股日重选失败（无候选），"
+              f"请检查数据库是否含该日行情/财务。")
+        return
+    k = coef_fn(sel_date)
+    spec = MODE_SPECS.get(mode, MODE_SPECS["official_compact"])
+    if spec["weight"] == "dividend":
+        yld = picks_df["fwd_yield"].fillna(picks_df["dv_ttm"] / 100.0)
+        yld = yld.fillna(0.0).clip(lower=0)
+        s = yld.sum()
+        w = ({c: 1.0 / len(picks_df.index) for c in picks_df["ts_code"]}
+             if s <= 0 else {c: y / s for c, y in zip(picks_df["ts_code"], yld.values)})
+    else:
+        w = {c: 1.0 / len(picks_df.index) for c in picks_df["ts_code"]}
+    print("\n" + "=" * 72)
+    print(f"【LIVE 前瞻买列表 · 选股日(as_of) {sel_date}】")
+    print(f"通道系数 k = {k:.3f}  →  权益 {k*100:.1f}% / 现金 {(1-k)*100:.1f}%")
+    if capital:
+        print(f"初始资金 {capital:,.0f}  →  投入权益 {capital*k:,.0f} / 留现金 {capital*(1-k):,.0f}")
+    print("-" * 72)
+    print(f"{'代码':<10}{'名称':<12}{'股息权重':>10}{'目标权益权重':>16}{'目标金额':>14}")
+    for _, r in picks_df.iterrows():
+        c = str(r["ts_code"])
+        ww = w[c]
+        wk = ww * k
+        amt = capital * wk if capital else None
+        nm = str(r.get("name", ""))
+        amt_s = f"{amt:>12,.0f}" if amt is not None else f"{'':>14}"
+        print(f"{c:<10}{nm:<12}{ww*100:>9.2f}%{wk*100:>15.2f}%{amt_s:>14}")
+    if overlay and _IDX922:
+        pos = _channel_pos(sel_date, channel_mode, channel_window, channel_bottom, channel_top)
+        if pos is not None:
+            print("-" * 72)
+            print(f"※ 选股日通道位置 pos={pos:.2f}（0=通道底/便宜，1=通道顶/贵）→ k={k:.3f}")
+            print(f"  评估：{'红利指数偏贵，已减仓至权益 ' + format(k*100, '.1f') + '%' if k < 1.0 else '红利指数偏便宜，满仓'}")
+        else:
+            print("-" * 72)
+            print("※ 通道历史不足，k 按满仓(1.0) 处理")
+    print("=" * 72)
+    print(f"[live-forward] 上表为以 {sel_date} 重新选股的前瞻清单，可直接用于建仓/调仓。")
+
+
 def _patched_vol(self, ts_code, trade_date, window=None):
     if window is None:
         window = self.volatility_window
@@ -287,8 +479,9 @@ def ffill_price(pmap, code, date, all_dates, idx):
     return None
 
 
-def run_nav(targets, price_map, all_dates):
-    """按 targets 序列做等权差额再平衡，返回每日 NAV 序列 与 交易记录。"""
+def run_nav(targets, price_map, all_dates, coef_fn=None):
+    """按 targets 序列做等权差额再平衡，返回每日 NAV 序列 与 交易记录。
+    coef_fn(sel_date)->仓位系数k∈(0,1]：红利通道 overlay（None=常满仓，与基线等价）。"""
     cash = INIT_CAPITAL
     positions = {}  # ts_code -> shares
     nav = []
@@ -307,8 +500,10 @@ def run_nav(targets, price_map, all_dates):
                 px = exec_px(code)
                 if px:
                     mv += sh * px
+            # 红利通道仓位系数：仅把 k 比例的市值铺进权益，余下留现金
+            k = coef_fn(_sel_date_of(all_dates, idx)) if coef_fn else 1.0
             n_tgt = max(len(rb_target), 1)
-            per = mv / n_tgt
+            per = mv * k / n_tgt
             all_codes = set(positions.keys()) | set(rb_target)
             for code in all_codes:
                 px = exec_px(code)
@@ -357,8 +552,9 @@ def compute_metrics(nav_list, all_dates):
     rets = np.diff(vals) / vals[:-1]
     vol = rets.std() * np.sqrt(252) if len(rets) > 1 else 0
     sharpe = (ann - 0.02) / vol if vol > 0 else 0
+    calmar = ann / abs(max_dd) if max_dd < 0 else 0.0   # 卡玛 = 年化 / |最大回撤|
     return dict(n=n, total_ret=total_ret, ann=ann, max_dd=max_dd,
-                vol=vol, sharpe=sharpe, years=years, final=vals[-1])
+                vol=vol, sharpe=sharpe, years=years, final=vals[-1], calmar=calmar)
 
 
 def yearly_returns(dates, vals):
@@ -530,8 +726,9 @@ def get_quarterly_5th_trading_days(all_dates):
     return [d for d in monthly if int(str(d)[4:6]) in (1, 4, 7, 10)]
 
 
-def run_nav_weighted(targets, weights_map, price_map, all_dates):
-    """股息率加权差额再平衡，返回每日 NAV 序列。weight 为各股目标权重(和≈1)。"""
+def run_nav_weighted(targets, weights_map, price_map, all_dates, coef_fn=None):
+    """股息率加权差额再平衡，返回每日 NAV 序列。weight 为各股目标权重(和≈1)。
+    coef_fn(sel_date)->仓位系数k：红利通道 overlay（None=常满仓）。"""
     cash = INIT_CAPITAL
     positions = {}
     nav = []
@@ -546,6 +743,7 @@ def run_nav_weighted(targets, weights_map, price_map, all_dates):
                 px = exec_px(code)
                 if px:
                     mv += sh * px
+            k = coef_fn(_sel_date_of(all_dates, idx)) if coef_fn else 1.0
             wmap = weights_map.get(str(d), {})
             all_codes = set(positions.keys()) | set(rb_target)
             for code in all_codes:
@@ -553,7 +751,7 @@ def run_nav_weighted(targets, weights_map, price_map, all_dates):
                 if px is None:
                     continue
                 wt = wmap.get(code, 0.0)
-                desired_val = mv * wt
+                desired_val = mv * wt * k
                 desired = int(desired_val // (px * (1 + COMMISSION_RATE + SLIPPAGE_RATE))) if wt > 0 else 0
                 cur_sh = positions.get(code, 0)
                 diff = desired - cur_sh
@@ -668,9 +866,16 @@ def select_targets_official(mode, pool=None, top_n=None):
     return targets, by_rb_w, sel_log
 
 
-def run_official_backtest(mode="official_compact", pool=None, top_n=None, capital=None):
+def run_official_backtest(mode="official_compact", pool=None, top_n=None, capital=None,
+                          overlay=True, channel_mode="rolling", channel_window=756,
+                          channel_bottom=None, channel_top=None, k_min=0.5, k_max=1.0,
+                          live=False, live_forward=False):
     """跑官方编制法某档。股票池/持仓数/初始资金=系统全局配置；基准=该股票池对应指数；
-    输出 NAV + 选股明细 + 逐年盈亏（策略 vs 基准 vs 同赛道 000922）。"""
+    输出 NAV + 选股明细 + 逐年盈亏（策略 vs 基准 vs 同赛道 000922）。
+
+    红利通道仓位 overlay 默认开启（rolling/w756/k0.5）：在官方 DL 选股之上叠加一层
+    按 000922 通道位置的权益仓位调节（贵→减仓留现金、便宜→满仓），属风控/仓位层、
+    不改选股。需复现普通满仓红利低波基线请用 --no-div-channel-overlay。"""
     global INIT_CAPITAL
     spec = MODE_SPECS.get(mode, MODE_SPECS["official_compact"])
     pool = pool or config.GLOBAL.get("stock_pool", "hs300")
@@ -694,14 +899,25 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
           f"调仓={'季度' if spec['rebal']=='quarter' else '月度'}  "
           f"加权={'股息率' if spec['weight']=='dividend' else '等权'}  行业上限={spec['ind_cap']}")
     print(f"基准指数：{bname}({bidx})  ｜ 同赛道参考：中证红利低波(000922.SH)")
+    if overlay:
+        _cm = (f"rolling(窗口{channel_window}交易日)"
+               if channel_mode == "rolling"
+               else f"fixed[{channel_bottom},{channel_top}]")
+        print(f"红利通道 overlay：开  模式={_cm}  仓位系数 k∈[{k_min},{k_max}]（便宜→{k_max}/贵→{k_min}）")
+    else:
+        print(f"红利通道 overlay：关（满仓基线＝普通红利低波，无任何仓位调节）")
+    if overlay or live or live_forward:
+        _preload_index_channel("000922.SH")
+    coef_fn = _make_coef_fn(overlay, channel_mode, channel_window,
+                            channel_bottom, channel_top, k_min, k_max)
     _preload_pool_prices(pool)
     targets, weights_map, sel_log = select_targets_official(mode, pool=pool, top_n=top_n)
     all_codes = sorted({c for _, cs in targets for c in cs})
     print(f"涉及股票数: {len(all_codes)}")
     pmap = bulk_close_prices(all_codes, START, END)
     all_dates = get_trade_dates(START, END)
-    nav = (run_nav_weighted(targets, weights_map, pmap, all_dates)
-           if spec["weight"] == "dividend" else run_nav(targets, pmap, all_dates))
+    nav = (run_nav_weighted(targets, weights_map, pmap, all_dates, coef_fn)
+           if spec["weight"] == "dividend" else run_nav(targets, pmap, all_dates, coef_fn))
 
     nav_b, _ = benchmark_nav(all_dates, bidx)          # 主基准：股票池对应指数
     nav_922, f922 = benchmark_nav(all_dates, "000922.SH")  # 同赛道参考
@@ -760,6 +976,7 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     print(f"{'最大回撤':<14}{m['max_dd']*100:>17.2f}%{m_b['max_dd']*100:>13.2f}%{m_922['max_dd']*100:>13.2f}%")
     print(f"{'年化波动':<14}{m['vol']*100:>17.2f}%{m_b['vol']*100:>13.2f}%{m_922['vol']*100:>13.2f}%")
     print(f"{'夏普(2%)':<14}{m['sharpe']:>18.2f}{m_b['sharpe']:>14.2f}{m_922['sharpe']:>14.2f}")
+    print(f"{'卡玛(Calmar)':<14}{m['calmar']:>18.2f}{m_b['calmar']:>14.2f}{m_922['calmar']:>14.2f}")
     print(f"{'对'+bname+'胜率':<14}{win_rate*100:>17.2f}%{'-':>13}{'-':>13}")
     print("-" * 80)
 
@@ -801,6 +1018,14 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     print(f"NAV 曲线 → {nav_out}")
     print(f"选股明细 → {sel_out}")
     print(f"逐年收益 → {yr_out}")
+    if live:
+        _print_live_signal(targets, weights_map, sel_log, coef_fn, all_dates, capital,
+                           channel_mode, channel_window, channel_bottom, channel_top,
+                           k_min, k_max, overlay)
+    if live_forward:
+        _print_live_signal_forward(mode, pool, top_n, capital, coef_fn, _latest_trade_date(),
+                                   channel_mode, channel_window, channel_bottom, channel_top,
+                                   k_min, k_max, overlay)
     print("DONE")
 
 
@@ -816,11 +1041,36 @@ def main():
                         help="持仓数量（默认=config.GLOBAL 选股数；不传则官方档用各自默认）")
     parser.add_argument("--capital", type=float, default=None,
                         help="初始资金（默认=config.BACKTEST.monthly_rebalance_capital，与其它月度策略一致）")
+    # ── 红利通道仓位 overlay（P0 实验）──
+    parser.add_argument("--div-channel-overlay", action="store_true",
+                        help="开启红利通道仓位 overlay（现已默认开启，此开关可省略）；按000922通道位置缩放权益仓位")
+    parser.add_argument("--no-div-channel-overlay", action="store_true",
+                        help="关闭红利通道仓位 overlay，回退为满仓基线（＝普通红利低波策略，用于复现/对照）")
+    parser.add_argument("--div-channel-mode", default="rolling", choices=["rolling", "fixed"],
+                        help="通道算法：rolling=sel_date前N日min/max通道(无前视)；fixed=固定上下轨线")
+    parser.add_argument("--div-channel-window", type=int, default=756,
+                        help="rolling 模式回看窗口(交易日)，默认756≈3年")
+    parser.add_argument("--div-channel-bottom", type=float, default=None,
+                        help="fixed 模式通道下轨(便宜线)，如 5100")
+    parser.add_argument("--div-channel-top", type=float, default=None,
+                        help="fixed 模式通道上轨(贵线)，如 6100")
+    parser.add_argument("--k-min", type=float, default=0.5,
+                        help="通道顶(最贵)时的仓位系数，默认0.5（即最多减至半仓）")
+    parser.add_argument("--k-max", type=float, default=1.0,
+                        help="通道底(最便宜)时的仓位系数，默认1.0（满仓）")
+    parser.add_argument("--live", action="store_true",
+                        help="回测结束后打印最近一期调仓的可执行买列表（k缩放权重+现金%），供实盘部署参考")
+    parser.add_argument("--live-forward", action="store_true",
+                        help="以库里最新交易日为选股日重跑 selector，打印真正『今天该买什么』的前瞻买列表（独立于历史回测）")
     args = parser.parse_args()
     if args.mode in ("old", "new", "soft"):
         run_legacy_comparison()
     else:
-        run_official_backtest(args.mode, pool=args.pool, top_n=args.top_n, capital=args.capital)
+        run_official_backtest(args.mode, pool=args.pool, top_n=args.top_n, capital=args.capital,
+                              overlay=not args.no_div_channel_overlay, channel_mode=args.div_channel_mode,
+                              channel_window=args.div_channel_window, channel_bottom=args.div_channel_bottom,
+                              channel_top=args.div_channel_top, k_min=args.k_min, k_max=args.k_max,
+                              live=args.live, live_forward=args.live_forward)
 
 
 if __name__ == "__main__":

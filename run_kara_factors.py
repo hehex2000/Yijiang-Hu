@@ -34,6 +34,17 @@ import sqlite3, bisect, datetime
 import numpy as np
 import pandas as pd
 import config
+import market_timing_overlay as mto   # A：市场情绪择时 overlay
+
+# ---------- CLI ----------
+import argparse
+ap = argparse.ArgumentParser(description="Kara 2因子复刻 + 可选市场择时闸门")
+ap.add_argument("--timing-gate", action="store_true", help="启用市场情绪择时闸门（沸点清仓/冰点满仓，非对称只卖不买）")
+ap.add_argument("--boil", type=float, default=80.0, help="沸点阈值：osc>=boil → 清仓(floor)")
+ap.add_argument("--ice", type=float, default=55.0, help="冰点阈值：osc<=ice → 满仓。默认55=温和真择时(常态满仓吃alpha+仅过热/泡沫顶减仓)；想得深回撤保护用 --wf(冰点≈30的永久去风险)")
+ap.add_argument("--floor", type=float, default=0.0, help="清仓时最低保留仓位(0=全清,0.2=永不空仓)")
+ap.add_argument("--wf", action="store_true", help="用 walk-forward 滚动选 boil/ice 阈值（防过拟合），覆盖 --boil/--ice")
+args = ap.parse_args()
 
 DB = config.DATA["local_db_path"]
 START      = "20140101"   # 回测起点（财报数据从此时起算信号）
@@ -41,7 +52,10 @@ START_LOOK = "20120101"   # 数据加载起点（留足回看窗口）
 END        = "20260807"
 TOPN       = 50
 COST       = 0.002        # 单边往返成本基准（月度调仓，按换手比例计费）
-UNIV_MV_MIN = 2e6         # 宇宙过滤：total_mv 单位=千元 → 2e6千元 = 20亿元
+UNIV_MV_MIN = 2e5         # 宇宙过滤：total_mv 单位=万元(Tushare原生) → 2e5万元 = 20亿元
+                          # 2026-08-18 修正：原值 2e6 注释按"千元"口径=20亿，但重建库
+                          # total_mv 为万元，2e6万=200亿 → 宇宙从~全市场塌缩到400-950只
+                          # 大盘股，年化 13.93%→5.12% 的主因。
 LIST_DAYS_MIN = 252       # 上市至少 252 个交易日（剔除次新股利空/IPO噪声）
 PIT = True                # point-in-time 财报对齐
 RF_ANN     = 0.025        # 无风险利率（年化），用于夏普
@@ -382,8 +396,13 @@ hs_px["trade_date"] = hs_px["trade_date"].astype(str)
 hs_px = hs_px.set_index("trade_date")["close"]
 hs_px_close = {d: hs_px[d] for d in hs_px.index if d in date_idx}
 
-hold_dates = []
-if comp_dates:
+# ---------- 7. 回测（重构为函数，支持择时闸门 A） ----------
+# 基线 = caps 全 1（闸门不触发，等价于原逻辑，保证回归一致）
+def run_backtest(caps_by_date):
+    strat_ret = []; bench_ret = []; bench_ret_px = []; hold_dates = []
+    prev = None; prev_cap = None
+    if not comp_dates:
+        return strat_ret, bench_ret, bench_ret_px, hold_dates
     fi = rebal.index(comp_dates[0])
     for k in range(fi, len(rebal) - 1):
         t = rebal[k]; t_next = rebal[k + 1]
@@ -408,6 +427,12 @@ if comp_dates:
         else:
             r -= COST   # 首次建仓
         prev = cur
+        # ---- 择时闸门（A）：缩放收益 + 现金 sleeve 切换成本 ----
+        cap = caps_by_date.get(t, 1.0)
+        r = cap * r                                  # 缩放收益与选择成本；cap=0 时选择成本归零(空仓不换股)
+        if prev_cap is not None:
+            r -= COST * abs(cap - prev_cap)          # 闸门切换：现金 sleeve 买卖单向成本，不缩放
+        prev_cap = cap
         # 基准月收益（全收益）
         b0 = hs_tr_close.get(t); b1 = hs_tr_close.get(t_next)
         br = (b1 / b0 - 1) if (b0 and b0 == b0 and b1 and b1 == b1) else 0.0
@@ -415,6 +440,35 @@ if comp_dates:
         p0 = hs_px_close.get(t); p1 = hs_px_close.get(t_next)
         pr = (p1 / p0 - 1) if (p0 and p0 == p0 and p1 and p1 == p1) else 0.0
         strat_ret.append(r); bench_ret.append(br); bench_ret_px.append(pr); hold_dates.append(t)
+    return strat_ret, bench_ret, bench_ret_px, hold_dates
+
+# 基线（无闸门）
+strat_ret, bench_ret, bench_ret_px, hold_dates = run_backtest({d: 1.0 for d in rebal})
+
+# ---------- 7a. 市场情绪振荡器 + 择时闸门（A：overlay） ----------
+gated = args.timing_gate
+strat_ret_g = bench_ret_g = bench_ret_px_g = hold_dates_g = None
+if gated:
+    osc_all = mto.compute_breadth_oscillator(close_p)
+    osc_rebal = osc_all.reindex(rebal)
+    # 用基线月度收益训练选阈（防过拟合）
+    base_ret = pd.Series(strat_ret, index=hold_dates)
+    osc_hold = osc_rebal.reindex(hold_dates)
+    if args.wf:
+        boil, ice, oos = mto.walk_forward_thresholds(osc_hold, base_ret,
+                                                     floor=args.floor, cost=COST)
+        print(f"[overlay] walk-forward 选阈: 沸点={boil:.0f} / 冰点={ice:.0f} | "
+              f"OOS年化={oos[0]*100:.2f}% / maxDD={oos[1]*100:.2f}% / 夏普={oos[2]:.2f}")
+    else:
+        boil, ice = args.boil, args.ice
+    caps_by_date = {}
+    for d in rebal:
+        o = osc_rebal[d] if d in osc_rebal.index else np.nan
+        caps_by_date[d] = mto.position_cap(o, boil, ice, args.floor) if (o == o) else 1.0
+    strat_ret_g, bench_ret_g, bench_ret_px_g, hold_dates_g = run_backtest(caps_by_date)
+    n_clear = sum(1 for d in hold_dates_g if caps_by_date.get(d, 1.0) < 1.0)
+    print(f"[overlay] 闸门: 沸点>={boil:.0f}清仓 / 冰点<={ice:.0f}满仓 / floor={args.floor:.2f} / "
+          f"触发减仓或清仓月 = {n_clear}/{len(hold_dates_g)}")
 
 dates_out = hold_dates
 snav = (1 + pd.Series(strat_ret, index=dates_out)).cumprod()
@@ -454,10 +508,29 @@ print(f"分组月均收益(1=最差~5=最好): " + "  ".join(f"G{g}={group_mean[
 print(f"  → UP 宣称 12.3%/夏普0.69/超额9.9%(vs沪深300)，且【未披露maxDD】")
 print("=====================================================================================")
 
+# ---------- 7b. 择时闸门对比（A：市场情绪 overlay） ----------
+if gated and strat_ret_g is not None:
+    gnav = (1 + pd.Series(strat_ret_g, index=hold_dates_g)).cumprod()
+    _, gcagr, gmdd, _ = metrics(gnav)
+    gs = pd.Series(strat_ret_g) - rf_m
+    gsharpe = (gs.mean() * 12) / (gs.std() * np.sqrt(12)) if gs.std() else np.nan
+    _, gc2, gm2, _ = metrics((1 + pd.Series(bench_ret_g, index=hold_dates_g)).cumprod())
+    print(f"\n================ 择时闸门对比（A：市场情绪 overlay·非对称只卖不买） ================")
+    print(f"{'指标':<16}{'基线(无闸门)':>16}{'+择时闸门':>16}")
+    print(f"{'年化':<16}{c1*100:>15.2f}%{gcagr*100:>15.2f}%")
+    print(f"{'最大回撤':<16}{m1*100:>15.2f}%{gmdd*100:>15.2f}%")
+    print(f"{'夏普':<16}{sharpe:>16.2f}{gsharpe:>16.2f}")
+    print(f"{'基准超额(年化)':<16}{(c1-c2)*100:>15.2f}pp{(gcagr-gc2)*100:>15.2f}pp")
+    print(f"  → 闸门目标: maxDD 压到 -25% 内、年化损失 -2~5pp; 非对称=只减仓不抄底; 阈值为 walk-forward 选出")
+    print("=====================================================================================")
+
 # ---------- 8. 落盘 ----------
 eq = pd.DataFrame({"date": dates_out, "strat_nav": snav.values, "bench_nav_tr": bnav.values,
                    "bench_nav_px": bnav_px.values,
                    "strat_ret": strat_ret, "bench_ret_tr": bench_ret, "bench_ret_px": bench_ret_px})
+if gated and strat_ret_g is not None:
+    gnav = (1 + pd.Series(strat_ret_g, index=hold_dates_g)).cumprod()
+    eq["strat_nav_gated"] = gnav.reindex(dates_out).values
 eq.to_csv("kara_factors_equity.csv", index=False)
 ic_df.to_csv("kara_factors_ic.csv", index=False)
 grp = pd.DataFrame({"group": list(range(1, 6)), "monthly_mean_ret": [group_mean[g] for g in range(1, 6)]})

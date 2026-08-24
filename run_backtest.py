@@ -2054,6 +2054,46 @@ if __name__ == "__main__":
         help="div_low_vol_quality 的模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)"
     )
     parser.add_argument(
+        "--div-channel-overlay", action="store_true",
+        help="红利通道仓位 overlay（000922通道位置→权益仓位系数，贵减仓/便宜满仓；已验证正向）。默认即开启，此 flag 仅显式打开"
+    )
+    parser.add_argument(
+        "--no-div-channel-overlay", action="store_true",
+        help="关闭红利通道仓位 overlay，回归满仓普通红利低波基线（对照用）"
+    )
+    parser.add_argument(
+        "--div-channel-mode", default="rolling", choices=["rolling", "fixed"],
+        help="通道位置算法: rolling(前N日min/max, 默认) / fixed(固定上下轨)"
+    )
+    parser.add_argument(
+        "--div-channel-window", type=int, default=756,
+        help="rolling 模式回看窗口(交易日, 默认756≈3年)"
+    )
+    parser.add_argument(
+        "--div-channel-bottom", type=float, default=None,
+        help="fixed 模式通道下轨(000922 点位)"
+    )
+    parser.add_argument(
+        "--div-channel-top", type=float, default=None,
+        help="fixed 模式通道上轨(000922 点位)"
+    )
+    parser.add_argument(
+        "--k-min", type=float, default=0.5,
+        help="通道最贵时的权益仓位系数下限(默认0.5；小账户档用0.3)"
+    )
+    parser.add_argument(
+        "--k-max", type=float, default=1.0,
+        help="通道最便宜时的权益仓位系数上限(默认1.0满仓)"
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="回测结束后打印上一期已选买列表(历史对照)"
+    )
+    parser.add_argument(
+        "--live-forward", action="store_true",
+        help="回测结束后以今日为选股日重跑 selector + 今日通道k，打印今日该买清单"
+    )
+    parser.add_argument(
         "--var-stop", action="store_true",
         help="启用 VAR 动态止损（动量月度同款 ATR 追踪：跌破[最高收-倍数×ATR]次日开盘卖；默认关）"
     )
@@ -2511,7 +2551,24 @@ if __name__ == "__main__":
             print(f"  {'='*60}")
             print(f"  ※ 本策略为【季度调仓】：官方编制法(中证红利低波930955口径)，"
                   f"季频 / 股息率加权；模式={_dlq_mode}")
-            dlq.run_official_backtest(_dlq_mode, capital=args.capital)
+            print(f"  ※ 红利通道仓位 overlay: "
+                  f"{'关闭(满仓基线)' if args.no_div_channel_overlay else '开启'}"
+                  f"{'' if args.no_div_channel_overlay else f' · {args.div_channel_mode}/w{args.div_channel_window}/k{args.k_min}'}")
+            print(f"  ※ 股票池: 全A(all·锁定) — 本策略候选宇宙需全市场，zz800会饿死候选导致失真")
+            dlq.run_official_backtest(
+                _dlq_mode,
+                pool="all",  # 本策略锁定全A池（zz800候选被饿死、质量复合失真；验证基线均在 all 池）
+                capital=args.capital,
+                overlay=not args.no_div_channel_overlay,
+                channel_mode=args.div_channel_mode,
+                channel_window=args.div_channel_window,
+                channel_bottom=args.div_channel_bottom,
+                channel_top=args.div_channel_top,
+                k_min=args.k_min,
+                k_max=args.k_max,
+                live=args.live,
+                live_forward=args.live_forward,
+            )
         else:
             from run_monthly_rebalance import run_backtest as run_monthly_rebalance_bt
             print(f"  {'='*60}")

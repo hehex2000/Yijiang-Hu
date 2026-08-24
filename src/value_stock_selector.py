@@ -68,6 +68,108 @@ def _vsel_gate_cfg():
     return cfg
 
 
+# ════════════════════════════════════════════════════════════════
+#  Piotroski F-score 质量门槛（step 5 接入，默认关闭）
+#  作为「质量门槛层」叠加在价值初筛之后、top_n 之前：
+#    先价值初筛 → 再 F-score 门槛 → 按 BM 降序取 top_n
+#  不替代既有 4 道质量门槛。PIT 取值严格复用 piotroski_fscore
+#  （ann_date < 调仓日，年报口径，无前视）。
+# ════════════════════════════════════════════════════════════════
+_PIOSCORE_MAPS_CACHE = {}
+
+
+def _get_fscore_maps():
+    """构建并缓存 F-score 的 PIT map（按 db_path 缓存，避免月度回测每月重扫全表）。"""
+    global _PIOSCORE_MAPS_CACHE
+    path = _vsel_db_path()
+    if path not in _PIOSCORE_MAPS_CACHE:
+        from piotroski_fscore import build_fscore_maps
+        con = _vsel_conn()
+        _PIOSCORE_MAPS_CACHE[path] = build_fscore_maps(con)
+        con.close()
+    return _PIOSCORE_MAPS_CACHE[path]
+
+
+# [step5已证伪·不采用] 二值质量门槛路线：非单调 + OOS(train 2010-2019)证伪 F>=6 输 OFF 5.2pp → regime 巧合。
+def apply_piotroski_gate(chosen, trade_date, threshold=7, distress_only=False):
+    """在价值候选池(chosen, 已按 BM 降序)上叠加 F-score 质量门槛。
+
+    返回 (survivors_df 含 fscore 列, stats dict)：
+      - distress_only=True : 仅剔除 F<=2 困境股（F=None 视为未知→保留）。
+                             OOS 实证推荐口径（A股低F端没那么惨，严门槛会过度删名）。
+      - distress_only=False: 仅保留 F>=threshold（F=None 视为未验证→剔除）。
+                             经典严格门槛(7/8)，作质量增强层。
+    """
+    # 边界：候选池为空（价值初筛+既有质量门槛已无标的）时直接原样返回，
+    # 不经过下方「空 df 赋 fscore 列」逻辑——pandas 在 0 行 df 上赋值新列会清空
+    # 所有列，导致丢失 ts_code 列、下游名称补全 KeyError。原样返回保留 ts_code 列。
+    if len(chosen) == 0:
+        return chosen, {"n_in": 0, "n_out": 0, "n_drop": 0,
+                        "mode": ("drop<=2" if distress_only else f"F>={threshold}"),
+                        "fs_missing": 0}
+    M = _get_fscore_maps()
+    from piotroski_fscore import compute_fscore
+    out = chosen.copy()
+    fs = {}
+    for c in out["ts_code"].tolist():
+        try:
+            s, _ = compute_fscore(c, trade_date, M)
+        except Exception:
+            s = None
+        fs[c] = s
+    out["fscore"] = out["ts_code"].map(fs)
+    if distress_only:
+        keep = out["fscore"].apply(lambda x: (x is None) or (x > 2))
+    else:
+        keep = out["fscore"].apply(lambda x: (x is not None) and (x >= threshold))
+    survivors = out[keep].copy()
+    stats = {"n_in": len(out), "n_out": len(survivors),
+             "n_drop": len(out) - len(survivors),
+             "mode": ("drop<=2" if distress_only else f"F>={threshold}"),
+             "fs_missing": int(out["fscore"].isna().sum())}
+    return survivors, stats
+
+
+# [step5已证伪·不采用] 连续质量加权路线：w=0.5 双窗口验证净负(train -24.88pp / 全窗 -47.72pp vs OFF)，对该价值宇宙是负贡献。
+def apply_piotroski_blend(chosen, trade_date, w=0.5):
+    """连续 F-score 加权（质量 overlay 的稳健替代，规避硬阈值刀刃/空仓）。
+
+    在价值候选池(chosen, 已按 BM 降序)上：
+      - 计算每只 F-score(0~9)；F=None 记 -1（最差，避免被当中等 0）。
+      - 横截面 rank：value_rank(便宜=1) / fscore_rank(高F=1)。
+      - composite = (1-w)*norm(value_rank) + w*norm(fscore_rank)，取前 top_n。
+    不剔除任何候选（不空仓），仅重排。返回 (df 含 fscore 列, stats)。
+    w=0 ≡ 纯价值(OFF)；w=1 ≡ 价值候选内纯 F-score 排序。
+    """
+    if len(chosen) == 0:
+        return chosen, {"mode": f"blend w={w}", "n": 0, "fs_missing": 0}
+    M = _get_fscore_maps()
+    from piotroski_fscore import compute_fscore
+    out = chosen.copy()
+    fs = {}
+    for c in out["ts_code"].tolist():
+        try:
+            s, _ = compute_fscore(c, trade_date, M)
+        except Exception:
+            s = None
+        fs[c] = s
+    out["fscore"] = out["ts_code"].map(fs)
+    fs_val = out["fscore"].fillna(-1.0)
+    N = len(out)
+    # value_rank: BM 降序 → 1 最便宜（chosen 已按 BM 降序）
+    out["_value_rank"] = range(1, N + 1)
+    # fscore_rank: 高 F 排前(1)
+    out["_fscore_rank"] = fs_val.rank(ascending=False, method="first").astype(int)
+    out["_nv"] = (N - out["_value_rank"]) / max(N - 1, 1)
+    out["_nf"] = (N - out["_fscore_rank"]) / max(N - 1, 1)
+    out["_composite"] = (1.0 - w) * out["_nv"] + w * out["_nf"]
+    out = out.sort_values("_composite", ascending=False).reset_index(drop=True)
+    stats = {"mode": f"blend w={w}", "n": N,
+             "fs_missing": int(out["fscore"].isna().sum())}
+    out = out.drop(columns=["_value_rank", "_fscore_rank", "_nv", "_nf", "_composite"])
+    return out, stats
+
+
 def _vsel_pool_ts_set(pool, conn, trade_date):
     """返回股票池 ts_code 集合（时点快照）；None 表示全A股不过滤。"""
     if pool in ("all", None):
@@ -102,7 +204,9 @@ def _vsel_pool_ts_set(pool, conn, trade_date):
 
 
 def select_value_stocks(trade_date, top_n=5, stock_pool="zz800",
-                        size_neutral=False, value_pct=None, mode="pobreak"):
+                        size_neutral=False, value_pct=None, mode="pobreak",
+                        piotroski_gate=None, piotroski_distress=False,
+                        piotroski_blend=None, downside_filter=False):
     """
     统一价值选股逻辑，[1] 选股+回测 与 [6] 月度调仓 共用：
 
@@ -366,6 +470,20 @@ def select_value_stocks(trade_date, top_n=5, stock_pool="zz800",
     else:
         chosen = chosen.sort_values("bm", ascending=False)
 
+    # ---- 可选：Piotroski F-score 连续加权（step 5 稳健质量 overlay）----
+    #   与 gate 互斥理念：gate 是硬剔除(可能空仓)，blend 是连续重排(不空仓)。
+    #   顺序（关键）：价值初筛 → 连续加权重排（在全候选池上）→ ⑤ 纵向分位（对重排后
+    #       候选取 top_n 截断）→ [可选 gate] → 取 top_n。
+    #   必须置于 ⑤ 之前：⑤ 默认按 top_n 提前截断候选池(_need=top_n)，若 blend 在 ⑤ 之后
+    #   执行，候选池已被压成 <=top_n，blend 仅重排一个"已全持有集合"，等权下与 OFF 逐字节
+    #   相同（已实测：w=0.25/0.5/0.75 三档与 OFF 完全相同，属结构性 no-op 而非 regime 结论）。
+    #   置于 ⑤ 之前后，blend 在全候选池上重排，⑤ 再按 top_n 截断重排结果 → 不同 w 可改变
+    #   最终持仓集合，连续加权才具备区分度。OFF(piotroski_blend=None)不受影响，基线不变。
+    if piotroski_blend is not None:
+        chosen, _bst = apply_piotroski_blend(chosen, actual_date, w=piotroski_blend)
+        logger.info(f"[价值选股] Piotroski连续加权(blend w={piotroski_blend:.2f}): "
+                    f"候选 {_bst['n']}→重排(置于⑤前，避免被⑤按top_n截断) (F缺失 {_bst.get('fs_missing', 0)}) @ {actual_date}")
+
     # ⑤ 估值纵向历史分位：当前 PE_TTM 需处于自身过去 N 年 <= 阈值分位（纵向也便宜）。
     #    NULL 容忍：历史样本不足(<60个交易日)的股票跳过该判断=保留。
     #    性能：按已排好的顺序逐只体检，凑够 top_n 即停，避免全池查历史。
@@ -401,6 +519,35 @@ def select_value_stocks(trade_date, top_n=5, stock_pool="zz800",
                     f"体检 {checked} 只→通过 {len(keep)}(剔除 {dropped}/样本不足保留 {skipped}) "
                     f"({_before}→{len(chosen)})")
 
+    # ---- 可选：Piotroski F-score 质量门槛（step 5，默认关闭）----
+    #   仅当显式开启时才计算（build_fscore_maps 有 db_path 缓存，月度回测内只建一次）。
+    #   顺序：先价值初筛 → 再 F-score 门槛 → 按 BM 降序取 top_n（门槛不重排，仅过滤）。
+    if piotroski_gate is not None or piotroski_distress:
+        _gthr = piotroski_gate if (piotroski_gate is not None) else 2
+        survivors, _gst = apply_piotroski_gate(
+            chosen, actual_date, threshold=_gthr, distress_only=piotroski_distress)
+        logger.info(f"[价值选股] Piotroski质量门槛({_gst['mode']}): "
+                    f"候选 {_gst['n_in']}→保留 {_gst['n_out']} (剔除 {_gst['n_drop']}, "
+                    f"F缺失 {_gst['fs_missing']}) @ {actual_date}")
+        chosen = survivors
+
+    # ---- 可选：下跌通道风控筛（超跌反弹漏斗剥离的纯剔除层，默认关闭）----
+    #   把"仍处下跌通道(仍贴lows/在MA下/量未缩)"的标的从候选池剔除，降波动不增收益。
+    #   PIT：用 trade_date 闭市数据判断，无前视；样本不足/无复权->跳过=保留。
+    if downside_filter and len(chosen) > 0:
+        try:
+            from downside_filter import compute_downside_banned
+            _banned = compute_downside_banned(
+                chosen["ts_code"].tolist(), actual_date,
+                db_path=_vsel_db_path())
+            if _banned:
+                _before = len(chosen)
+                chosen = chosen[~chosen["ts_code"].isin(_banned)]
+                logger.info(f"[价值选股] 下跌通道风控筛: 剔除 {_before - len(chosen)} 只 "
+                            f"({_before}→{len(chosen)}) @ {actual_date}")
+        except Exception as _e:
+            logger.warning(f"[价值选股] 下跌通道风控筛异常跳过: {_e}")
+
     # ---- 取 top_n ----
     if top_n and top_n > 0:
         chosen = chosen.head(top_n)
@@ -419,8 +566,11 @@ def select_value_stocks(trade_date, top_n=5, stock_pool="zz800",
     df["name"] = df["ts_code"].map(names)
     df["code"] = df["ts_code"].str.extract(r"(\d{6})", expand=False)
     df.insert(0, "selection_date", trade_date)
-    return df[["ts_code", "code", "name", "pb", "pe_ttm", "roe",
-               "current_ratio", "selection_date"]]
+    _ret_cols = ["ts_code", "code", "name", "pb", "pe_ttm", "roe",
+                 "current_ratio", "selection_date"]
+    if "fscore" in df.columns:
+        _ret_cols.append("fscore")
+    return df[_ret_cols]
 
 
 class ValueStockSelector:
@@ -981,7 +1131,8 @@ class ValueStockSelector:
         return result
     
     def select_stocks(self, date: str = None,
-                     top_n: int = None) -> pd.DataFrame:
+                     top_n: int = None,
+                     downside_filter: bool = False) -> pd.DataFrame:
         """
         执行选股（主流程）。
 
@@ -993,7 +1144,8 @@ class ValueStockSelector:
         return select_value_stocks(date, top_n, self.stock_pool,
                                    size_neutral=self.value_size_neutral,
                                    value_pct=self.value_pct,
-                                   mode=self.value_mode)
+                                   mode=self.value_mode,
+                                   downside_filter=downside_filter)
     
     def export_to_csv(self, df: pd.DataFrame, 
                       filename: Optional[str] = None,

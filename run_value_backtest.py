@@ -26,7 +26,7 @@ class ValueStrategyBacktest:
     
     def __init__(self, initial_cash=50000, db_path="D:/tu-shareData/astock_daily.db",
                  freq="monthly", size_neutral=False, value_pct=None, top_n=5,
-                 stock_pool="zz800", value_mode="pobreak"):
+                 stock_pool="zz800", value_mode="pobreak", downside_filter=False):
         """
         初始化回测
 
@@ -48,6 +48,7 @@ class ValueStrategyBacktest:
         self.top_n = top_n
         self.stock_pool = stock_pool
         self.value_mode = value_mode
+        self.downside_filter = downside_filter
         self.data_fetcher = DataFetcher()
 
         # 读取配置
@@ -170,8 +171,8 @@ class ValueStrategyBacktest:
         self.selector.date = rebalance_date
         self.selector.report_date = report_date
         
-        # 执行选股
-        selected_df = self.selector.select_stocks()
+        # 执行选股（下跌通道风控筛经 self.downside_filter 透传，默认关）
+        selected_df = self.selector.select_stocks(downside_filter=self.downside_filter)
         
         # 恢复原始日期
         self.selector.date = original_date
@@ -257,7 +258,8 @@ class ValueStrategyBacktest:
               f"每次选{self.top_n}只股票，每只投入1万元")
         print(f"增强开关: 市值中性化={'开' if self.size_neutral else '关'} | "
               f"BM分位筛选={('前%.0f%%'%(self.value_pct*100)) if self.value_pct else '关'} | "
-              f"模式={self.value_mode} | 池={self.stock_pool}")
+              f"模式={self.value_mode} | 池={self.stock_pool} | "
+              f"下跌通道风控筛={'开' if self.downside_filter else '关'}")
         print("=" * 80)
 
         # 获取所有交易日
@@ -386,6 +388,8 @@ def main():
                     help="BM分位筛选，如0.3=全市场BM前30%（Fama-French前20-30%口径）")
     ap.add_argument("--mode", default="pobreak", choices=["pobreak", "pure_bm"],
                     help="pobreak=破净价值(PB<1+ROE质量) | pure_bm=放宽破净·全市场BM前N%门槛")
+    ap.add_argument("--downside-filter", action="store_true",
+                    help="下跌通道风控筛：剔除仍处下跌通道(贴lows/在MA下/量未缩)的候选，降波动不增收益")
     args = ap.parse_args()
 
     backtest = ValueStrategyBacktest(
@@ -397,6 +401,7 @@ def main():
         top_n=args.top_n,
         stock_pool=args.pool,
         value_mode=args.mode,
+        downside_filter=args.downside_filter,
     )
 
     result = backtest.run_backtest(start_date=args.start, end_date=args.end)

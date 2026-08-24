@@ -78,14 +78,13 @@ def get_pro():
 def ensure_tables(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS index_weight (
-            index_code TEXT, con_code TEXT, trade_date INTEGER, weight REAL,
-            PRIMARY KEY (index_code, con_code, trade_date)
+            index_code TEXT, ts_code TEXT, trade_date TEXT, weight REAL,
+            PRIMARY KEY (index_code, ts_code, trade_date)
         )""")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS index_constituent (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts_code TEXT NOT NULL, index_code TEXT NOT NULL, index_name TEXT,
-            trade_date INTEGER, weight REAL, create_time TEXT,
+            index_code TEXT, ts_code TEXT, trade_date TEXT,
+            weight REAL, index_name TEXT,
             UNIQUE(ts_code, index_code, trade_date)
         )""")
     conn.commit()
@@ -133,7 +132,7 @@ def download(pro, conn, index_code, start_ym, end_ym):
                 continue
             conn.executemany(
                 "INSERT OR REPLACE INTO index_weight "
-                "(index_code, con_code, trade_date, weight) VALUES (?,?,?,?)", rows)
+                "(index_code, ts_code, trade_date, weight) VALUES (?,?,?,?)", rows)
             conn.commit()
             total += len(rows)
             snaps.update(r[2] for r in rows)
@@ -154,8 +153,8 @@ def sync_to_constituent(conn, index_code):
         (index_code,)).fetchone()[0]
     cur = conn.execute("""
         INSERT OR REPLACE INTO index_constituent
-            (ts_code, index_code, index_name, trade_date, weight, create_time)
-        SELECT con_code, index_code, ?, trade_date, weight, datetime('now')
+            (ts_code, index_code, index_name, trade_date, weight)
+        SELECT ts_code, index_code, ?, trade_date, weight
         FROM index_weight WHERE index_code = ?
     """, (name, index_code))
     conn.commit()

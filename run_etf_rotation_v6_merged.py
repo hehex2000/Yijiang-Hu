@@ -32,6 +32,15 @@ try:
 except Exception:
     _epf = None
 
+# ── 板块三态状态机（B 项前置闸门，纯函数模块）──────────────
+# sector_state_machine 为纯函数（无 DB 依赖，可单测）；DB 取数 + 闸门封装在本文件。
+from sector_state_machine import (
+    classify_state, STATE_CN, GATE_PASS, UNKNOWN, HIST_LEN as SSM_HIST_LEN,
+)
+
+# ── 市场择时 overlay（A 项振荡器闸门，纯函数模块）────────────
+from market_timing_overlay import compute_breadth_oscillator, position_cap
+
 # ── 常量 ──────────────────────────────────────────────────
 STAMP_DUTY_RATE_ETF = 0.0       # ETF 免印花税
 INITIAL_CAPITAL = 100000        # 初始总资金
@@ -675,7 +684,103 @@ class PremiumGate:
         return kept
 
 
+# ── 板块三态状态机前置闸门（B 项）──────────────────────────
+#
+# 【设计原则】「状态确认」而非「强度排序」（§5.12 已证板块强度=负贡献）：
+#   · 横截面动量强弱排序 → 容易买到「最强=刚见顶」的标的（动量均值回归）。
+#   · 本闸门不重排候选，只对每个候选逐期判定其趋势「状态」——
+#       加速见底(左侧)  → 价格在长期趋势线(MA60)下方，或站上 MA60 但 MA60 斜率仍
+#                         向下（死猫反弹）→ 结构未反转，不抄底、不接下落刀 → 剔除。
+#       右侧趋势        → 价格>MA60 且 MA60 斜率转正，动量平稳/温和减速 → 可持有。
+#       趋势加速        → 右侧基础上短期动量相对长期动量加速(roc20>roc60) → 突破主升。
+#   · 只保留 右侧趋势+趋势加速，剔除 加速见底。排序仍由策略自身 RSRS+双动量决定，
+#     二者解耦，避免把状态机变成又一个强度排序器。
+#   · 数据不足(UNKNOWN)保守保留，不误杀。
+#
+def classify_etf_state(code, trade_date, hist_len=SSM_HIST_LEN):
+    """用本地库价格历史判定某 ETF 当期趋势状态（接 sector_state_machine 纯函数）。
+
+    返回 STATE_CN 的 key：ACCEL_BOTTOM / RIGHT_TREND / TREND_ACCEL / UNKNOWN。
+    """
+    closes = _query_history(code, trade_date, "close", hist_len)
+    if closes is None or len(closes) < SSM_HIST_LEN:
+        return UNKNOWN
+    asc = np.array(closes[::-1], dtype=float)  # 降序→升序(旧→新)
+    st, _det = classify_state(asc)
+    return st
+
+
+class SectorStateGate:
+    """板块三态状态机前置闸门：与 PremiumGate 同接口，用于调仓前过滤候选。
+
+    只进 右侧趋势+趋势加速，剔除 加速见底（左侧/下落刀）。
+    """
+
+    def __init__(self, universe, mode="off"):
+        self.mode = mode
+        self.enabled = (mode == "on")
+        self.dropped = []   # [(date, code, name, state)]
+        self.kept = []      # [(date, code, name, state)] 诊断用
+
+    def filter_scored(self, scored, day, universe, verbose=False):
+        """对打分列表逐个按三态过滤，返回保留列表（顺序不变）。"""
+        if not self.enabled or not scored:
+            return scored
+        kept = []
+        for item in scored:
+            code = item[0]
+            st = classify_etf_state(code, day)
+            if st in GATE_PASS:
+                kept.append(item)
+                self.kept.append((day, code, st))
+            else:
+                name = next((e["name"] for e in universe if e["code"] == code), code)
+                self.dropped.append((day, code, name, st))
+                if verbose:
+                    print(f"    [三态闸门剔除] {name}({code}) 状态={STATE_CN.get(st, st)} → 不接左侧")
+        return kept
+
+
 # ── 主回测循环 ────────────────────────────────────────────
+
+# ── 市场择时 overlay 辅助：加载全市场收盘价矩阵（供广度振荡器）──
+def _load_market_close_p(start_date, end_date):
+    """从 daily 表取全市场收盘价，pivot 成 (trade_date × ts_code) 矩阵。
+    回溯 300 日以确保 MA200 有足够 min_periods。返回 DataFrame(index=int日期)。
+    """
+    import datetime
+    sy, sm, sd = int(start_date[:4]), int(start_date[4:6]), int(start_date[6:8])
+    lo = (datetime.date(sy, sm, sd) - datetime.timedelta(days=300)).strftime("%Y%m%d")
+    con = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT trade_date, ts_code, close FROM daily "
+            "WHERE trade_date>=? AND trade_date<=?",
+            con, params=(lo, end_date))
+    finally:
+        con.close()
+    if df.empty:
+        return pd.DataFrame()
+    px = df.pivot(index="trade_date", columns="ts_code", values="close").sort_index()
+    px.index = pd.to_numeric(px.index).astype(int)
+    return px
+
+
+def _build_timing_gate_caps(rebalance_dates, start_date, end_date,
+                            boil, ice, floor, verbose=True):
+    """对调仓日计算择时 cap ∈ [floor,1]（非对称，只减仓）。返回 {int_date: cap}。"""
+    px = _load_market_close_p(start_date, end_date)
+    if px.empty:
+        if verbose:
+            print("  [择时overlay] 警告：daily 表为空，闸门未生效（退化为满仓）")
+        return {}
+    osc_all = compute_breadth_oscillator(px).dropna()
+    caps = {}
+    for d in sorted(rebalance_dates):
+        caps[d] = float(position_cap(float(osc_all[d]), boil, ice, floor)) \
+            if d in osc_all.index else 1.0   # 早期无信号 → 满仓
+    return caps
+
 
 def run_etf_rotation(start_date="20200101", end_date="20251231",
                      method="dual", roc_period=20, ma_period=60,
@@ -688,7 +793,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                      interrupt_start=None, interrupt_months=0, interrupt_pct=0.0,
                      premium_filter="off",
                      rsrs_weight=RSRS_WEIGHT, rsrs_window=RSRS_WINDOW,
-                     regime_hook=None):
+                     regime_hook=None,
+                     sector_gate="off",
+                     timing_gate=False, boil=80, ice=55, floor=0.0):
     """ETF轮动策略主回测
 
     Args:
@@ -739,6 +846,18 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         print(f"  交易日：{len(trade_dates)} 天 | 调仓日：{len(rebalance_dates)} 次")
         print()
 
+    # ── 市场择时 overlay（A 项振荡器闸门，默认关，不破坏审计链）──
+    timing_caps = {}
+    n_timing_trig = 0
+    if timing_gate:
+        timing_caps = _build_timing_gate_caps(
+            rebalance_dates, start_date, end_date, boil, ice, floor, verbose=verbose)
+        n_timing_trig = sum(1 for c in timing_caps.values() if c < 1.0)
+        if verbose:
+            print(f"  市场择时 overlay：开启（沸点>={boil}清仓 / 冰点<={ice}满仓 / floor={floor:.2f}）")
+            print(f"    触发减仓或清仓的调仓月 = {n_timing_trig}/{len(timing_caps)}")
+            print()
+
     # ── 初始化 ──
     cash = float(capital)
     positions = {}  # { code: {"shares": int, "buy_price": float} }
@@ -752,6 +871,12 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                      "qdii": f"仅限申赎受限品种({QDII_HARD_THRESHOLD:.0%})",
                      "rolling": "自适应分位数(P95+abs≥2%)"}
         print(f"  折溢价过滤：开启 [{premium_filter}] {mode_desc.get(premium_filter, '')}")
+        print()
+
+    # ── 板块三态状态机前置闸门（默认 off，不破坏审计链）──
+    sector_state_g = SectorStateGate(universe, mode=sector_gate)
+    if sector_state_g.enabled and verbose:
+        print(f"  板块三态闸门：开启（只进 右侧趋势+趋势加速，剔除 加速见底/左侧）")
         print()
 
     # ── Regime β 兜底开关提示（仅 on 时）──
@@ -788,6 +913,8 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                                   rsrs_weight=rsrs_weight, rsrs_window=rsrs_window)
             # 折溢价闸门：剔除高溢价标的，top_n 自动顺延到下一名
             scored = gate.filter_scored(scored, prev_td, universe, verbose=verbose)
+            # 板块三态闸门：剔除 加速见底(左侧)，只留 右侧趋势+趋势加速
+            scored = sector_state_g.filter_scored(scored, prev_td, universe, verbose=verbose)
             targets = select_targets(scored, method=method, top_n=top_n)
 
             # ── Regime β 兜底（--regime 开关，默认关闭，不破坏审计链）──
@@ -838,81 +965,124 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                     regime_str = f" | Regime={regime_hook.state}({regime_hook.raw}·趋势{regime_hook.trend}·{br_s})"
                 print(f"  调仓日 {td}：得分前三={score_str} | 目标={target_str}{prot_str}{var_str}{regime_str}")
 
-            # ── 卖出不在目标中的旧持仓（跳过protected和货币基金）──
-            for code in list(positions.keys()):
-                if code in target_codes or code in protected:
-                    continue
-                # 熊市模式下保留货币基金
-                if not targets and code == MONEY_FUND_CODE:
-                    continue
-                open_price = get_etf_open(code, td)
-                if open_price is None or open_price <= 0:
-                    continue
-                pos = positions[code]
-                proceeds = pos["shares"] * open_price
-                fee = calc_etf_fee('sell', open_price, pos["shares"])
-                cash += proceeds - fee
-                trades.append({
-                    "date": td, "action": "SELL", "code": code,
-                    "name": next((e["name"] for e in universe if e["code"] == code), code),
-                    "price": open_price, "shares": pos["shares"], "reason": "rotation"
-                })
-                if verbose:
-                    etf_name = next((e["name"] for e in universe if e["code"] == code), code)
-                    print(f"    → 卖出 {etf_name}：{pos['shares']}份 @ {open_price:.3f}")
-                del positions[code]
+            # ── A 项市场择时 overlay：非对称减仓（只减不增）──
+            # cap=1（正常市）→ 完全走原基线轮动；cap<1（过热）→ 按比例 trim 全部权益、不轮换不抄底
+            cap = 1.0
+            if timing_gate and td in timing_caps:
+                cap = timing_caps[td]
 
-            # ── 买入新的目标持仓（等权分配，保留现金缓冲）──
-            if targets:
-                new_to_buy = [(c, n, w) for c, n, w in targets if c not in positions]
-                if new_to_buy:
-                    # VaR 缩放：现金缓冲后再乘投入比例，未投部分留现金（凶策略同款口径）
-                    investable = cash * (1 - cash_buffer_pct) * var_ratio
-                    cash_per_target = investable / len(new_to_buy)
-                    for code, name, weight in new_to_buy:
+            if cap < 1.0 - 1e-9:
+                # ── 闸门触发：非对称减仓，按 cap 比例 trim 全部权益持仓（货币基金不动）──
+                cur_equity = 0.0
+                for _c, _p in positions.items():
+                    if _c == MONEY_FUND_CODE:
+                        continue
+                    _px = get_etf_price(_c, prev_td) or _p.get("buy_price") or 0.0
+                    cur_equity += _p["shares"] * _px
+                if cur_equity > 0:
+                    scale = cap
+                    for code in list(positions.keys()):
+                        if code == MONEY_FUND_CODE:
+                            continue
                         open_price = get_etf_open(code, td)
                         if open_price is None or open_price <= 0:
                             continue
-                        alloc = cash_per_target * weight * len(new_to_buy)
-                        alloc = min(alloc, cash)
-                        alloc_after_fee = alloc * 0.998
-                        max_shares = int(alloc_after_fee / open_price / 100) * 100
-                        if max_shares < 100:
-                            continue
-                        cost = max_shares * open_price
-                        fee = calc_etf_fee('buy', open_price, max_shares)
-                        if cost + fee <= cash:
-                            cash -= cost + fee
-                            positions[code] = {"shares": max_shares, "buy_price": open_price}
+                        pos = positions[code]
+                        keep_shares = int(pos["shares"] * scale / 100) * 100
+                        sell_shares = pos["shares"] - keep_shares
+                        if sell_shares >= 100:
+                            proceeds = sell_shares * open_price
+                            fee = calc_etf_fee('sell', open_price, sell_shares)
+                            cash += proceeds - fee
                             trades.append({
-                                "date": td, "action": "BUY", "code": code,
-                                "name": name, "price": open_price,
-                                "shares": max_shares, "reason": "rotation"
+                                "date": td, "action": "SELL", "code": code,
+                                "name": next((e["name"] for e in universe if e["code"] == code), code),
+                                "price": open_price, "shares": sell_shares,
+                                "reason": f"timing_trim(cap={cap:.2f})"
                             })
-                            if verbose:
-                                print(f"    → 买入 {name}：{max_shares}份 @ {open_price:.3f}")
+                            pos["shares"] = keep_shares
+                            if keep_shares == 0:
+                                del positions[code]
+                if verbose:
+                    print(f"    → 择时闸门触发(cap={cap:.2f})：权益按比例 trim 至 {cap*100:.0f}%，"
+                          f"本月不轮换、不抄底")
             else:
-                # ── 熊市避险：全部走弱时买入货币基金 ──
-                if MONEY_FUND_CODE not in positions:
-                    open_price = get_etf_open(MONEY_FUND_CODE, td)
-                    if open_price and open_price > 0:
-                        investable = cash * (1 - cash_buffer_pct)
-                        alloc_after_fee = investable * 0.998
-                        max_shares = int(alloc_after_fee / open_price / 100) * 100
-                        if max_shares >= 100:
+                # ── 常规轮动（与基线完全一致）──
+                # ── 卖出不在目标中的旧持仓（跳过protected和货币基金）──
+                for code in list(positions.keys()):
+                    if code in target_codes or code in protected:
+                        continue
+                    # 熊市模式下保留货币基金
+                    if not targets and code == MONEY_FUND_CODE:
+                        continue
+                    open_price = get_etf_open(code, td)
+                    if open_price is None or open_price <= 0:
+                        continue
+                    pos = positions[code]
+                    proceeds = pos["shares"] * open_price
+                    fee = calc_etf_fee('sell', open_price, pos["shares"])
+                    cash += proceeds - fee
+                    trades.append({
+                        "date": td, "action": "SELL", "code": code,
+                        "name": next((e["name"] for e in universe if e["code"] == code), code),
+                        "price": open_price, "shares": pos["shares"], "reason": "rotation"
+                    })
+                    if verbose:
+                        etf_name = next((e["name"] for e in universe if e["code"] == code), code)
+                        print(f"    → 卖出 {etf_name}：{pos['shares']}份 @ {open_price:.3f}")
+                    del positions[code]
+
+                # ── 买入新的目标持仓（等权分配，保留现金缓冲）──
+                if targets:
+                    new_to_buy = [(c, n, w) for c, n, w in targets if c not in positions]
+                    if new_to_buy:
+                        # VaR 缩放：现金缓冲后再乘投入比例，未投部分留现金（凶策略同款口径）
+                        investable = cash * (1 - cash_buffer_pct) * var_ratio
+                        cash_per_target = investable / len(new_to_buy)
+                        for code, name, weight in new_to_buy:
+                            open_price = get_etf_open(code, td)
+                            if open_price is None or open_price <= 0:
+                                continue
+                            alloc = cash_per_target * weight * len(new_to_buy)
+                            alloc = min(alloc, cash)
+                            alloc_after_fee = alloc * 0.998
+                            max_shares = int(alloc_after_fee / open_price / 100) * 100
+                            if max_shares < 100:
+                                continue
                             cost = max_shares * open_price
                             fee = calc_etf_fee('buy', open_price, max_shares)
                             if cost + fee <= cash:
                                 cash -= cost + fee
-                                positions[MONEY_FUND_CODE] = {"shares": max_shares, "buy_price": open_price}
-                                mf_name = next((e["name"] for e in universe if e["code"] == MONEY_FUND_CODE), CASH_NAME)
+                                positions[code] = {"shares": max_shares, "buy_price": open_price}
                                 trades.append({
-                                    "date": td, "action": "BUY", "code": MONEY_FUND_CODE,
-                                    "name": mf_name, "price": open_price,
-                                    "shares": max_shares, "reason": "bear_market_safe_haven"
+                                    "date": td, "action": "BUY", "code": code,
+                                    "name": name, "price": open_price,
+                                    "shares": max_shares, "reason": "rotation"
                                 })
                                 if verbose:
-                                    print(f"    → 熊市避险：买入 {mf_name}：{max_shares}份 @ {open_price:.3f}")
+                                    print(f"    → 买入 {name}：{max_shares}份 @ {open_price:.3f}")
+                else:
+                    # ── 熊市避险：全部走弱时买入货币基金 ──
+                    if MONEY_FUND_CODE not in positions:
+                        open_price = get_etf_open(MONEY_FUND_CODE, td)
+                        if open_price and open_price > 0:
+                            investable = cash * (1 - cash_buffer_pct)
+                            alloc_after_fee = investable * 0.998
+                            max_shares = int(alloc_after_fee / open_price / 100) * 100
+                            if max_shares >= 100:
+                                cost = max_shares * open_price
+                                fee = calc_etf_fee('buy', open_price, max_shares)
+                                if cost + fee <= cash:
+                                    cash -= cost + fee
+                                    positions[MONEY_FUND_CODE] = {"shares": max_shares, "buy_price": open_price}
+                                    mf_name = next((e["name"] for e in universe if e["code"] == MONEY_FUND_CODE), CASH_NAME)
+                                    trades.append({
+                                        "date": td, "action": "BUY", "code": MONEY_FUND_CODE,
+                                        "name": mf_name, "price": open_price,
+                                        "shares": max_shares, "reason": "bear_market_safe_haven"
+                                    })
+                                    if verbose:
+                                        print(f"    → 熊市避险：买入 {mf_name}：{max_shares}份 @ {open_price:.3f}")
 
         # ── 每日市值记录（调仓后，反映当日实际持仓的收盘价）──
         total_value = cash
@@ -982,6 +1152,12 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     print(f"  基准（沪深300）涨幅：{idx_return:+.2f}%")
     print(f"  超额收益：{total_return - idx_return:+.2f}%")
+    if sector_state_g.enabled:
+        print(f"  板块三态闸门：剔除 {len(sector_state_g.dropped)} 次候选(加速见底/左侧) ｜ "
+              f"放行 {len(sector_state_g.kept)} 次")
+    if timing_gate:
+        print(f"  市场择时 overlay：触发减仓/清仓 {n_timing_trig} 个调仓月 ｜ "
+              f"沸点>={boil}清仓 / 冰点<={ice}满仓 / floor={floor:.2f}")
 
     # ── 现实折扣三件套（扣通胀 / 定投拖累 / 中断模拟）──
     disc = compute_reality_discounts(
@@ -1011,6 +1187,14 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         except Exception:
             pass
 
+    # ── 成交明细 CSV 导出（含 reason 列，调试友好）──
+    if trades:
+        _trades_df = pd.DataFrame(trades)[
+            ["date", "action", "code", "name", "price", "shares", "reason"]
+        ]
+        _trades_df.to_csv("etf_rotation_trades.csv", index=False, encoding="utf-8-sig")
+        print(f"  成交明细：已导出 etf_rotation_trades.csv（{len(_trades_df)} 笔，含 reason 列）")
+
     return {
         "total_return": total_return,
         "annual_return": annual_return,
@@ -1023,6 +1207,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         "var_control": var_control,
         "premium_filter": premium_filter,
         "premium_blocked": list(gate.blocked),
+        "timing_gate": timing_gate,
+        "timing_triggered": n_timing_trig,
+        "timing_boil": boil, "timing_ice": ice, "timing_floor": floor,
     }
 
 
@@ -1057,6 +1244,18 @@ if __name__ == "__main__":
                         help="ETF折溢价过滤：off=关(默认) | uniform=统一5%% | "
                              "strict=跨境更严(3%%/5%%) | qdii=仅申赎受限品种8%% | "
                              "rolling=自适应分位数(P95+绝对值≥2%%，推荐)")
+    parser.add_argument("--sector-gate", action="store_true",
+                        help="板块三态状态机前置闸门：只进 右侧趋势+趋势加速，剔除 加速见底(左侧/下落刀)。"
+                             "默认关(不破坏审计链)")
+    parser.add_argument("--timing-gate", action="store_true",
+                        help="A项市场择时 overlay：全市场广度振荡器(沸点>=boil清仓/冰点<=ice满仓)非对称闸门，"
+                             "只减仓不抄底。默认关(不破坏审计链)。阈值见 --boil/--ice/--floor")
+    parser.add_argument("--boil", type=float, default=80.0,
+                        help="择时 overlay 沸点阈值(默认80，振荡器>=此值清仓)")
+    parser.add_argument("--ice", type=float, default=20.0,
+                        help="择时 overlay 冰点阈值(默认20，振荡器<=此值满仓)")
+    parser.add_argument("--floor", type=float, default=0.0,
+                        help="择时 overlay 清仓时最低保留仓位(默认0=全清；设0.2=最多降到2成)")
     parser.add_argument("--quiet", action="store_true", help="静默模式")
     parser.add_argument("--interrupt-start", type=str, default=None,
                         help="现实折扣-中断模拟：从 YYYYMM 起撤出部分资金（配合 --interrupt-months/--interrupt-pct）")
@@ -1119,4 +1318,7 @@ if __name__ == "__main__":
         rsrs_weight=args.rsrs_weight,
         rsrs_window=args.rsrs_window,
         regime_hook=regime_hook,
+        sector_gate="on" if args.sector_gate else "off",
+        timing_gate=args.timing_gate,
+        boil=args.boil, ice=args.ice, floor=args.floor,
     )

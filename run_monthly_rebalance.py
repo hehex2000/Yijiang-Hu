@@ -18,6 +18,8 @@ import numpy as np
 from datetime import datetime
 import os
 import sys
+import json
+import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -45,6 +47,12 @@ except (ImportError, Exception):
     vp_fakeout_reclaim = None
 
 from position_sizing import SCHEMES, compute_target_weights, rebalance_to_targets
+
+# 缠论买点门控（Mode A 接入）：复用忠实内核的流式信号发生器（含逐Bar因果+去闪烁，无未来函数）
+try:
+    from chan_lun_core_faithful import ChanLunStream
+except Exception:
+    ChanLunStream = None
 
 def get_top_n():
     """动态获取选股数量（优先从 config.SELECTION 读取）"""
@@ -203,6 +211,33 @@ SLIPPAGE_RATE = 0.001  # 滑点率（0.1%，模拟实盘买卖价差和冲击成
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
+
+
+def _data_fingerprint():
+    """返回 (短哈希, 明细) 用于跨跑可比性判定。
+
+    回测数字“同参数两次跑不同”的常见根因是数据库在两次运行间被改写
+    （补数脚本 / Tushare-Downloader 更新改变成分股池或财务表），而非引擎
+    非确定性。组合关键表的 (行数, 最大日期) 求短哈希；DB 任何更新都会改变
+    它，据此可判定两次结果是否基于同一份数据、是否可比。
+    """
+    try:
+        conn = get_conn()
+        parts = []
+        for tbl, dtcol in (("index_constituent", "trade_date"),
+                           ("daily", "trade_date"), ("daily_basic", "trade_date"),
+                           ("fina_indicator", "ann_date"), ("cashflow", "ann_date"),
+                           ("balance_sheet", "ann_date")):
+            try:
+                r = conn.execute(f"SELECT COUNT(*), MAX({dtcol}) FROM {tbl}").fetchone()
+                parts.append(f"{tbl}:{r[0]}:{r[1]}")
+            except Exception:
+                parts.append(f"{tbl}:ERR")
+        conn.close()
+        detail = " | ".join(parts)
+        return hashlib.md5(detail.encode("utf-8")).hexdigest()[:12], detail
+    except Exception as e:  # noqa: BLE001
+        return "NA", f"fingerprint_error:{e}"
 
 
 def get_stock_name(ts_code):
@@ -370,6 +405,21 @@ def _get_ohlc(ts_code, trade_date):
             d[str(r["ts_code"])] = (h, l, c)
         _DAY_OHLC[trade_date] = d
     return d.get(ts_code)
+
+
+def get_ohlc_history(ts_code, end_date):
+    """取 code 截至 end_date 的全部日线 OHLC（升序），返回 [(date,h,l,c), ...]。
+    用于缠论买点门控：给流式信号发生器播种历史。缺失/NaN 行已过滤。"""
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT trade_date, high, low, close FROM daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date ASC",
+        conn, params=(ts_code, end_date))
+    conn.close()
+    out = []
+    for _, r in df.iterrows():
+        if pd.notna(r["high"]) and pd.notna(r["low"]) and pd.notna(r["close"]):
+            out.append((int(r["trade_date"]), float(r["high"]), float(r["low"]), float(r["close"])))
+    return out
 
 
 # ════════════════════════════════════════════════════════════
@@ -618,6 +668,36 @@ def _bb_width_pct(ts_code, trade_date, is_index=False, win=20, lookback=120):
     return float((widths < cur).mean())
 
 
+def apply_consolidation_filter(codes, trade_date, con_win=20, con_lookback=120, con_th=0.25):
+    """【已证伪·仅诊断·默认关】缠论中枢回避过滤（原缠论验证 G1 组）。
+
+    ⚠️ OOS 证伪结论（见 docs/consolidation_filter_oos_report.md）：
+       - 样本内 2020-2025 价值选股 n=5/10 下 +31pp/+54pp 看似有效；
+       - 真实样本外 2015-2019 把价值策略从 +20.89% 干到 -17.72%（跑输基准 -26pp）；
+       - 本质=通用盘整 regime 探测器（布林带宽），非缠论几何，且对 2024 价值大年窗口拟合。
+       → 默认关，仅作诊断对照，不当 alpha 使用，不进主策略默认开。
+    剔除当前处于『中枢/盘整期』(布林带宽滚动分位 < con_th) 的候选股。
+    无未来函数：trade_date 用 T-1（prev_td），T 开盘执行；复用引擎内 _bb_width_pct
+    （与 chan_lun_core.in_consolidation 等价）。数据不足时 _bb_width_pct 返回 0.5(中性)→保留。
+    入参兼容 DataFrame(select_stocks 返回) 与 ts_code 列表，统一归一化为列表返回。
+    """
+    # 兼容 DataFrame 与列表
+    if hasattr(codes, "empty"):  # pandas DataFrame/Series
+        _cols = getattr(codes, "columns", [])
+        _col = "ts_code" if "ts_code" in _cols else (_cols[0] if len(_cols) else None)
+        codes = codes[_col].tolist() if _col else []
+    else:
+        codes = list(codes)
+    if not codes:
+        return []
+    keep = []
+    for c in codes:
+        bb_pct = _bb_width_pct(c, trade_date, is_index=False, win=con_win, lookback=con_lookback)
+        if bb_pct >= con_th:
+            keep.append(c)
+    return keep
+
+
 def macd_state(ts_code, trade_date, is_index_signal=False,
                regime_code=None, regime_is_index=True,
                mode="regime", ma_period=200, bb_win=20,
@@ -689,31 +769,38 @@ def calc_volatility(ts_code, trade_date, window=VOL_WINDOW):
 #  选股函数
 # ============================================================
 
-def select_stocks(trade_date, top_n=None, mode="pobreak", size_neutral=False, value_pct=None):
+def select_stocks(trade_date, top_n=None, mode="pobreak", size_neutral=False, value_pct=None, stock_pool=None,
+                  piotroski_gate=None, piotroski_distress=False, piotroski_blend=None):
     """
     价值选股（统一逻辑，来自 src.value_stock_selector.select_value_stocks）：
     - mode="pobreak"（默认）：PB < 1.0（破净）+ ROE>8% + 流动比率>=1.2 + 0<PE_TTM<30
     - mode="pure_bm"：放宽破净约束（去掉 pb<1.0），改由全市场 BM 分位门槛筛选便宜标的
     说明：ROE/流动比率 从 fina_indicator 取真实财报数据，修正此前
     daily_basic 无此列导致两条件被静默跳过的 bug。
+    stock_pool: None=沿用 config.SELECTION["stock_pool"]；"all"=全A股；或指数代码(如 000300.SH)
     """
     if top_n is None:
         top_n = get_top_n()
-    try:
-        from config import SELECTION as _SEL
-        pool = _SEL.get("stock_pool", "zz800")
-    except Exception:
-        pool = "zz800"
+    if stock_pool is not None:
+        pool = stock_pool          # "all" 或指数代码，_shared 经 STOCK_POOL_INDEX 映射（"all"→全A股）
+    else:
+        try:
+            from config import SELECTION as _SEL
+            pool = _SEL.get("stock_pool", "zz800")
+        except Exception:
+            pool = "zz800"
     from src.value_stock_selector import select_value_stocks as _shared
     return _shared(trade_date, top_n, pool, size_neutral=size_neutral,
-                   value_pct=value_pct, mode=mode)
+                   value_pct=value_pct, mode=mode,
+                   piotroski_gate=piotroski_gate, piotroski_distress=piotroski_distress,
+                   piotroski_blend=piotroski_blend)
 
 
 def select_dividend_low_vol_stocks(trade_date, top_n=None,
                                    leverage_filter=False, de_ratio_exclude_pct=5, icover_min=3,
                                    div_quality_filter=False, div_years_min=3,
                                    require_ocf_cover=True, div_growth_min=None,
-                                   macd_filter_mode="golden"):
+                                   macd_filter_mode="golden", stock_pool=None):
     """
     红利低波双重排序选股：
     1. 股票池成分股（从配置读取）
@@ -725,8 +812,8 @@ def select_dividend_low_vol_stocks(trade_date, top_n=None,
     """
     if top_n is None:
         top_n = get_top_n()
-    
-    index_code = get_stock_pool_index()
+
+    index_code = None if stock_pool == "all" else (stock_pool or get_stock_pool_index())
     zz_set = get_index_constituents(index_code)  # None 表示全A股
     conn = get_conn()
 
@@ -1601,14 +1688,16 @@ def select_by_method(method, trade_date, top_n=None, lookback_months=None,
                      leverage_filter=False, de_ratio_exclude_pct=5, icover_min=3,
                      div_quality_filter=False, div_years_min=3,
                      require_ocf_cover=True, div_growth_min=None,
-                     macd_filter_mode="golden"):
+                     macd_filter_mode="golden", stock_pool=None,
+                     piotroski_gate=None, piotroski_distress=False,
+                     piotroski_blend=None):
     """调度选股函数"""
     if top_n is None:
         top_n = get_top_n()
-    
+
     if method == "momentum":
         lb = lookback_months if lookback_months is not None else MOMENTUM_LOOKBACK
-        index_code = get_stock_pool_index()  # 从配置读取
+        index_code = None if stock_pool == "all" else (stock_pool or get_stock_pool_index())
         return select_momentum_stocks(trade_date, lookback_months=lb, top_n=top_n, index_code=index_code)
     elif method == "div_low_vol":
         return select_dividend_low_vol_stocks(trade_date, top_n,
@@ -1619,13 +1708,17 @@ def select_by_method(method, trade_date, top_n=None, lookback_months=None,
                                               div_years_min=div_years_min,
                                               require_ocf_cover=require_ocf_cover,
                                               div_growth_min=div_growth_min,
-                                              macd_filter_mode=macd_filter_mode)
+                                              macd_filter_mode=macd_filter_mode,
+                                              stock_pool=stock_pool)
     elif method == "div_growth":
         # 高股息+基本面成长（B站视频策略）：三筛 + 月调仓 + 涨停跑路日规则
         return select_dividend_growth_stocks(trade_date, top_n)
     else:  # value
         return select_stocks(trade_date, top_n, mode=value_mode,
-                             size_neutral=value_size_neutral, value_pct=value_pct)
+                             size_neutral=value_size_neutral, value_pct=value_pct,
+                             stock_pool=stock_pool,
+                             piotroski_gate=piotroski_gate, piotroski_distress=piotroski_distress,
+                             piotroski_blend=piotroski_blend)
 
 
 # ============================================================
@@ -1714,6 +1807,76 @@ def _print_annual_pnl(daily_vals, init_capital, benchmark_idx=None):
 #  主回测
 # ============================================================
 
+# ════════════════════════════════════════════════════════════════════
+# 频率自检 + 赢后过度自信教训卡
+# 借鉴：B站「雷阵雨的庭院」BV11cGc6yE8c《容易被忽视的盈利指标：交易频率》
+#       → 本平台 §5.21 收敛验证（日频高换手被摩擦吃光 ↔ §5.19）
+# ════════════════════════════════════════════════════════════════════
+
+def _annualized_freq(trades, daily_vals, trade_dates):
+    """从逐笔 trades 计算年化交易次数 / 年化换手率。
+    年化交易次数 = 交易笔数 / 年；年化换手率 = (累计买入名义额/平均权益)/年。
+    """
+    if not trades or len(daily_vals) < 2:
+        return None
+    try:
+        d0 = pd.to_datetime(daily_vals[0]["date"])
+        d1 = pd.to_datetime(daily_vals[-1]["date"])
+        years = (d1 - d0).days / 365.25
+    except Exception:
+        years = max(len(trade_dates) / 252, 1e-9)
+    if years <= 0:
+        years = 1e-9
+    trade_count = len(trades)
+    annual_trades = trade_count / years
+    bought = sum(t.get("price", 0) * t.get("shares", 0)
+                 for t in trades if t.get("action") == "BUY")
+    vals = [d["value"] for d in daily_vals]
+    avg_equity = sum(vals) / len(vals)
+    turnover_rate = (bought / avg_equity) if avg_equity > 0 else 0.0
+    annual_turnover = turnover_rate / years
+    return {"years": years, "trade_count": trade_count,
+            "annual_trades": annual_trades, "turnover_rate": turnover_rate,
+            "annual_turnover": annual_turnover}
+
+
+def _freq_selfcheck(trades, daily_vals, trade_dates, key):
+    """频率自检：打印年化换手率/交易次数栏；年换手偏离自身历史 2σ 即标警报。
+    key: 策略签名（如 'value_monthly'），跨运行持久化基线。"""
+    f = _annualized_freq(trades, daily_vals, trade_dates)
+    if f is None:
+        return
+    print(f"  年化交易次数：{f['annual_trades']:.1f} 次/年 ｜ 年化换手率：{f['annual_turnover']:.2f}x")
+    try:
+        _bp = "data/results/_turnover_baseline.json"
+        os.makedirs(os.path.dirname(_bp), exist_ok=True)
+        hist = {}
+        if os.path.exists(_bp):
+            with open(_bp, "r", encoding="utf-8") as _fh:
+                hist = json.load(_fh)
+        samples = hist.get(key, [])
+        if len(samples) >= 3:
+            m = sum(samples) / len(samples)
+            sd = (sum((x - m) ** 2 for x in samples) / len(samples)) ** 0.5
+            if sd > 0 and abs(f["annual_turnover"] - m) > 2 * sd:
+                print(f"  ⚠️ 情绪/过拟合警报：年换手 {f['annual_turnover']:.2f}x "
+                      f"偏离自身历史均值 {m:.2f}x 超 2σ（样本{len(samples)}次）")
+        samples.append(round(f["annual_turnover"], 4))
+        hist[key] = samples[-50:]
+        with open(_bp, "w", encoding="utf-8") as _fh:
+            json.dump(hist, _fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # 基线不可写则跳过警报，不阻断主流程
+
+
+def _win_streak_lesson_card():
+    """风控教训卡（借鉴 §5.21 / 雷阵雨 BV11cGc6yE8c）：平台仅 dd-stop 输后降级，
+    缺赢后过度自信防护——连胜后风险偏好非理性上升→仓位/频率放大→一次回吐。"""
+    print(f"  ── 风控教训卡·连胜后降频/降仓（§5.21）──")
+    print(f"  平台当前仅 dd-stop（输后降级）。连胜后过度自信易放大仓位/频率，一次回吐利润。")
+    print(f"  建议：近 N 笔连胜后下期仓位×0.5（对称于 dd-stop），待 A/B 验证（暂未接仓位计算）。")
+
+
 def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selection_method="value",
                  select_only=False, value_mode="pobreak", value_size_neutral=False, value_pct=None,
                  stop_loss_pct=None, var_stop=False, atr_mult=2.0, atr_cooling=5,
@@ -1721,7 +1884,13 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                  div_quality_filter=False, div_years_min=3,
                  require_ocf_cover=True, div_growth_min=None,
                  macd_filter_mode=None,
-                 interrupt_start=None, interrupt_months=0, interrupt_pct=0.0):
+                 interrupt_start=None, interrupt_months=0, interrupt_pct=0.0,
+                 stock_pool=None,
+                 consolidation_filter=False, con_win=20, con_lookback=120, con_th=0.25,
+                 piotroski_gate=None, piotroski_distress=False,
+                 piotroski_blend=None,
+                 chanlun_buy_gate=False,
+                 rebalance_freq_months=1):
     # 止损：默认沿用模块常量 STOP_LOSS(15%) 以保持价值/红利低波既有行为；
     # 因子类策略月度调仓即退出，传 0 关闭个股止损。
     if stop_loss_pct is None:
@@ -1732,8 +1901,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     if top_n is None:
         top_n = get_top_n()
 
-    # 获取股票池显示名称
-    _pool_idx = get_stock_pool_index()
+    # 获取股票池显示名称（--stock-pool 优先，None 则沿用 config）
+    _pool_idx = None if stock_pool == "all" else (stock_pool or get_stock_pool_index())
     if _pool_idx is None:
         _pool_name = "全A股"
     else:
@@ -1763,10 +1932,26 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
         _growth_txt = f"≥{div_growth_min*100:.1f}%" if div_growth_min is not None else "不启用"
         print(f"  红利质量：连续分红≥{div_years_min if div_years_min > 0 else '不限制'}年 | 经营现金流覆盖分红={'是' if require_ocf_cover else '否'} | 分红增长CAGR{_growth_txt}")
     print(f"  MACD信号模式：{macd_filter_mode or 'golden'}（golden=旧金叉死叉 | regime=金叉须指数>MA200且非盘整；不指定则红利低波默认 golden）")
-    print(f"  MACD死叉：减仓{BEAR_REDUCE*100:.0f}%（不清仓），金叉买回\n")
+    print(f"  中枢回避过滤(--consolidation-filter)：{'开(剔除中枢期候选·win=%d/look=%d/th=%.2f)' % (con_win, con_lookback, con_th) if consolidation_filter else '关（对照基线）'}")
+    if consolidation_filter:
+        print(f"  ⚠️ OOS证伪·仅诊断：真实样本外2015-2019该过滤把价值策略+20.89%→-17.72%（跑输基准-26pp），不当alpha使用(见docs/consolidation_filter_oos_report.md)")
+    print(f"  MACD死叉：减仓{BEAR_REDUCE*100:.0f}%（不清仓），金叉买回")
+    if piotroski_gate is not None or piotroski_distress:
+        _pm = ("剔除F<=2困境股(宽松)" if piotroski_distress else f"仅保留F>={piotroski_gate}(严格)")
+        print(f"  Piotroski质量门槛(--piotroski-gate): {_pm}\n")
+    if piotroski_blend is not None:
+        print(f"  Piotroski连续加权(--piotroski-blend): w={piotroski_blend:.2f}（价值rank与F-score rank混合重排，不空仓）\n")
+    if chanlun_buy_gate:
+        if ChanLunStream is None:
+            print(f"  [ERROR] 缠论买点门控需要 chan_lun_core_faithful.py（导入失败），无法启用")
+            return
+        print(f"  缠论买点门控(Mode A)：开启——月度选出新股后不立即买，等缠论买点(b1/b2/b3)确认后次日均价买入；卖出仍月度强制")
+        if selection_method == "div_low_vol":
+            print(f"  ⚠️ 提示：红利低波走 MACD 择时分支，缠论门控目前仅作用于「标准调仓分支」(价值/动量/高股息成长)；红利低波接入为后续 Mode C 范围")
 
     trade_dates = get_trade_dates(start_date, end_date)
-    rebalance_set = get_monthly_5th_trading_days(trade_dates)
+    # 调仓频率（task #54 规则再平衡反事实）：默认1=每月；3=每季/6=半年/12=每年/999≈买入持有
+    rebalance_set = set(get_monthly_5th_trading_days(trade_dates)[::max(1, int(rebalance_freq_months))])
 
     # 仅选股模式：执行第一次选股后退出，不回测
     if select_only:
@@ -1775,7 +1960,25 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
             return
         first_rb = sorted(rebalance_set)[0]
         selected_codes = select_stocks(first_rb, top_n, mode=value_mode,
-                                       size_neutral=value_size_neutral, value_pct=value_pct)
+                                       size_neutral=value_size_neutral, value_pct=value_pct,
+                                       stock_pool=stock_pool,
+                                       piotroski_gate=piotroski_gate, piotroski_distress=piotroski_distress,
+                                       piotroski_blend=piotroski_blend)
+        # select_stocks 返回 DataFrame → 归一化为 ts_code 列表
+        # （同时修正 select_only 既有的「DataFrame 迭代列名」潜在 bug）
+        if selected_codes is None:
+            selected_codes = []
+        elif hasattr(selected_codes, "empty"):  # pandas DataFrame/Series
+            _cols = getattr(selected_codes, "columns", [])
+            _col = "ts_code" if "ts_code" in _cols else (_cols[0] if len(_cols) else None)
+            selected_codes = selected_codes[_col].tolist() if _col else []
+        else:
+            selected_codes = list(selected_codes)
+        if consolidation_filter:
+            _before = len(selected_codes)
+            selected_codes = apply_consolidation_filter(selected_codes, first_rb, con_win, con_lookback, con_th)
+            if _before != len(selected_codes):
+                print(f"  🔻 中枢回避过滤：剔除 {_before - len(selected_codes)} 只(中枢期)，余 {len(selected_codes)} 只")
         print(f"\n{'='*60}")
         if selected_codes and len(selected_codes) > 0:
             print(f"  选股结果（共 {len(selected_codes)} 只）:")
@@ -1795,6 +1998,11 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     daily_vals   = []
     trades       = []
     pending_orders = []
+    # 缠论买点门控(Mode A)：ts_code -> {"stream","budget","reg_date","name"}
+    pending_entries = {}
+    cl_reg = 0      # 注册监控次数
+    cl_enter = 0    # 成功建仓次数
+    cl_expire = 0   # 候选剔除(未触发即过期)次数
 
     print(f"交易日总数：{len(trade_dates)}")
 
@@ -1806,6 +2014,40 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                 ts_code = order["ts_code"]
                 open_price = get_open_price(ts_code, td)
                 if open_price is None:
+                    remaining.append(order)
+                    continue
+                if order.get("type") == "buy":
+                    # 缠论买点建仓（Mode A）：以注册时预算均分建仓，资金不足则次日均价重试
+                    name = order.get("name") or get_stock_name(ts_code)
+                    avail = min(order.get("budget", open_price * 100), cash)
+                    max_shares = int(avail / open_price / 100) * 100
+                    if max_shares >= 100:
+                        cost = max_shares * open_price
+                        fee = calc_fee('buy', open_price, max_shares)
+                        if cost + fee <= cash:
+                            cash -= cost + fee
+                            positions[ts_code] = {"shares": max_shares, "buy_price": open_price}
+                            if var_stop:
+                                _atr0 = get_atr(ts_code, td, 14)
+                                if _atr0 and _atr0 > 0:
+                                    positions[ts_code].update({
+                                        "highest_close": open_price,
+                                        "atr_stop_price": open_price - atr_mult * _atr0,
+                                        "entry_idx": i,
+                                        "last_close": open_price,
+                                        "tr_window": [],
+                                    })
+                                else:
+                                    positions[ts_code]["atr_stop_price"] = None
+                            print(f"  ✅ 缠论买入 {ts_code}({name})：{max_shares}股 @ {open_price:.2f}")
+                            trades.append({
+                                "date": td, "action": "BUY", "code": ts_code, "name": name,
+                                "price": open_price, "shares": max_shares, "reason": "chanlun_buy"
+                            })
+                            cl_enter += 1
+                            pending_entries.pop(ts_code, None)
+                            continue
+                    # 资金不足：保留，次日均价重试
                     remaining.append(order)
                     continue
                 if ts_code not in positions:
@@ -1929,6 +2171,27 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                     del positions[code]
 
         # ═══ 步骤4：调仓日决策（仅调仓日执行）═══
+        # ═══ 步骤4.5：缠论买点门控监控（每交易日执行，含非调仓日）═══
+        #   对每只挂起候选喂入当日 bar，若确认买点则挂「次日均价买入」单（步骤1执行）。
+        #   当天刚注册的候选 seed 已含今日 bar，跳过以免重复喂入。
+        if chanlun_buy_gate and pending_entries:
+            for code in list(pending_entries.keys()):
+                pe = pending_entries[code]
+                if pe.get("reg_date") == td:
+                    continue
+                ohlc = _get_ohlc(code, td)
+                if ohlc is None:
+                    continue
+                h, l, c = ohlc
+                sig = pe["stream"].feed(h, l, c)
+                if sig is not None and sig[0] == "BUY":
+                    pending_orders.append({
+                        "type": "buy", "ts_code": code,
+                        "budget": pe["budget"], "reason": "chanlun_buy",
+                        "name": pe["name"]
+                    })
+                    print(f"  🟢 缠论买点 {code}({pe['name']})：{td} 确认买点，次日均价买入")
+
         if td not in rebalance_set:
             continue
 
@@ -1955,6 +2218,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                 stocks = select_by_method(selection_method, prev_td, top_n=top_n,
                                           value_mode=value_mode, value_size_neutral=value_size_neutral,
                                           value_pct=value_pct,
+                                          stock_pool=stock_pool,
                                           leverage_filter=leverage_filter,
                                           de_ratio_exclude_pct=de_ratio_exclude_pct,
                                           icover_min=icover_min,
@@ -1962,8 +2226,16 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                                           div_years_min=div_years_min,
                                           require_ocf_cover=require_ocf_cover,
                                           div_growth_min=div_growth_min,
-                                          macd_filter_mode=_mode)
+                                          macd_filter_mode=_mode,
+                                          piotroski_gate=piotroski_gate, piotroski_distress=piotroski_distress,
+                                          piotroski_blend=piotroski_blend)
                 new_codes = stocks['ts_code'].tolist() if not stocks.empty else []
+
+                if consolidation_filter:
+                    _before = len(new_codes)
+                    new_codes = apply_consolidation_filter(new_codes, prev_td, con_win, con_lookback, con_th)
+                    if _before != len(new_codes):
+                        print(f"  🔻 中枢回避过滤：剔除 {_before - len(new_codes)} 只(中枢期)，余 {len(new_codes)} 只")
 
                 # 买回之前减仓的股票（不超过当前持仓量，防止止损后超买）
                 for code in list(positions.keys()):
@@ -2011,12 +2283,39 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                             })
                             del positions[code]
 
-                # 买入新股票
+                # 待买入 = 新池中有、当前未持仓
                 new_to_buy = [c for c in new_codes if c not in positions]
-                if len(new_to_buy) > 0:
+
+                if chanlun_buy_gate:
+                    # Mode A：不立即买入，转为「缠论买点监控」挂起项
+                    # 1) 修剪：候选已不在新池的挂起项移除(并清其待执行买单，避免误建仓)
+                    for code in list(pending_entries.keys()):
+                        if code not in new_codes:
+                            pending_orders[:] = [o for o in pending_orders
+                                                 if not (o.get("type") == "buy" and o["ts_code"] == code)]
+                            pending_entries.pop(code, None)
+                            cl_expire += 1
+                    # 2) 注册新挂起项（预算 = 当前现金 / 新股数，与即时买入口径一致）
+                    if new_to_buy:
+                        budget = cash / len(new_to_buy)
+                        for c in new_to_buy:
+                            if c in pending_entries or c in positions:
+                                continue
+                            hist = get_ohlc_history(c, td)
+                            if not hist:
+                                print(f"  ⚠️ 缠论门控跳过 {c}：无历史OHLC")
+                                continue
+                            Hs = [r[1] for r in hist]; Ls = [r[2] for r in hist]; Cs = [r[3] for r in hist]
+                            s = ChanLunStream()
+                            s.seed(Hs, Ls, Cs)
+                            pending_entries[c] = {"stream": s, "budget": budget, "reg_date": td, "name": get_stock_name(c)}
+                            cl_reg += 1
+                            print(f"  ⏳ 缠论门控 {c}({get_stock_name(c)})：注册监控，等待买点(预算约{budget:.0f}元)")
+                        print(f"  [缠论买点门控] 本次注册 {len(new_to_buy)} 只待买，现金预算 {budget:.0f}/只；卖出仍按月度强制")
+                elif len(new_to_buy) > 0:
                     cash_per_stock = cash / len(new_to_buy)
                     skipped_stocks = []  # 记录因资金不足跳过的股票
-                    
+
                     for ts_code in new_to_buy:
                         name = get_stock_name(ts_code)
                         open_price = get_open_price(ts_code, td)
@@ -2024,7 +2323,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                             print(f"  ⚠️ 跳过 {ts_code}({name})：无开盘价数据")
                             skipped_stocks.append(f"{ts_code}({name})：无开盘价数据")
                             continue
-                        
+
                         max_shares = int(cash_per_stock / open_price / 100) * 100
                         if max_shares >= 100:
                             cost = max_shares * open_price
@@ -2057,7 +2356,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                             skip_msg = f"{ts_code}({name})：价格{open_price:.2f}元过高，分配资金{cash_per_stock:.2f}元不足买100股"
                             print(f"  ⚠️ 跳过 {skip_msg}")
                             skipped_stocks.append(skip_msg)
-                    
+
                     # 打印跳过汇总
                     if skipped_stocks:
                         print(f"\n  ⚠️ 资金不足汇总：本次调仓跳过 {len(skipped_stocks)} 只股票")
@@ -2110,8 +2409,17 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                                       div_quality_filter=div_quality_filter,
                                       div_years_min=div_years_min,
                                       require_ocf_cover=require_ocf_cover,
-                                      div_growth_min=div_growth_min)
+                                      div_growth_min=div_growth_min,
+                                      stock_pool=stock_pool,
+                                      piotroski_gate=piotroski_gate, piotroski_distress=piotroski_distress,
+                                      piotroski_blend=piotroski_blend)
             new_codes = stocks['ts_code'].tolist() if not stocks.empty else []
+
+            if consolidation_filter:
+                _before = len(new_codes)
+                new_codes = apply_consolidation_filter(new_codes, prev_td, con_win, con_lookback, con_th)
+                if _before != len(new_codes):
+                    print(f"  🔻 中枢回避过滤：剔除 {_before - len(new_codes)} 只(中枢期)，余 {len(new_codes)} 只")
 
             if not stocks.empty:
                 # 判断是否需要调仓
@@ -2145,10 +2453,37 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
 
                 # 买入新股票
                 new_to_buy = [c for c in new_codes if c not in positions]
-                if len(new_to_buy) > 0:
+
+                if chanlun_buy_gate:
+                    # Mode A：不立即买入，转为「缠论买点监控」挂起项
+                    # 1) 修剪：候选已不在新池的挂起项移除(并清其待执行买单，避免误建仓)
+                    for code in list(pending_entries.keys()):
+                        if code not in new_codes:
+                            pending_orders[:] = [o for o in pending_orders
+                                                 if not (o.get("type") == "buy" and o["ts_code"] == code)]
+                            pending_entries.pop(code, None)
+                            cl_expire += 1
+                    # 2) 注册新挂起项（预算 = 当前现金 / 新股数，与即时买入口径一致）
+                    if new_to_buy:
+                        budget = cash / len(new_to_buy)
+                        for c in new_to_buy:
+                            if c in pending_entries or c in positions:
+                                continue
+                            hist = get_ohlc_history(c, td)
+                            if not hist:
+                                print(f"  ⚠️ 缠论门控跳过 {c}：无历史OHLC")
+                                continue
+                            Hs = [r[1] for r in hist]; Ls = [r[2] for r in hist]; Cs = [r[3] for r in hist]
+                            s = ChanLunStream()
+                            s.seed(Hs, Ls, Cs)
+                            pending_entries[c] = {"stream": s, "budget": budget, "reg_date": td, "name": get_stock_name(c)}
+                            cl_reg += 1
+                            print(f"  ⏳ 缠论门控 {c}({get_stock_name(c)})：注册监控，等待买点(预算约{budget:.0f}元)")
+                        print(f"  [缠论买点门控] 本次注册 {len(new_to_buy)} 只待买，现金预算 {budget:.0f}/只；卖出仍按月度强制")
+                elif len(new_to_buy) > 0:
                     cash_per_stock = cash / len(new_to_buy)
                     skipped_stocks = []  # 记录因资金不足跳过的股票
-                    
+
                     for ts_code in new_to_buy:
                         name = get_stock_name(ts_code)
                         open_price = get_open_price(ts_code, td)
@@ -2156,7 +2491,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                             print(f"  ⚠️ 跳过 {ts_code}({name})：无开盘价数据")
                             skipped_stocks.append(f"{ts_code}({name})：无开盘价数据")
                             continue
-                        
+
                         max_shares = int(cash_per_stock / open_price / 100) * 100
                         if max_shares >= 100:
                             cost = max_shares * open_price
@@ -2189,7 +2524,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
                             skip_msg = f"{ts_code}({name})：价格{open_price:.2f}元过高，分配资金{cash_per_stock:.2f}元不足买100股"
                             print(f"  ⚠️ 跳过 {skip_msg}")
                             skipped_stocks.append(skip_msg)
-                    
+
                     # 打印跳过汇总
                     if skipped_stocks:
                         print(f"\n  ⚠️ 资金不足汇总：本次调仓跳过 {len(skipped_stocks)} 只股票")
@@ -2244,6 +2579,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"\n{'='*70}")
     print("  回测结果")
     print(f"{'='*70}")
+    _fp, _fp_detail = _data_fingerprint()
+    print(f"  数据指纹：{_fp}  (DB 更新会变；跨跑可比性判定用)")
     profit_amount = final_value - INIT_CAPITAL
     print(f"  初始资金：{INIT_CAPITAL:,.2f}")
     print(f"  最终资产：{final_value:,.2f}")
@@ -2279,10 +2616,24 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
         print(f"  VAR动态止损触发：{stop_count} 次（ATR追踪·动量月度同款）")
     print(f"  减仓次数：{reduce_count} 次")
 
-    # 动态基准指数对比
-    benchmark_idx = get_stock_pool_index()
-    if benchmark_idx is None:
-        benchmark_idx = "000906.SH"  # 全A股模式用中证800作为基准
+    # ── 缠论买点门控(Mode A) 统计 ──
+    if chanlun_buy_gate:
+        print(f"\n{'='*70}")
+        print(f"  缠论买点门控(Mode A) 统计")
+        print(f"{'='*70}")
+        print(f"  注册监控：{cl_reg} 只次（月度选出后转挂起）")
+        print(f"  成功建仓：{cl_enter} 只次（缠论买点确认后买入）")
+        print(f"  候选剔除过期：{cl_expire} 只次（未触发买点即被调仓剔除）")
+        print(f"  末日仍挂起：{len(pending_entries)} 只（全程未触发买点，现金未被占用）")
+
+    # ── 频率自检 + 赢后过度自信教训卡（§5.21 借鉴：雷阵雨 BV11cGc6yE8c）──
+    _freq_selfcheck(trades, daily_vals, trade_dates, f"{selection_method}_monthly_{('all' if _pool_idx is None else _pool_idx)}")
+    _win_streak_lesson_card()
+
+    # 动态基准指数对比（--stock-pool all 时 _pool_idx 为 None，回退中证800作参照）
+    # 池名(如 zz800/hs300)需映射为指数代码(000906.SH)才能查 index_daily；已是代码则原样返回
+    _pool_bench = _pool_idx if _pool_idx else "000906.SH"
+    benchmark_idx = STOCK_POOL_INDEX.get(_pool_bench, _pool_bench)
     benchmark_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx)
     
     conn = get_conn()
@@ -2311,14 +2662,36 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     # 保存结果
     csv_dir = "data/results/monthly_rebalance"
     os.makedirs(csv_dir, exist_ok=True)
-    csv_path = f"{csv_dir}/backtest_{start_date}_{end_date}.csv"
+    # 输出文件加 gate 后缀，避免 OFF / GATE / DISTRESS 各次运行互相覆盖（OFF 保持原名向后兼容）
+    if piotroski_distress:
+        _gate_tag = "_distress"
+    elif piotroski_gate is not None:
+        _gate_tag = f"_gate{piotroski_gate}"
+    elif piotroski_blend is not None:
+        _gate_tag = f"_blend{int(round(piotroski_blend*100))}"
+    else:
+        _gate_tag = ""
+    csv_path = f"{csv_dir}/backtest{_gate_tag}_{start_date}_{end_date}.csv"
     pd.DataFrame(daily_vals).to_csv(csv_path, index=False)
+    try:
+        with open(csv_path + ".fingerprint", "w", encoding="utf-8") as _fh:
+            _fh.write(f"fingerprint={_fp}\n{datetime.now().isoformat()}\n{_fp_detail}\n")
+    except Exception:
+        pass
     print(f"\n  结果已保存：{csv_path}")
+    print(f"  数据指纹已保存：{csv_path}.fingerprint")
 
     if annual_rows:
-        annual_path = f"{csv_dir}/annual_pnl_{start_date}_{end_date}.csv"
+        annual_path = f"{csv_dir}/annual_pnl{_gate_tag}_{start_date}_{end_date}.csv"
         pd.DataFrame(annual_rows).to_csv(annual_path, index=False)
         print(f"  年度盈亏明细已保存：{annual_path}")
+
+    # ── 成交明细 CSV 导出（含 reason 列，调试友好）──
+    if trades:
+        _trades_cols = ["date", "action", "code", "name", "price", "shares", "reason"]
+        _trades_path = f"{csv_dir}/trades{_gate_tag}_{selection_method}_{start_date}_{end_date}.csv"
+        pd.DataFrame(trades)[_trades_cols].to_csv(_trades_path, index=False, encoding="utf-8-sig")
+        print(f"  成交明细已保存：{_trades_path}（{len(trades)} 笔，含 reason 列）")
 
     return {
         "total_return": total_return,
@@ -2686,7 +3059,7 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         # ========== 调仓日：卖出旧仓 + 买入新仓（均按当日开盘价）==========
         if td in rebalance_set:
             # ===== 市场趋势过滤：指数<MA200时只卖不买 =====
-            benchmark_idx = stock_pool if stock_pool else "000906.SH"
+            benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
             market_ok = True
             if trend_filter_ma > 0:
                 market_ok = is_above_ma(benchmark_idx, td, period=trend_filter_ma, is_index=True)
@@ -2819,29 +3192,52 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
                                 hv_pct = f"{hold_var * 100:.2f}%" if hold_var is not None else "n/a"
                                 print(f"  🛡️ VaR缩放(var={var_control}%): 篮子日VaR损={bv_pct} → 持有期VaR={hv_pct} "
                                       f"→ 投入比例={invest_ratio * 100:.0f}%（预留现金{(1 - invest_ratio) * 100:.0f}%）")
-                            for ts_code in new_to_buy:
-                                open_price = get_open_price(ts_code, td)
-                                if open_price is None:
-                                    continue
-                                max_shares = int(cash_per_stock / open_price / 100) * 100
-                                if max_shares < 100:
-                                    continue
-                                cost = max_shares * open_price
-                                fee = calc_fee('buy', open_price, max_shares)
-                                if cost + fee <= cash:
-                                    cash -= cost + fee
-                                    positions[ts_code] = {
-                                        "shares": max_shares,
-                                        "buy_price": open_price,
-                                        "buy_idx": i,
-                                        "highest_close": open_price,
-                                        "stop_triggered": False,
-                                    }
-                                    print(f"  ✅ 买入 {ts_code}({get_name(ts_code)})：{max_shares}股 @ {open_price:.2f}")
-                                    trades.append({
-                                        "date": td, "action": "BUY", "code": ts_code, "name": get_name(ts_code),
-                                        "price": open_price, "shares": max_shares, "reason": f"{strategy}_rebalance"
-                                    })
+                            if chanlun_buy_gate:
+                                # Mode A：不立即买入，转缠论买点监控挂起项（预算=VaR缩放后每股预算）
+                                for code in list(pending_entries.keys()):
+                                    if code not in new_codes:
+                                        pending_orders[:] = [o for o in pending_orders
+                                                             if not (o.get("type") == "buy" and o["ts_code"] == code)]
+                                        pending_entries.pop(code, None)
+                                        cl_expire += 1
+                                for c in new_to_buy:
+                                    if c in pending_entries or c in positions:
+                                        continue
+                                    hist = get_ohlc_history(c, td)
+                                    if not hist:
+                                        print(f"  ⚠️ 缠论门控跳过 {c}：无历史OHLC")
+                                        continue
+                                    Hs = [r[1] for r in hist]; Ls = [r[2] for r in hist]; Cs = [r[3] for r in hist]
+                                    s = ChanLunStream()
+                                    s.seed(Hs, Ls, Cs)
+                                    pending_entries[c] = {"stream": s, "budget": cash_per_stock, "reg_date": td, "name": get_name(c)}
+                                    cl_reg += 1
+                                    print(f"  ⏳ 缠论门控 {c}({get_name(c)})：注册监控，等待买点(预算约{cash_per_stock:.0f}元)")
+                                print(f"  [缠论买点门控] 本次注册 {len(new_to_buy)} 只待买(VaR缩放预算 {cash_per_stock:.0f}/只)；卖出仍按月度强制")
+                            else:
+                                for ts_code in new_to_buy:
+                                    open_price = get_open_price(ts_code, td)
+                                    if open_price is None:
+                                        continue
+                                    max_shares = int(cash_per_stock / open_price / 100) * 100
+                                    if max_shares < 100:
+                                        continue
+                                    cost = max_shares * open_price
+                                    fee = calc_fee('buy', open_price, max_shares)
+                                    if cost + fee <= cash:
+                                        cash -= cost + fee
+                                        positions[ts_code] = {
+                                            "shares": max_shares,
+                                            "buy_price": open_price,
+                                            "buy_idx": i,
+                                            "highest_close": open_price,
+                                            "stop_triggered": False,
+                                        }
+                                        print(f"  ✅ 买入 {ts_code}({get_name(ts_code)})：{max_shares}股 @ {open_price:.2f}")
+                                        trades.append({
+                                            "date": td, "action": "BUY", "code": ts_code, "name": get_name(ts_code),
+                                            "price": open_price, "shares": max_shares, "reason": f"{strategy}_rebalance"
+                                        })
                     else:
                         # —— 目标权重再平衡（金字塔/倒金字塔/马丁格尔）——
                         from position_sizing import compute_target_weights, rebalance_to_targets
@@ -2915,7 +3311,7 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         sharpe = 0.0
 
     # === 基准指数 ===
-    benchmark_idx = stock_pool if stock_pool else "000906.SH"
+    benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
     conn = get_conn()
     b_start = pd.read_sql_query(
         "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date >= ? ORDER BY trade_date ASC LIMIT 1",
@@ -2961,6 +3357,9 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
         print(f"  胜率：{win_rate:.1f}%（{win_cnt}/{tot_cnt}）")
     if atr_stop_multiple > 0 or trailing_stop_pct > 0:
         print(f"  止损次数：{stop_count}")
+    # ── 频率自检 + 赢后过度自信教训卡（§5.21 借鉴）──
+    _freq_selfcheck(trades, daily_vals, trade_dates, f"{strategy}_{lookback_months}m_{freq_label}")
+    _win_streak_lesson_card()
     # 基准名称跟随实际 benchmark_idx，避免用中证800的标签套在创业板等其它指数上
     _bench_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx)
     print(f"  {_bench_name}涨幅：{idx_return:+.2f}%")
@@ -3246,7 +3645,7 @@ def run_reversal_backtest(start_date="20251201", end_date="20251231",
     freq_label = f"每{holding_days}日" if holding_days > 1 else "每日"
     filter_label = {"none":"无过滤", "ma20":"价格>MA20", "macd":"MACD金叉(regime)"}.get(market_filter, "无过滤")
     stop_label = f" | 止损-{stop_loss_pct:.0%}" if stop_loss_pct > 0 else ""
-    benchmark_idx = stock_pool if stock_pool else "000906.SH"
+    benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
 
     print("=" * 70)
     print(f"短期逆转效应回测（{lookback_days}日跌幅 × {freq_label}轮动 × {filter_label}{stop_label}）")
@@ -3531,6 +3930,9 @@ def run_reversal_backtest(start_date="20251201", end_date="20251231",
     if tot_cnt > 0:
         stxt += f" | 胜率 {win_rate:.1f}%"
     print(f"  最大回撤：{dd:.2f}% | 夏普比率：{sp:.2f} | 交易：{len(trades)}{stxt}")
+    # ── 频率自检 + 赢后过度自信教训卡（§5.21 借鉴）──
+    _freq_selfcheck(trades, daily_vals, trade_dates, "reversal_ddstop")
+    _win_streak_lesson_card()
     print(f"\n  逐日净值：")
     for dv in daily_vals:
         chg = (dv["value"] / INIT_CAPITAL - 1) * 100
@@ -3539,186 +3941,6 @@ def run_reversal_backtest(start_date="20251201", end_date="20251231",
 
     return {"total_return": tr, "annual_return": ar, "max_drawdown": dd, "var_control": var_control,
             "sharpe": sp, "trades": len(trades), "daily_values": daily_vals}
-
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="月度调仓回测")
-    parser.add_argument("start_date", nargs="?", default="20200102", help="开始日期 YYYYMMDD")
-    parser.add_argument("end_date", nargs="?", default="20251231", help="结束日期 YYYYMMDD")
-    parser.add_argument("--top-n", type=int, default=None, help="选股数量")
-    parser.add_argument("--selection-method", type=str, default="value",
-                        choices=["value", "div_low_vol", "momentum", "breakout", "reversal", "div_low_vol_quality"],
-                        help="选股策略(momentum=动量, breakout=突破赢家, div_low_vol_quality=红利低波质量复合·季度调仓)")
-    parser.add_argument("--dlvq-mode", type=str, default="official_compact",
-                        choices=["official", "official_improved", "official_compact"],
-                        help="div_low_vol_quality 模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)")
-    parser.add_argument("--select-only", action="store_true",
-                        help="只选股，不回测")
-    parser.add_argument("--lookback", type=int, default=6,
-                        choices=[3, 6, 12], help="动量回看月数（仅 momentum 模式）")
-    parser.add_argument("--pre-years", type=int, default=3,
-                        help="突破赢家突破回望年数（仅 breakout 模式，默认3）")
-    parser.add_argument("--breakout-L", type=int, default=60,
-                        help="突破赢家突破窗口L日（仅 breakout 模式，默认60）")
-    parser.add_argument("--breakout-vol", type=float, default=1.5,
-                        help="突破赢家量能倍数（仅 breakout 模式，默认1.5）")
-    parser.add_argument("--compare", action="store_true",
-                        help="对比模式：依次跑3/6/12个月动量回测")
-    parser.add_argument("--stock-pool", type=str, default=None,
-                        help="股票池指数代码（如 000300.SH），默认全A股")
-    parser.add_argument("--rebalance-freq", type=int, default=1,
-                        choices=[1, 3], help="调仓频率月数（1=每月，3=每季度，仅 momentum 模式）")
-    parser.add_argument("--atr-stop", type=float, default=0,
-                        help="ATR止损倍数（0=不启用，建议2~3，与--trailing-stop互斥，仅 momentum 模式）")
-    parser.add_argument("--trailing-stop", type=float, default=0,
-                        help="固定比例trailing stop（0=不启用，如0.15=15%%，与--atr-stop互斥，仅 momentum 模式）")
-    parser.add_argument("--atr-cooling", type=int, default=0,
-                        help="买入后冷静期交易日数（期内不触发止损，仅 momentum 模式）")
-    parser.add_argument("--skip-recent", type=int, default=1,
-                        choices=[0, 1, 2], help="跳过最近N个月（默认1，避免短期反转，仅 momentum 模式）")
-    parser.add_argument("--trend-filter", type=int, default=0,
-                        help="市场趋势过滤MA周期（0=不启用，200=指数<200日MA时空仓，仅 momentum 模式）")
-    parser.add_argument("--reversal-lookback", type=int, default=5,
-                        help="逆转策略回看天数（仅 reversal 模式，默认5）")
-    parser.add_argument("--reversal-hold", type=int, default=1,
-                        help="逆转策略持有天数（仅 reversal 模式，默认1=每日轮动）")
-    parser.add_argument("--reversal-stop", type=float, default=0,
-                        help="逆转策略个股止损比例（0=不启用，0.08=8%%，仅 reversal 模式）")
-    parser.add_argument("--market-filter", type=str, default="none",
-                        choices=["none", "ma20", "macd"], help="市场趋势过滤（仅 reversal 模式）")
-    parser.add_argument("--macd-filter", type=str, default=None,
-                        choices=["golden", "regime"],
-                        help="MACD信号模式：golden=旧金叉死叉当按钮 | regime=金叉须叠加指数>MA200且非盘整(语境感知)。不指定则按策略默认：逆转=regime，红利低波=golden")
-    parser.add_argument("--var-control", type=int, default=0, choices=[0, 90, 95, 99],
-                        help="VaR仓位缩放置信水平: 0=关闭 | 90/95/99=启用（仅 reversal 模式）")
-    parser.add_argument("--var-maxdd", type=float, default=15.0,
-                        help="目标最大回撤上限(%%) ，反解每期风险预算（仅 reversal 模式，默认15）")
-    parser.add_argument("--var-n", type=int, default=3,
-                        help="连续下跌周期数 N（反转类=3），分摊回撤预算（仅 reversal 模式，默认3）")
-    parser.add_argument("--value-area", type=int, default=0,
-                        help="价值区过滤回看天数: 0=关闭 | >0=启用(对动量/反转生效，默认0)")
-    parser.add_argument("--va-pct", type=float, default=70.0,
-                        help="价值区覆盖成交量比例(%%)，默认70")
-    parser.add_argument("--sizing", type=str, default="equal",
-                        choices=["equal", "pyramid", "inverted", "martingale"],
-                        help="仓位方案(动量模式): equal=等权基线 | pyramid=正金字塔(赢家加注) "
-                             "| inverted=倒金字塔(越涨越加) | martingale=马丁格尔(越亏越补,单票上限防爆仓)")
-    parser.add_argument("--sizing-alpha", type=float, default=0.5,
-                        help="pyramid 赢家倾斜强度(默认0.5)")
-    parser.add_argument("--sizing-gamma", type=float, default=1.0,
-                        help="inverted 赢家倾斜强度(默认1.0)")
-    parser.add_argument("--sizing-beta", type=float, default=0.5,
-                        help="martingale 输家倾斜强度(默认0.5)")
-    parser.add_argument("--sizing-max-w", type=float, default=2.0,
-                        help="martingale 单票权重上限 = 此值 × 等权(默认2.0, 防爆仓)")
-    parser.add_argument("--fakeout-reclaim", action="store_true", default=False,
-                        help="反转优先'扫止损→快速收回'标的（仅 reversal 模式）")
-    parser.add_argument("--interrupt-start", type=str, default=None,
-                        help="中断模拟起点(YYYYMM)，配合--interrupt-pct使用")
-    parser.add_argument("--interrupt-months", type=int, default=0,
-                        help="中断模拟：撤出资金空仓月数（默认0=不模拟）")
-    parser.add_argument("--interrupt-pct", type=float, default=0.0,
-                        help="中断模拟：撤出资金比例(0~1，如0.5=撤一半)，默认0=不模拟")
-    args = parser.parse_args()
-
-    if args.selection_method == "momentum":
-        if args.compare:
-            # 对比模式：跑3/6/12三个周期
-            print(f"动量效应轮动策略对比回测")
-            print(f"{'=' * 60}")
-            compare_momentum_periods(
-                start_date=args.start_date,
-                end_date=args.end_date,
-                top_n=args.top_n if args.top_n is not None else MOMENTUM_TOP_N,
-                stock_pool=args.stock_pool,
-            )
-        else:
-            # 单次动量回测
-            top_n = args.top_n if args.top_n is not None else MOMENTUM_TOP_N
-            run_momentum_backtest(
-                start_date=args.start_date,
-                end_date=args.end_date,
-                top_n=top_n,
-                lookback_months=args.lookback,
-                stock_pool=args.stock_pool,
-                rebalance_freq_months=args.rebalance_freq,
-                atr_stop_multiple=args.atr_stop,
-                atr_cooling_days=args.atr_cooling,
-                trailing_stop_pct=args.trailing_stop,
-                skip_recent_months=args.skip_recent,
-                trend_filter_ma=args.trend_filter,
-                value_area=args.value_area,
-                va_pct=args.va_pct,
-                sizing=args.sizing,
-                sizing_alpha=args.sizing_alpha,
-                sizing_gamma=args.sizing_gamma,
-                sizing_beta=args.sizing_beta,
-                sizing_max_w_ratio=args.sizing_max_w,
-            )
-    elif args.selection_method == "breakout":
-        # 突破赢家月度轮动（复用动量引擎：sizing/止损/VaR/趋势过滤）
-        # 默认15只（已验证口径：突破赢家选法 top_n=10~15 精选才有效），用户显式--top-n则尊重
-        top_n = args.top_n if args.top_n is not None else 15
-        run_momentum_backtest(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            top_n=top_n,
-            stock_pool=args.stock_pool,
-            rebalance_freq_months=args.rebalance_freq,
-            atr_stop_multiple=args.atr_stop,
-            atr_cooling_days=args.atr_cooling,
-            trailing_stop_pct=args.trailing_stop,
-            skip_recent_months=args.skip_recent,
-            trend_filter_ma=args.trend_filter,
-            value_area=args.value_area,
-            va_pct=args.va_pct,
-            sizing=args.sizing,
-            sizing_alpha=args.sizing_alpha,
-            sizing_gamma=args.sizing_gamma,
-            sizing_beta=args.sizing_beta,
-            sizing_max_w_ratio=args.sizing_max_w,
-            strategy="breakout",
-            pre_years=args.pre_years,
-            breakout_L=args.breakout_L,
-            breakout_vol=args.breakout_vol,
-        )
-    elif args.selection_method == "reversal":
-        # 短期逆转策略
-        print(f"短期逆转效应回测")
-        print(f"{'=' * 60}")
-        run_reversal_backtest(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            lookback_days=args.reversal_lookback,
-            top_n=args.top_n if args.top_n is not None else 5,
-            stock_pool=args.stock_pool,
-            holding_days=args.reversal_hold,
-            market_filter=args.market_filter,
-            macd_filter_mode=args.macd_filter,
-            stop_loss_pct=args.reversal_stop,
-            var_control=args.var_control,
-            var_maxdd=args.var_maxdd,
-            var_n=args.var_n,
-            value_area=args.value_area,
-            va_pct=args.va_pct,
-            fakeout_reclaim=args.fakeout_reclaim,
-        )
-    elif args.selection_method == "div_low_vol_quality":
-        # 红利低波「质量复合」策略：官方编制法实战三档（季度调仓）
-        import run_dividend_low_vol_quality_bt as dlq
-        dlq.START = args.start_date
-        dlq.END = args.end_date
-        _dlq_mode = args.dlvq_mode
-        print(f"红利低波质量复合【季度调仓】回测：{args.start_date} ~ {args.end_date}")
-        print(f"  模式: {_dlq_mode}（官方编制法930955口径·季频/股息率加权）")
-        dlq.run_official_backtest(_dlq_mode)
-    else:
-        print(f"回测周期：{args.start_date} ~ {args.end_date}")
-        print(f"选股策略：{args.selection_method}")
-        run_backtest(args.start_date, args.end_date, top_n=args.top_n, selection_method=args.selection_method, select_only=args.select_only,
-                     interrupt_start=args.interrupt_start, interrupt_months=args.interrupt_months, interrupt_pct=args.interrupt_pct,
-                     macd_filter_mode=args.macd_filter)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -3818,3 +4040,211 @@ def compute_reality_discounts(daily_vals, init_capital,
                 lost / final_value * 100) if final_value > 0 else 0.0
 
     return out
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="月度调仓回测")
+    parser.add_argument("start_date", nargs="?", default="20200102", help="开始日期 YYYYMMDD")
+    parser.add_argument("end_date", nargs="?", default="20251231", help="结束日期 YYYYMMDD")
+    parser.add_argument("--top-n", type=int, default=None, help="选股数量")
+    parser.add_argument("--selection-method", type=str, default="value",
+                        choices=["value", "div_low_vol", "momentum", "breakout", "reversal", "div_low_vol_quality"],
+                        help="选股策略(momentum=动量, breakout=突破赢家, div_low_vol_quality=红利低波质量复合·季度调仓)")
+    parser.add_argument("--dlvq-mode", type=str, default="official_compact",
+                        choices=["official", "official_improved", "official_compact"],
+                        help="div_low_vol_quality 模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)")
+    parser.add_argument("--select-only", action="store_true",
+                        help="只选股，不回测")
+    parser.add_argument("--lookback", type=int, default=6,
+                        choices=[3, 6, 12], help="动量回看月数（仅 momentum 模式）")
+    parser.add_argument("--pre-years", type=int, default=3,
+                        help="突破赢家突破回望年数（仅 breakout 模式，默认3）")
+    parser.add_argument("--breakout-L", type=int, default=60,
+                        help="突破赢家突破窗口L日（仅 breakout 模式，默认60）")
+    parser.add_argument("--breakout-vol", type=float, default=1.5,
+                        help="突破赢家量能倍数（仅 breakout 模式，默认1.5）")
+    parser.add_argument("--compare", action="store_true",
+                        help="对比模式：依次跑3/6/12个月动量回测")
+    parser.add_argument("--stock-pool", type=str, default=None,
+                        help="股票池指数代码（如 000300.SH），默认全A股")
+    parser.add_argument("--rebalance-freq", type=int, default=1,
+                        help="调仓频率月数（1=每月,3=每季,6=半年,12=每年,999≈买入持有；value/动量均生效）")
+    parser.add_argument("--atr-stop", type=float, default=0,
+                        help="ATR止损倍数（0=不启用，建议2~3，与--trailing-stop互斥，仅 momentum 模式）")
+    parser.add_argument("--trailing-stop", type=float, default=0,
+                        help="固定比例trailing stop（0=不启用，如0.15=15%%，与--atr-stop互斥，仅 momentum 模式）")
+    parser.add_argument("--atr-cooling", type=int, default=0,
+                        help="买入后冷静期交易日数（期内不触发止损，仅 momentum 模式）")
+    parser.add_argument("--skip-recent", type=int, default=1,
+                        choices=[0, 1, 2], help="跳过最近N个月（默认1，避免短期反转，仅 momentum 模式）")
+    parser.add_argument("--trend-filter", type=int, default=0,
+                        help="市场趋势过滤MA周期（0=不启用，200=指数<200日MA时空仓，仅 momentum 模式）")
+    parser.add_argument("--reversal-lookback", type=int, default=5,
+                        help="逆转策略回看天数（仅 reversal 模式，默认5）")
+    parser.add_argument("--reversal-hold", type=int, default=1,
+                        help="逆转策略持有天数（仅 reversal 模式，默认1=每日轮动）")
+    parser.add_argument("--reversal-stop", type=float, default=0,
+                        help="逆转策略个股止损比例（0=不启用，0.08=8%%，仅 reversal 模式）")
+    parser.add_argument("--market-filter", type=str, default="none",
+                        choices=["none", "ma20", "macd"], help="市场趋势过滤（仅 reversal 模式）")
+    parser.add_argument("--macd-filter", type=str, default=None,
+                        choices=["golden", "regime"],
+                        help="MACD信号模式：golden=旧金叉死叉当按钮 | regime=金叉须叠加指数>MA200且非盘整(语境感知)。不指定则按策略默认：逆转=regime，红利低波=golden")
+    parser.add_argument("--var-control", type=int, default=0, choices=[0, 90, 95, 99],
+                        help="VaR仓位缩放置信水平: 0=关闭 | 90/95/99=启用（仅 reversal 模式）")
+    parser.add_argument("--var-maxdd", type=float, default=15.0,
+                        help="目标最大回撤上限(%%) ，反解每期风险预算（仅 reversal 模式，默认15）")
+    parser.add_argument("--var-n", type=int, default=3,
+                        help="连续下跌周期数 N（反转类=3），分摊回撤预算（仅 reversal 模式，默认3）")
+    parser.add_argument("--value-area", type=int, default=0,
+                        help="价值区过滤回看天数: 0=关闭 | >0=启用(对动量/反转生效，默认0)")
+    parser.add_argument("--va-pct", type=float, default=70.0,
+                        help="价值区覆盖成交量比例(%%)，默认70")
+    parser.add_argument("--sizing", type=str, default="equal",
+                        choices=["equal", "pyramid", "inverted", "martingale"],
+                        help="仓位方案(动量模式): equal=等权基线 | pyramid=正金字塔(赢家加注) "
+                             "| inverted=倒金字塔(越涨越加) | martingale=马丁格尔(越亏越补,单票上限防爆仓)")
+    parser.add_argument("--sizing-alpha", type=float, default=0.5,
+                        help="pyramid 赢家倾斜强度(默认0.5)")
+    parser.add_argument("--sizing-gamma", type=float, default=1.0,
+                        help="inverted 赢家倾斜强度(默认1.0)")
+    parser.add_argument("--sizing-beta", type=float, default=0.5,
+                        help="martingale 输家倾斜强度(默认0.5)")
+    parser.add_argument("--sizing-max-w", type=float, default=2.0,
+                        help="martingale 单票权重上限 = 此值 × 等权(默认2.0, 防爆仓)")
+    parser.add_argument("--fakeout-reclaim", action="store_true", default=False,
+                        help="反转优先'扫止损→快速收回'标的（仅 reversal 模式）")
+    parser.add_argument("--interrupt-start", type=str, default=None,
+                        help="中断模拟起点(YYYYMM)，配合--interrupt-pct使用")
+    parser.add_argument("--interrupt-months", type=int, default=0,
+                        help="中断模拟：撤出资金空仓月数（默认0=不模拟）")
+    parser.add_argument("--interrupt-pct", type=float, default=0.0,
+                        help="中断模拟：撤出资金比例(0~1，如0.5=撤一半)，默认0=不模拟")
+    parser.add_argument("--consolidation-filter", action="store_true", default=False,
+                        help="【已证伪·仅诊断·默认关】缠论中枢回避过滤：剔除中枢/盘整期(布林带宽分位<th)候选股。OOS 2015-2019 证伪(价值+20.89%→-17.72%)，不作alpha、不进主策略默认开")
+    parser.add_argument("--con-win", type=int, default=20,
+                        help="中枢回避：布林带宽窗口(默认20)")
+    parser.add_argument("--con-lookback", type=int, default=120,
+                        help="中枢回避：带宽分位回望窗口(默认120)")
+    parser.add_argument("--con-th", type=float, default=0.25,
+                        help="中枢回避：带宽分位阈值，低于此值判为中枢期(默认0.25)")
+    parser.add_argument("--piotroski-gate", type=int, default=None,
+                        help="[step5已证伪·不采用] Piotroski F-score 质量门槛(关默认)：仅保留 F>=N 的价值候选(经典7/8)。"
+                             "作质量增强层叠加在价值初筛之后；与 --piotroski-distress 互斥")
+    parser.add_argument("--piotroski-distress", action="store_true", default=False,
+                        help="[step5已证伪·不采用] Piotroski 宽松门槛：仅剔除 F<=2 困境股(其余保留)。"
+                             "OOS 实证推荐(A股低F端没那么惨)，与 --piotroski-gate 互斥")
+    parser.add_argument("--piotroski-blend", type=float, default=None,
+                        help="[step5已证伪·不采用] Piotroski 连续加权 w∈[0,1]：价值rank与 F-score rank 混合重排(top_n)，"
+                             "不剔除候选(不空仓)。w=0≡纯价值(OFF)，w=1≡价值池内纯F-score排序。"
+                             "与 --piotroski-gate/--piotroski-distress 互斥理念")
+    parser.add_argument("--chanlun-buy-gate", action="store_true", default=False,
+                        help="缠论买点门控(Mode A)：月度选出新股后不立即买入，等缠论买点(b1/b2/b3)确认后"
+                             "次日均价买入；卖出仍按月度强制。复用 chan_lun_core_faithful 流式引擎(无未来函数)。"
+                             "仅作用于标准调仓分支(价值/动量/高股息成长)")
+    args = parser.parse_args()
+
+    if args.selection_method == "momentum":
+        if args.compare:
+            # 对比模式：跑3/6/12三个周期
+            print(f"动量效应轮动策略对比回测")
+            print(f"{'=' * 60}")
+            compare_momentum_periods(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                top_n=args.top_n if args.top_n is not None else MOMENTUM_TOP_N,
+                stock_pool=args.stock_pool,
+            )
+        else:
+            # 单次动量回测
+            top_n = args.top_n if args.top_n is not None else MOMENTUM_TOP_N
+            run_momentum_backtest(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                top_n=top_n,
+                lookback_months=args.lookback,
+                stock_pool=args.stock_pool,
+                rebalance_freq_months=args.rebalance_freq,
+                atr_stop_multiple=args.atr_stop,
+                atr_cooling_days=args.atr_cooling,
+                trailing_stop_pct=args.trailing_stop,
+                skip_recent_months=args.skip_recent,
+                trend_filter_ma=args.trend_filter,
+                value_area=args.value_area,
+                va_pct=args.va_pct,
+                sizing=args.sizing,
+                sizing_alpha=args.sizing_alpha,
+                sizing_gamma=args.sizing_gamma,
+                sizing_beta=args.sizing_beta,
+                sizing_max_w_ratio=args.sizing_max_w,
+            )
+    elif args.selection_method == "breakout":
+        # 突破赢家月度轮动（复用动量引擎：sizing/止损/VaR/趋势过滤）
+        # 默认15只（已验证口径：突破赢家选法 top_n=10~15 精选才有效），用户显式--top-n则尊重
+        top_n = args.top_n if args.top_n is not None else 15
+        run_momentum_backtest(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            top_n=top_n,
+            stock_pool=args.stock_pool,
+            rebalance_freq_months=args.rebalance_freq,
+            atr_stop_multiple=args.atr_stop,
+            atr_cooling_days=args.atr_cooling,
+            trailing_stop_pct=args.trailing_stop,
+            skip_recent_months=args.skip_recent,
+            trend_filter_ma=args.trend_filter,
+            value_area=args.value_area,
+            va_pct=args.va_pct,
+            sizing=args.sizing,
+            sizing_alpha=args.sizing_alpha,
+            sizing_gamma=args.sizing_gamma,
+            sizing_beta=args.sizing_beta,
+            sizing_max_w_ratio=args.sizing_max_w,
+            strategy="breakout",
+            pre_years=args.pre_years,
+            breakout_L=args.breakout_L,
+            breakout_vol=args.breakout_vol,
+        )
+    elif args.selection_method == "reversal":
+        # 短期逆转策略
+        print(f"短期逆转效应回测")
+        print(f"{'=' * 60}")
+        run_reversal_backtest(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            lookback_days=args.reversal_lookback,
+            top_n=args.top_n if args.top_n is not None else 5,
+            stock_pool=args.stock_pool,
+            holding_days=args.reversal_hold,
+            market_filter=args.market_filter,
+            macd_filter_mode=args.macd_filter,
+            stop_loss_pct=args.reversal_stop,
+            var_control=args.var_control,
+            var_maxdd=args.var_maxdd,
+            var_n=args.var_n,
+            value_area=args.value_area,
+            va_pct=args.va_pct,
+            fakeout_reclaim=args.fakeout_reclaim,
+        )
+    elif args.selection_method == "div_low_vol_quality":
+        # 红利低波「质量复合」策略：官方编制法实战三档（季度调仓）
+        import run_dividend_low_vol_quality_bt as dlq
+        dlq.START = args.start_date
+        dlq.END = args.end_date
+        _dlq_mode = args.dlvq_mode
+        print(f"红利低波质量复合【季度调仓】回测：{args.start_date} ~ {args.end_date}")
+        print(f"  模式: {_dlq_mode}（官方编制法930955口径·季频/股息率加权）")
+        dlq.run_official_backtest(_dlq_mode)
+    else:
+        print(f"回测周期：{args.start_date} ~ {args.end_date}")
+        print(f"选股策略：{args.selection_method}")
+        run_backtest(args.start_date, args.end_date, top_n=args.top_n, selection_method=args.selection_method, select_only=args.select_only,
+                     interrupt_start=args.interrupt_start, interrupt_months=args.interrupt_months, interrupt_pct=args.interrupt_pct,
+                     macd_filter_mode=args.macd_filter, stock_pool=args.stock_pool,
+                     consolidation_filter=args.consolidation_filter, con_win=args.con_win,
+                     con_lookback=args.con_lookback, con_th=args.con_th,
+                     piotroski_gate=args.piotroski_gate, piotroski_distress=args.piotroski_distress,
+                     piotroski_blend=args.piotroski_blend,
+                     chanlun_buy_gate=args.chanlun_buy_gate,
+                     rebalance_freq_months=args.rebalance_freq)
+
+

@@ -562,6 +562,19 @@ goto :mr_after
 set MR_ARG=--selection-method div_low_vol_quality --dlvq-mode official_compact
 echo.
 echo   已选择: 红利低波质量复合[季度调仓]
+echo.
+echo   红利通道仓位 overlay（000922通道位置→权益仓位，贵减仓/便宜满仓·已验证正向）:
+echo   [1] 平衡档[默认·rolling w756/k0.5·开启]
+echo   [2] 小账户档[rolling w504/k0.3·开启·卡玛0.40]
+echo   [3] 关闭[满仓基线·对照普通红利低波]
+echo   [4] 实盘前瞻版[--live-forward·今日重选+今日k]
+echo   [5] 历史买列表[--live·上期已选票]
+set DCO_SEL=
+set /p DCO_SEL=请选择 (1-5, 回车=1平衡档):
+if "%DCO_SEL%"=="2" set MR_ARG=%MR_ARG% --div-channel-window 504 --k-min 0.3
+if "%DCO_SEL%"=="3" set MR_ARG=%MR_ARG% --no-div-channel-overlay
+if "%DCO_SEL%"=="4" set MR_ARG=%MR_ARG% --live-forward
+if "%DCO_SEL%"=="5" set MR_ARG=%MR_ARG% --live
 goto :mr_after
 
 :mr_mom
