@@ -390,6 +390,11 @@ def main():
                     help="pobreak=破净价值(PB<1+ROE质量) | pure_bm=放宽破净·全市场BM前N%门槛")
     ap.add_argument("--downside-filter", action="store_true",
                     help="下跌通道风控筛：剔除仍处下跌通道(贴lows/在MA下/量未缩)的候选，降波动不增收益")
+    ap.add_argument("--portfolio-layer", default=None,
+                    help="组合层分散: 权重 equity,bond,gold 逗号分隔(如 0.7,0.15,0.15), "
+                         "把本策略日频NAV与国债511260+黄金518880做月度再平衡。默认None=不开启")
+    ap.add_argument("--layer-scheme", default="static", choices=["static", "invvol"],
+                    help="组合层权重方案: static=固定权重 | invvol=逆波动月度")
     args = ap.parse_args()
 
     backtest = ValueStrategyBacktest(
@@ -405,6 +410,19 @@ def main():
     )
 
     result = backtest.run_backtest(start_date=args.start, end_date=args.end)
+
+    # 组合层分散 (opt-in, 默认不开启; 不动现有选股/持仓逻辑)
+    if args.portfolio_layer:
+        from portfolio_layer import PortfolioLayer
+        wk = [float(x) for x in args.portfolio_layer.split(",")]
+        lowcorr = ("bond", "gold")
+        names = ["equity"] + list(lowcorr)
+        weights = {n: wk[i] for i, n in enumerate(names)}
+        layer = PortfolioLayer(
+            equity_csv=f"data/results/value_strategy/backtest_result_{args.start}_{args.end}.csv",
+            weights=weights, lowcorr=lowcorr, scheme=args.layer_scheme,
+            equity_col="portfolio_value")
+        layer.run().report()
 
     print("\n✓ 回测完成！")
 

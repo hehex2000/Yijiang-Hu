@@ -521,6 +521,7 @@ echo   [3] 动量效应追涨[动量选股]
 echo   [4] 红利低波质量复合[季度调仓]
 echo   [5] MACD择时[逐股DIF^>DEA·无KDJ·跟随全局股票池]
 echo   [6] 高股息+基本面成长[股息率前10%%+PE/PEG/ROE/增长五关·月调仓·涨停跑路]
+echo   [7] 价值选股+组合层分散[70%%权益+15%%国债+15%%黄金·月度再平衡]
 echo   [0] 返回主菜单
 echo.
 set MR_ARG=
@@ -532,7 +533,7 @@ set VAR_MDD=15
     set VA_PCT=70
     set VAR_SEL=
     set VA_SEL=
-    set /p MR_METHOD=请选择 (1-6, 0返回):
+    set /p MR_METHOD=请选择 (1-7, 0返回):
 
 if "%MR_METHOD%"=="0" goto :menu
 if "%MR_METHOD%"=="6" goto :mr_dg
@@ -540,6 +541,7 @@ if "%MR_METHOD%"=="2" goto :mr_div
 if "%MR_METHOD%"=="4" goto :mr_divq
 if "%MR_METHOD%"=="5" goto :macd_timing
 if "%MR_METHOD%"=="3" goto :mr_mom
+if "%MR_METHOD%"=="7" goto :mr_blended
 set MR_ARG=--selection-method value
 echo.
 echo   已选择: 价值选股
@@ -616,6 +618,39 @@ echo   配置:
 echo     回测区间: %BACKTEST_START% ~ %BACKTEST_END%
 echo.
 venv_ml\Scripts\python.exe run_backtest.py --source monthly_rebalance --start-date %BACKTEST_START% --end-date %BACKTEST_END% --top-n %TOP_N% --capital %TOTAL_CAPITAL% %MR_ARG% %VB_ARGS%
+echo.
+echo   [返回主菜单]
+pause
+goto :menu
+
+:mr_blended
+cls
+echo.
+echo ================
+echo   价值选股 + 组合层分散 [70%%权益 + 15%%国债 + 15%%黄金]
+echo ================
+echo.
+echo   底层: run_value_backtest.py 价值选股(破净+ROE质量, 月度第5交易日调仓)
+echo   组合层: 把价值选股日频NAV与 国债ETF 511260 + 黄金ETF 518880 做月度再平衡
+echo   作用: 降波动/降回撤/提夏普 (机制真, 收益溢价依赖债金双牛窗口, 非免费午餐)
+echo   区间: %BACKTEST_START% ~ %BACKTEST_END%
+echo.
+echo   权重方案:
+echo   [1] static 固定 0.7/0.15/0.15 (推荐·已验证价值选股夏普 0.31->0.54, MDD -36.8%%->-26.4%%)
+echo   [2] invvol 逆波动月度 (债金顶满, 2018-2025窗口虚高, 谨慎)
+echo.
+set PL_SCHEME=static
+set /p PL_SCHEME_SEL=请选择 (1/2, 回车=1 static):
+if "%PL_SCHEME_SEL%"=="2" set PL_SCHEME=invvol
+echo.
+set PL_POOL=zz800
+if "%STOCK_POOL%"=="hs300" set PL_POOL=hs300
+if "%STOCK_POOL%"=="zz500" set PL_POOL=zz500
+if "%STOCK_POOL%"=="zz1000" set PL_POOL=zz1000
+if "%STOCK_POOL%"=="all" set PL_POOL=zz800
+echo.
+echo   正在运行(池=%PL_POOL% 权益70%%/国债15%%/黄金15%%/方案=%PL_SCHEME%)...
+"venv_ml\Scripts\python.exe" run_value_backtest.py --start %BACKTEST_START% --end %BACKTEST_END% --initial-cash %TOTAL_CAPITAL% --top-n %TOP_N% --pool %PL_POOL% --portfolio-layer 0.7,0.15,0.15 --layer-scheme %PL_SCHEME%
 echo.
 echo   [返回主菜单]
 pause
