@@ -1,3 +1,7 @@
+> ❌ **INVALIDATED · 无效策略归档**：本文件对应量化刘不牛「173倍」ETF 轮动 (BV1BqMX6TEx2)，
+> 经严谨回测 + 月度调仓 bug 修复后已彻底证伪（关止损 -64.1%、池子 0.0%ile condemned）。
+> 保留作证据归档，不作为任何实盘/复现参考。详见 `etf_rebalance_bugfix_reverify.md`。
+
 > ⚠️ **本报告数字已失效**：基于修复前的错误月度调仓日程（每年仅 2 个决策日）。修正后结论**反转**：刘不牛原10只由"洗清(91.5%ile)"变为"condemned(0.0%ile)"；V6原4只仍红(98.5%ile)。详见 `etf_rebalance_bugfix_reverify.md` 第4节。
 >
 # 阶段3：嵌套 Walk-Forward 选池（池子过拟合 / selection bias 检验）

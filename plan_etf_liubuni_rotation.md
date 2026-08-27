@@ -1,3 +1,7 @@
+> ❌ **INVALIDATED · 无效策略归档**：本文件对应量化刘不牛「173倍」ETF 轮动 (BV1BqMX6TEx2)，
+> 经严谨回测 + 月度调仓 bug 修复后已彻底证伪（关止损 -64.1%、池子 0.0%ile condemned）。
+> 保留作证据归档，不作为任何实盘/复现参考。详见 `etf_rebalance_bugfix_reverify.md`。
+
 # 计划：ETF 轮动策略（量化刘不牛「173倍」）复现 + 反过拟合验证
 
 > 来源视频：BV1BqMX6TEx2《从堆砌到精简：我如何把 ETF 轮动策略做到 173 倍收益》

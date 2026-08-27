@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os
+import math
 import sys
 import json
 import hashlib
@@ -81,6 +82,7 @@ STAMP_DUTY_CUT_DATE  = 20230828
 _CTX_TRADE_DATE = None
 _CTX_MISS_COUNT = 0          # 无任何日期信息的计费次数（审计用）
 _CTX_WARNED = False
+_CTX_TS_CODE = None          # 当前成交股票（滑点冲击模型按个股流动性估算）
 
 
 def set_trade_date_ctx(trade_date):
@@ -94,12 +96,24 @@ def get_trade_date_ctx():
     return _CTX_TRADE_DATE
 
 
+def set_ts_code_ctx(ts_code):
+    """登记当前成交股票（滑点冲击模型读取个股流动性用）。"""
+    global _CTX_TS_CODE
+    if ts_code is not None:
+        _CTX_TS_CODE = ts_code
+
+
+def get_ts_code_ctx():
+    return _CTX_TS_CODE
+
+
 def reset_fee_ctx():
     """回测开始前清空上下文与审计计数。"""
-    global _CTX_TRADE_DATE, _CTX_MISS_COUNT, _CTX_WARNED
+    global _CTX_TRADE_DATE, _CTX_MISS_COUNT, _CTX_WARNED, _CTX_TS_CODE
     _CTX_TRADE_DATE = None
     _CTX_MISS_COUNT = 0
     _CTX_WARNED = False
+    _CTX_TS_CODE = None
 
 
 def fee_ctx_audit():
@@ -208,6 +222,20 @@ def get_stock_pool_index():
 VOL_WINDOW = 120  # 波动率计算窗口（交易日）
 SLIPPAGE_RATE = 0.001  # 滑点率（0.1%，模拟实盘买卖价差和冲击成本）
 
+# ── 滑点模型升级：平方根冲击（日线流动性感知）──
+# 默认关闭（USE_SQRT_IMPACT=False）保持历史 flat 0.1% 行为；
+# 置环境变量 MFS_SQRT_IMPACT=1 开启，与 flat 做单变量 A/B 隔离。
+# 模型：impact_frac = k · σ_daily · sqrt(Q / ADV)
+#   σ_daily = 个股前 lookback 日收盘收益率标准差（日线算）
+#   ADV     = 同期日均成交额（元，daily.amount 千元×1000）
+#   Q       = 本笔成交金额（元）→ Q/ADV 即参与率
+# 小盘低流动股(σ大、ADV小)冲击自动放大，大盘股收缩——把"盘口会消失、实际
+# 吃到比看到的差"近似收进滑点模型。sqrt 上限 SQRT_IMPACT_CAP 防极端小票爆表。
+USE_SQRT_IMPACT = os.environ.get("MFS_SQRT_IMPACT", "0") == "1"
+SQRT_IMPACT_K   = float(os.environ.get("MFS_SQRT_IMPACT_K", "1.0"))    # 冲击系数
+SQRT_IMPACT_CAP = float(os.environ.get("MFS_SQRT_IMPACT_CAP", "0.10")) # 冲击比例安全上限
+SQRT_IMPACT_LB  = int(os.environ.get("MFS_SQRT_IMPACT_LB", "60"))      # 流动性估计窗口(交易日)
+
 
 def get_conn():
     # timeout=30：延长锁等待（默认仅5s），消除长窗口回测中
@@ -255,16 +283,16 @@ def get_stock_name(ts_code):
     return ts_code
 
 
-def calc_fee(buy_or_sell, price, shares, trade_date=None):
+def calc_fee(buy_or_sell, price, shares, trade_date=None, ts_code=None):
     """计算含滑点的总交易成本
 
-    印花税按成交日历史分段：2023-08-27 及以前 0.1%，2023-08-28 起 0.05%。
-    trade_date 不传时自动回退到成交日上下文（由 get_price/get_open_price 登记），
-    因此全平台既有策略无需改调用即可用上真实税率。
+    滑点：默认 flat SLIPPAGE_RATE(0.1%)；开启平方根冲击模型(USE_SQRT_IMPACT)
+    后按个股流动性估算（k·σ·√(Q/ADV)）。ts_code 可显式传入，否则回退到
+    取价函数登记的个股上下文。全平台既有策略无需改调用即自动生效。
     """
     amount = price * shares
     commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
-    slippage = amount * SLIPPAGE_RATE  # 买/卖均含滑点
+    slippage = _compute_slippage(amount, trade_date, ts_code)
     if buy_or_sell == 'buy':
         return commission + slippage
     else:
@@ -272,17 +300,96 @@ def calc_fee(buy_or_sell, price, shares, trade_date=None):
         return commission + stamp_duty + slippage
 
 
-def calc_fee_breakdown(buy_or_sell, price, shares, trade_date=None):
+def calc_fee_breakdown(buy_or_sell, price, shares, trade_date=None, ts_code=None):
     """同 calc_fee，但返回分项 dict，供成本审计报告使用。
 
     return: {"commission":x, "slippage":x, "stamp_duty":x, "total":x}
     """
     amount = price * shares
     commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
-    slippage = amount * SLIPPAGE_RATE
+    slippage = _compute_slippage(amount, trade_date, ts_code)
     duty = amount * stamp_duty_rate(trade_date) if buy_or_sell != 'buy' else 0.0
     return {"commission": commission, "slippage": slippage,
             "stamp_duty": duty, "total": commission + slippage + duty}
+
+
+# ── 滑点模型升级：平方根冲击（日线流动性感知）────────────
+_LIQ_CACHE = {}   # (ts_code, trade_date, lookback) -> (sigma, adv_yuan)
+
+
+def _compute_slippage(amount, trade_date=None, ts_code=None):
+    """返回滑点金额。默认 flat；开启平方根冲击且个股数据齐备时按流动性感知。"""
+    if USE_SQRT_IMPACT:
+        tc = trade_date if trade_date is not None else _CTX_TRADE_DATE
+        code = ts_code if ts_code is not None else _CTX_TS_CODE
+        if code is not None and tc is not None:
+            frac, adv, sigma = sqrt_impact_slippage(amount, code, tc)
+            if frac is not None:
+                return amount * frac
+    return amount * SLIPPAGE_RATE
+
+
+def estimate_daily_liquidity(ts_code, trade_date, lookback=SQRT_IMPACT_LB):
+    """返回 (sigma_daily, adv_yuan)；数据不足返回 (None, None)。
+
+    sigma_daily = trade_date 之前 lookback 日收盘收益率标准差(百分比)
+    adv_yuan    = 同期日均成交额（元；daily.amount 千元 ×1000）
+    用 trade_date < ? 严格前视窗口（不含成交当日），避免开盘交易偷看当日收盘。
+    按 (ts_code, trade_date, lookback) 缓存，避免 calc_fee 高频重复查询。
+    """
+    key = (ts_code, int(trade_date), int(lookback))
+    if key in _LIQ_CACHE:
+        return _LIQ_CACHE[key]
+    conn = get_conn()
+    try:
+        win = conn.execute(
+            "SELECT trade_date FROM daily WHERE ts_code=? AND trade_date < ? "
+            "ORDER BY trade_date DESC LIMIT ?",
+            (ts_code, int(trade_date), int(lookback))).fetchall()
+        if len(win) < 2:
+            _LIQ_CACHE[key] = (None, None)
+            return (None, None)
+        win_start = win[-1][0]
+        rows = pd.read_sql_query(
+            "SELECT close, amount FROM daily WHERE ts_code=? "
+            "AND trade_date >= ? AND trade_date < ? ORDER BY trade_date",
+            conn, params=(ts_code, win_start, int(trade_date)))
+        if len(rows) < 2:
+            _LIQ_CACHE[key] = (None, None)
+            return (None, None)
+        rets = rows['close'].pct_change().dropna().to_numpy()
+        if len(rets) < 2:
+            _LIQ_CACHE[key] = (None, None)
+            return (None, None)
+        sigma = float(np.std(rets))
+        adv = float(rows['amount'].mean()) * 1000.0  # 千元→元
+        res = (sigma, adv)
+    except Exception:
+        res = (None, None)
+    finally:
+        conn.close()
+    _LIQ_CACHE[key] = res
+    return res
+
+
+def sqrt_impact_slippage(amount, ts_code, trade_date, k=SQRT_IMPACT_K,
+                         lookback=SQRT_IMPACT_LB, cap=SQRT_IMPACT_CAP):
+    """平方根冲击滑点占成交金额比例。
+
+    impact_frac = k · sigma_daily · sqrt(Q / ADV)，Q=amount(元)，ADV=日均成交额(元)。
+    返回 (frac, adv_yuan, sigma_daily)；数据不足或 ADV<=0 返回 (None, *, *)。
+    frac 超出 SQRT_IMPACT_CAP 时封顶（极端小票 Q>>ADV 防爆表）。
+    """
+    liq = estimate_daily_liquidity(ts_code, trade_date, lookback)
+    if liq[0] is None:
+        return (None, None, None)
+    sigma, adv = liq
+    if adv <= 0 or sigma <= 0:
+        return (None, adv, sigma)
+    frac = k * sigma * math.sqrt(amount / adv)
+    if frac > cap:
+        frac = cap
+    return (frac, adv, sigma)
 
 
 # ============================================================
@@ -292,6 +399,7 @@ def calc_fee_breakdown(buy_or_sell, price, shares, trade_date=None):
 def get_price(ts_code, trade_date):
     """获取不复权收盘价（实际使用价格）"""
     set_trade_date_ctx(trade_date)   # 登记成交日 → calc_fee 自动用对当期印花税率
+    set_ts_code_ctx(ts_code)         # 登记个股 → 滑点冲击模型按流动性估算
     if ts_code in ("000906.SH",):
         conn = get_conn()
         row = pd.read_sql_query(
@@ -346,6 +454,7 @@ def get_open_price(ts_code, trade_date):
     2026-07-06后：收盘价（盘后30分钟定价交易，非未来函数）
     """
     set_trade_date_ctx(trade_date)   # 登记成交日 → calc_fee 自动用对当期印花税率
+    set_ts_code_ctx(ts_code)         # 登记个股 → 滑点冲击模型按流动性估算
     td = int(trade_date) if isinstance(trade_date, str) else trade_date
     if td >= 20260706:
         # 盘后定价交易 → 使用当日收盘价
