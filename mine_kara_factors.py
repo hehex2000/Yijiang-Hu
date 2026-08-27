@@ -23,7 +23,7 @@ ann_date严格<t、退市NaN、换手率不ffill、夏普减rf）。
       mine_groups.csv(7因子分组) 。
 =============================================================================
 """
-import sqlite3, bisect, datetime
+import sqlite3, bisect, datetime, collections
 import numpy as np
 import pandas as pd
 import config
@@ -34,7 +34,7 @@ START_LOOK = "20120101"
 END        = "20260807"
 TOPN       = 50
 COST       = 0.002
-UNIV_MV_MIN = 2e6
+UNIV_MV_MIN = 2e5   # total_mv 单位=万元(Tushare原生)=20亿；原 2e6 误当千元=200亿(塌缩宇宙,2026-08-18修)
 LIST_DAYS_MIN = 252
 PIT = True
 RF_ANN     = 0.025
@@ -340,16 +340,36 @@ for k, t in enumerate(rebal):
 
 print(f"[calc] 有效选股月份: {len(comp_dates)} 个；候选因子 {len(CANDIDATES())} 个")
 
+# 释放 calc 阶段后不再使用的大矩阵（仅 logmv / adj_close_raw 后段仍需要）
+for _m in ["close_p", "adj_close_f", "amount_p", "adj_factor_p", "mv_p", "pe_p", "pb_p", "ps_p", "dv_p",
+           "turn_p", "amt20", "turnstd60", "ret5", "ret10", "ret20", "ret60", "ret120"]:
+    globals().pop(_m, None)
+import gc; gc.collect()
+
+# 调试模式：MINE_DUMP_STORES=1 时把逐月存储落盘退出，供轻量诊断脚本复算 incr
+import os as _os
+if _os.environ.get("MINE_DUMP_STORES"):
+    import pickle as _pkl
+    with open("_mine_stores.pkl", "wb") as _f:
+        _pkl.dump({"comp_dates": comp_dates, "comp2": comp2_store, "f1": f1_store,
+                   "f2": f2_store, "fwd": fwd_ret, "cand_z": cand_z}, _f, protocol=4)
+    print("[dump] _mine_stores.pkl saved; exit")
+    import sys; sys.exit(0)
+
 
 # ---------- 7. 中性化工具（框架L4） ----------
 def neutralize(score, logmv, ind):
     """score ~ [1, logmv, industry dummies] 的OLS残差（规模+行业中性化）"""
-    df = pd.concat([score, logmv, ind], axis=1).dropna()
+    df = pd.concat([score, logmv, ind], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
     df.columns = ["s", "lm", "ind"]
     if len(df) < 50:
         return score
+    # 注意：不能用 pd.DataFrame({"const":1.0,"lm":df["lm"].values}).join(X)——
+    #       ndarray 构造会丢 ts_code index，join 后行业 dummy 列全变 NaN → SVD 不收敛 → 中性化静默失效。
+    #       改用 insert 直接在 X（index=df.index）上按位置加列。
     X = pd.get_dummies(df["ind"], drop_first=True).astype(float)
-    X = pd.DataFrame({"const": 1.0, "lm": df["lm"].values}).join(X)
+    X.insert(0, "const", 1.0)
+    X.insert(1, "lm", df["lm"].values)
     X = X.values.astype(float); y = df["s"].values.astype(float)
     try:
         beta, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -402,7 +422,9 @@ del _f1, _f2
 
 # 候选
 incr_store = {}
+INCR_SKIP = {}
 for name in CANDIDATES():
+    print(f"  [incr] {name} ...", flush=True)
     raw_ics = calc_ic_from_store(cand_raw[name])
     # 中性化IC（逐月）
     neu_ics = []
@@ -419,33 +441,47 @@ for name in CANDIDATES():
             neu_ics.append(ic)
     neu_ics = np.array(neu_ics)
     # 增量IC：相对 F1/F2 正交化后的残差IC
-    incr_ics = []
-    for t in comp_dates:
+    # 注意：必须与 comp_dates 严格对齐（定长数组，无效月=NaN），供 walk-forward 用全局索引切片
+    incr_store[name] = np.full(len(comp_dates), np.nan)
+    _skip = {"lt30": 0, "linalg": 0, "corr_nan": 0, "ok": 0}
+    for ki, t in enumerate(comp_dates):
         f = cand_z[name][t]
         z1 = zscore(pd.Series(f1_store[t]).reindex(f.index))
         z2 = zscore(pd.Series(f2_store[t]).reindex(f.index))
-        df = pd.concat([f, z1, z2], axis=1).dropna()
-        df.columns = ["f", "z1", "z2"]
+        # 关键修复：fwd_ret 必须与因子参与同一 dropna。
+        # 旧版先对 fwd_ret reindex+dropna（停牌/退市/无下月价会删行），再
+        # pd.DataFrame({"res": resid_ndarray, "r": r_series}) 混用——ndarray 无索引对齐、
+        # 要求长度严格相等 → 几乎每月抛 ValueError，被 except 吞成 linalg:80，
+        # incr_store 大面积 NaN → SELECTED/WF 全部失效。回归与 IC 须用同一批股票。
+        r = fwd_ret[t].reindex(f.index)
+        df = pd.concat([f, z1, z2, r], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+        df.columns = ["f", "z1", "z2", "r"]
         if len(df) < 30:
+            _skip["lt30"] += 1
             continue
         try:
             X = df[["z1", "z2"]].values.astype(float); y = df["f"].values.astype(float)
             beta, *_ = np.linalg.lstsq(X, y, rcond=None)
             resid = y - X @ beta
-            r = fwd_ret[t].reindex(df.index).dropna()
-            jj = pd.DataFrame({"res": resid, "r": r}).dropna()
-            ic = jj["res"].corr(jj["r"], method="spearman")
+            ic = pd.Series(resid, index=df.index).corr(df["r"], method="spearman")
             if ic == ic:
-                incr_ics.append(ic)
-        except Exception:
+                incr_store[name][ki] = ic
+                _skip["ok"] += 1
+            else:
+                _skip["corr_nan"] += 1
+        except Exception as e:
+            _skip["linalg"] += 1
+            if _skip["linalg"] <= 2:
+                print(f"      [incr] {name} @ {t} {type(e).__name__}: {e}", flush=True)
             continue
-    incr_ics = np.array(incr_ics)
-    incr_store[name] = incr_ics
+    INCR_SKIP[name] = _skip
+    incr_ics = incr_store[name][~np.isnan(incr_store[name])]
+    # 注意：不能 incr_store[name] = incr_ics（会覆盖成压缩列表、破坏与 comp_dates 的对齐）
     ic_rows.append(dict(
-        factor=name, n=len(raw_ics),
+        factor=name, n=len(raw_ics), n_incr=len(incr_ics), skip=INCR_SKIP[name],
         ic_raw=raw_ics.mean(), ir_raw=raw_ics.mean()/raw_ics.std() if raw_ics.std() else np.nan,
         ic_neu=neu_ics.mean(), ir_neu=neu_ics.mean()/neu_ics.std() if neu_ics.std() else np.nan,
-        incr_ir=incr_ics.mean()/incr_ics.std() if incr_ics.std() else np.nan,
+        incr_ir=(incr_ics.mean()/incr_ics.std() if len(incr_ics) >= 12 and incr_ics.std() else np.nan),
         tag="candidate"))
 
 ic_df = pd.DataFrame(ic_rows)
@@ -487,6 +523,75 @@ for t in comp_dates:
         parts.append(zv)
     comp7 = pd.concat(parts, axis=1).dropna().sum(axis=1)
     comp7_store[t] = comp7
+
+
+# ---------- 9.5  Walk-forward 样本外选股层（年度滚动） ----------
+# 关键：消除"在同一窗口选因子又在该窗口回测"的样本内偏误。
+# 规则：每年 Y 初，用 [Y-3, Y-1] 三年增量 IC（同类冠军、incr_ir>0 前5）选因子，
+#       当年 12 个月固定持有该组；当年月份绝不参与自身选择（无前视）。
+#       [Y-3,Y-1] 不足 36 月但有 ≥12 月则用可用历史；不足 12 月回退 in-sample SELECTED。
+year_idx = collections.defaultdict(list)
+for ki, t in enumerate(comp_dates):
+    year_idx[t[:4]].append(ki)
+print("[wf] 有效选股月按年分布:", {y: len(v) for y, v in sorted(year_idx.items())})
+
+def select_wf(year):
+    months = []
+    for yy in [str(int(year)-3), str(int(year)-2), str(int(year)-1)]:
+        months += year_idx.get(yy, [])
+    if len(months) < 12:
+        return None
+    rows = []
+    for name in CANDIDATES():
+        arr = incr_store[name]              # 与 comp_dates 对齐的定长数组
+        vals = arr[months]
+        vals = vals[~np.isnan(vals)]
+        if len(vals) < 12:
+            continue
+        sd = vals.std()
+        ir = vals.mean()/sd if sd else np.nan
+        rows.append((name, ir))
+    df = pd.DataFrame(rows, columns=["factor", "incr_ir"])
+    df["cat"] = df["factor"].map(CATEGORY)
+    df = df.dropna(subset=["incr_ir"])
+    if df.empty:
+        return None
+    winners = df.sort_values("incr_ir", ascending=False).groupby("cat", as_index=False).first()
+    winners = winners[winners["incr_ir"] > 0].sort_values("incr_ir", ascending=False)
+    return winners.head(5)["factor"].tolist()
+
+comp7_wf_store = {}
+wf_sel_log = {}        # year -> 选中的因子（用于展示）
+wf_is_oos = {}        # t -> 是否真·样本外选择（≥3yr trailing）
+for ki, t in enumerate(comp_dates):
+    year = t[:4]
+    sel = select_wf(year)
+    if sel is None:
+        sel = SELECTED
+        wf_is_oos[t] = False
+    else:
+        # 前 3 年有效月计数（与 select_wf 同阈值：≥12 即算真·样本外选择）
+        n3 = (len(year_idx.get(str(int(year) - 3), [])) +
+              len(year_idx.get(str(int(year) - 2), [])) +
+              len(year_idx.get(str(int(year) - 1), [])))
+        wf_is_oos[t] = (n3 >= 12)
+    wf_sel_log[year] = sel
+    s = comp2_store[t].copy()
+    parts = [s]
+    for name in sel:
+        zv = cand_z[name][t].reindex(s.index)
+        parts.append(zv)
+    comp7_wf = pd.concat(parts, axis=1).dropna().sum(axis=1)
+    comp7_wf_store[t] = comp7_wf
+
+oos_years = sorted({t[:4] for t in comp_dates if wf_is_oos.get(t, False)})
+if oos_years:
+    print(f"[wf] 样本外选择年份(前3年有效月≥12): {oos_years[0]}~{oos_years[-1]} ({len(oos_years)}年)")
+else:
+    print("[wf] 无月份满足样本外选择（有效月过于稀疏，全部回退样本内 SELECTED）")
+print(f"[wf] 各年选中因子:")
+for y in sorted(wf_sel_log):
+    print(f"   {y}: {wf_sel_log[y]}")
 
 
 # ---------- 10. 分组收益（7因子） ----------
@@ -599,30 +704,55 @@ _sr2, _br2, _bp2, _h2 = backtest(comp2_store)
 m2 = metrics(_sr2, _br2, _h2)
 _sr7, _br7, _bp7, _h7 = backtest(comp7_store)
 m7 = metrics(_sr7, _br7, _h7)
+_srw, _brw, _bpw, _hw = backtest(comp7_wf_store)
+mw = metrics(_srw, _brw, _hw)
 
-print(f"\n================ 对照：2因子基线 vs 7因子(自挖5) ================")
-print(f"{'指标':<12}{'2因子':>14}{'7因子':>14}")
-print(f"{'年化':<12}{m2['cagr']*100:>13.2f}%{m7['cagr']*100:>13.2f}%")
-print(f"{'总收益':<12}{m2['tot']*100:>13.2f}%{m7['tot']*100:>13.2f}%")
-print(f"{'最大回撤':<12}{m2['mdd']*100:>13.2f}%{m7['mdd']*100:>13.2f}%")
-print(f"{'夏普':<12}{m2['sharpe']:>14.2f}{m7['sharpe']:>14.2f}")
-print(f"{'基准年化':<12}{m2['bcagr']*100:>13.2f}%{m7['bcagr']*100:>13.2f}%")
-print(f"{'年化超额':<12}{m2['excess']*100:>13.2f}pp{m7['excess']*100:>13.2f}pp")
-print(f"{'区间年数':<12}{m2['yrs']:>14.1f}{m7['yrs']:>14.1f}")
-print(f"\n7因子构成: F1 + F2 + {SELECTED}")
+print(f"\n================ 对照：2因子基线 vs 7因子(样本内选) vs 7因子(walk-forward样本外) ================")
+print(f"{'指标':<12}{'2因子':>14}{'7因子(内)':>14}{'7因子(WF)':>14}")
+print(f"{'年化':<12}{m2['cagr']*100:>13.2f}%{m7['cagr']*100:>13.2f}%{mw['cagr']*100:>13.2f}%")
+print(f"{'总收益':<12}{m2['tot']*100:>13.2f}%{m7['tot']*100:>13.2f}%{mw['tot']*100:>13.2f}%")
+print(f"{'最大回撤':<12}{m2['mdd']*100:>13.2f}%{m7['mdd']*100:>13.2f}%{mw['mdd']*100:>13.2f}%")
+print(f"{'夏普':<12}{m2['sharpe']:>14.2f}{m7['sharpe']:>14.2f}{mw['sharpe']:>14.2f}")
+print(f"{'基准年化':<12}{m2['bcagr']*100:>13.2f}%{m7['bcagr']*100:>13.2f}%{mw['bcagr']*100:>13.2f}%")
+print(f"{'年化超额':<12}{m2['excess']*100:>13.2f}pp{m7['excess']*100:>13.2f}pp{mw['excess']*100:>13.2f}pp")
+print(f"{'区间年数':<12}{m2['yrs']:>14.1f}{m7['yrs']:>14.1f}{mw['yrs']:>14.1f}")
+
+# 纯样本外窗口(≥3yr trailing 的年份)三方对照，排除 warmup 干扰
+oos_dates = [t for t in comp_dates if wf_is_oos.get(t, False)]
+oos_set = set(oos_dates)
+def sub_metrics(comp_store):
+    sr, br, bp, h = backtest(comp_store)
+    idx = [i for i, t in enumerate(h) if t in oos_set]
+    if not idx:
+        return None
+    return metrics([sr[i] for i in idx], [br[i] for i in idx], [h[i] for i in idx])
+m2o = sub_metrics(comp2_store); m7o = sub_metrics(comp7_store); mwo = sub_metrics(comp7_wf_store)
+if m2o and m7o and mwo:
+    print(f"\n--- 纯样本外窗口 {oos_dates[0]}~{oos_dates[-1]} ({mwo['yrs']:.1f}年) 三方对照 ---")
+    print(f"{'指标':<12}{'2因子':>14}{'7因子(内)':>14}{'7因子(WF)':>14}")
+    print(f"{'年化':<12}{m2o['cagr']*100:>13.2f}%{m7o['cagr']*100:>13.2f}%{mwo['cagr']*100:>13.2f}%")
+    print(f"{'最大回撤':<12}{m2o['mdd']*100:>13.2f}%{m7o['mdd']*100:>13.2f}%{mwo['mdd']*100:>13.2f}%")
+    print(f"{'夏普':<12}{m2o['sharpe']:>14.2f}{m7o['sharpe']:>14.2f}{mwo['sharpe']:>14.2f}")
+    print(f"{'年化超额':<12}{m2o['excess']*100:>13.2f}pp{m7o['excess']*100:>13.2f}pp{mwo['excess']*100:>13.2f}pp")
+else:
+    print("\n[OOS] 样本外窗口为空（WF 全部回退样本内），跳过纯OOS对照。")
+
+print(f"\n7因子(样本内)构成: F1 + F2 + {SELECTED}")
 print(f"分组月均(1差~5好): " + "  ".join(f"G{g}={group_mean[g]*100:5.2f}%" for g in range(1,6)))
-print("=====================================================================")
+print("=====================================================================================")
 
 
 # ---------- 12. 落盘 ----------
 eq2r, eq2b, eq2p, eq2h = backtest(comp2_store)
 eq7r, eq7b, eq7p, eq7h = backtest(comp7_store)
+eqwr, eqwb, eqwp, eqwh = backtest(comp7_wf_store)
 eq = pd.DataFrame({
     "date": eq2h,
     "nav_2f": (1+pd.Series(eq2r, index=eq2h)).cumprod().values,
     "nav_7f": (1+pd.Series(eq7r, index=eq7h)).cumprod().values,
+    "nav_7f_wf": (1+pd.Series(eqwr, index=eqwh)).cumprod().values,
     "nav_bench_tr": (1+pd.Series(eq2b, index=eq2h)).cumprod().values,
-    "ret_2f": eq2r, "ret_7f": eq7r, "ret_bench_tr": eq2b,
+    "ret_2f": eq2r, "ret_7f": eq7r, "ret_7f_wf": eqwr, "ret_bench_tr": eq2b,
 })
 eq.to_csv("mine_equity.csv", index=False)
 ic_df.to_csv("mine_ic.csv", index=False)

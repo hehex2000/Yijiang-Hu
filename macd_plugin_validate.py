@@ -83,10 +83,12 @@ def load_base_zz800_eq(start='20100101', end='20251231'):
     alld = pd.concat(frames, ignore_index=True)
     alld['trade_date'] = alld['trade_date'].astype(int)  # 关键：保持 int 索引，否则与 hs(int) 对齐失败→全NaN→overlay 全程现金
     panel = alld.pivot(index='trade_date', columns='ts_code', values='close').sort_index()
-    ret = panel.pct_change().fillna(0.0)
-    # 等权指数：每日等权收益 -> 累乘（等价于每日再平衡到等权）
-    eq_ret = ret.mean(axis=1)
-    nav = (1.0 + eq_ret).cumprod()
+    ret = panel.pct_change()
+    # 等权指数：每日在【当天有数据】的成分股间等权 -> 累乘（等价于每日再平衡到等权）。
+    # 不能 fillna(0) 后全列平均：那会把未上市/退市股票的缺失收益当 0 摊入等权，
+    # 早期(2010)稀释约1.5倍、压平早期波动，实测使最大回撤被低估 ~11pp(-54.6% vs 真实 -65.7%)。
+    eq_ret = ret.mean(axis=1, skipna=True)
+    nav = (1.0 + eq_ret.fillna(0.0)).cumprod()
     print(f"[load] 等权基线就绪，长度 {len(nav)}", flush=True)
     return nav
 
@@ -137,7 +139,7 @@ def macd_golden(close, fast=12, slow=26, sig=9):
 def platform_stop_overlay(base_nav, bench_close, stop_pct=0.15):
     """faithful 组合层复刻 红利/价值内核风控层（15%止损 + MACD减仓）。
     组合峰回撤>=stop_pct → 触止损持币；基准 MACD death → 持币；
-    金叉 且 收复峰(创新高) 才再入场。"""
+    金叉即解锁再入场（不要求创新高，避免宽基永久锁死退化为全程空仓）。"""
     base = np.asarray(base_nav, dtype=float)
     peak = pd.Series(base).cummax().values
     trailing_hit = base < peak * (1 - stop_pct)

@@ -33,7 +33,17 @@ class DualMAStrategyPlugin(BaseStrategy):
             atr_mult=cfg.get("atr_mult", 3.0),
             trail_mult=cfg.get("trail_mult", 3.0),
         )
-        
+
+        # ── Jim 框架状态机增强（默认关；子类 dual_ma_jim 强制开，与基础版 A/B）──
+        #   UP   : 收盘价 > 短均线 > 长均线 且 两均线斜率均向上
+        #   DOWN : 收盘价 < 短均线 < 长均线 且 两均线斜率均向下
+        #   UNCLEAR: 其余（价格在两线间来回 / 斜率方向不一致）→ 不出手
+        #   入场: 状态转入 UP（T+1）；出场: 状态转出 UP（失效≠反转，不裸空）
+        #   收盘确认: 日频数据天然收盘确认（盘中交叉不可观测）；方向过滤即信号漏斗
+        self.state_machine = bool(cfg.get("state_machine", False))
+        self.slope_lookback = int(cfg.get("slope_lookback", 10))
+        self.slope_thresh = float(cfg.get("slope_thresh", 0.0))
+
         logger.info(
             f"DualMAStrategyPlugin initialized: "
             f"MA{self.ma_short}/{self.ma_long}, "
@@ -94,7 +104,11 @@ class DualMAStrategyPlugin(BaseStrategy):
         if ma_long_col not in df.columns:
             df[ma_long_col] = ta.SMA(df[close_col].values, timeperiod=self.ma_long)
             logger.info(f"Auto-calculated {ma_long_col} using TA-Lib SMA")
-        
+
+        # ═══ 状态机增强分支（Jim 框架）：开启后与基础版（金叉买死叉卖）做 A/B ═══
+        if self.state_machine:
+            return self._run_state_machine(df, start_idx, close_col, ma_short_col, ma_long_col)
+
         # ═════ 预计算金叉/死叉信号 ═════
         df['prev_' + ma_short_col] = df[ma_short_col].shift(1)
         df['prev_' + ma_long_col] = df[ma_long_col].shift(1)
@@ -181,6 +195,132 @@ class DualMAStrategyPlugin(BaseStrategy):
             "daily_values": self.daily_values,
         }
     
+    def _run_state_machine(self, df: pd.DataFrame, start_idx: int,
+                            close_col: str, ma_short_col: str, ma_long_col: str) -> dict:
+        """
+        Jim 框架增强版（方向状态机）。
+
+        与 run() 基础版的唯一区别是「信号逻辑」：
+          - 在金叉/死叉之外叠加「价格相对双均线位置 + 双均线斜率方向」的状态判定；
+          - 仅在状态转入 UP 时买入（T+1）、转出 UP（到 UNCLEAR/DOWN）时卖出；
+          - 震荡市状态停在 UNCLEAR → 不出手，天然过滤 whipsaw（信号漏斗）；
+          - 失效≠反转：UP 退出后先空仓，不裸空，等状态再次明确 UP 才回补。
+        仓位(position_pct)、止盈止损、ATR、凯利 与基础版完全一致（公平 A/B）。
+        """
+        logger.info(f"Running DualMA state-machine on {len(df)} days (MA{self.ma_short}/{self.ma_long}, "
+                    f"slope_lookback={self.slope_lookback}, slope_thresh={self.slope_thresh:.4f})...")
+
+        self.trades = []
+        self.daily_values = []
+        self.position = 0
+        self.avg_cost = 0.0
+        self.cash = self.capital
+
+        if len(df) == 0:
+            return {"returns": 0.0, "trades": [], "daily_values": []}
+
+        df = df.sort_values('trade_date').reset_index(drop=True)
+        if start_idx > 0:
+            df = df.iloc[start_idx:].reset_index(drop=True)
+
+        L = max(int(self.slope_lookback), 1)
+        # 仅用长均线斜率判定方向（长均线平滑，避免短均线斜率在回踩里反复翻转→自造 whipsaw）
+        df[f'{ma_long_col}_slope'] = df[ma_long_col].diff(L)
+
+        # ── 信号漏斗 raw 层统计（原始金叉/死叉，仅量化过滤掉多少）──
+        prev_s = df[ma_short_col].shift(1)
+        prev_l = df[ma_long_col].shift(1)
+        raw_golden = int(((prev_s <= prev_l) & (df[ma_short_col] > df[ma_long_col])).sum())
+        raw_death = int(((prev_s >= prev_l) & (df[ma_short_col] < df[ma_long_col])).sum())
+        golden_mask = (prev_s <= prev_l) & (df[ma_short_col] > df[ma_long_col])
+        death_mask = (prev_s >= prev_l) & (df[ma_short_col] < df[ma_long_col])
+
+        # ── ATR ──
+        if self.use_atr_sl:
+            high_col = 'high' if 'high' in df.columns else close_col
+            low_col = 'low' if 'low' in df.columns else close_col
+            atr_arr = self.atr_sl.calc_atr(df[high_col].values, df[low_col].values, df[close_col].values)
+        else:
+            atr_arr = np.zeros(len(df))
+
+        UP, DOWN, UNCLEAR = 'UP', 'DOWN', 'UNCLEAR'
+        prev_state = UNCLEAR
+        prev_golden = False
+        entries = 0
+        exits = 0
+
+        for idx, row in df.iterrows():
+            current_date = row['trade_date']
+            price = self._get_price(row)
+            if price <= 0:
+                continue
+            self._record_daily_value(price, current_date)
+
+            state = self._state_of(row, close_col, ma_long_col, UP, DOWN, UNCLEAR)
+            golden = bool(golden_mask.iloc[idx]) if idx < len(golden_mask) else False
+
+            # T+1 执行（Jim 信号漏斗）：
+            #   入场 = 前一天金叉(收盘确认) 且 今日方向明确 UP（方向不清的金叉被滤掉 → 入场数<=金叉数）
+            #   出场 = 状态转出 UP（失效≠反转：先空仓，不裸空；等再次金叉+方向确认才回补）
+            if prev_golden and state == UP and self.cash > 0:
+                pos_before = self.position
+                self._buy_golden_cross(row, reason="金叉+方向确认买入")
+                if self.use_atr_sl and self.position > pos_before:
+                    self.atr_sl.on_entry(entry_price=self.avg_cost, atr_val=atr_arr[idx])
+                entries += 1
+            elif prev_state == UP and state != UP and self.position > 0:
+                if self.use_atr_sl:
+                    self.atr_sl.reset()
+                self._sell_death_cross(row, reason="状态退出卖出")
+                exits += 1
+
+            # 每日止盈/止损/ATR
+            if self.position > 0:
+                if self.use_atr_sl:
+                    high_val = float(row.get('high', price))
+                    self.atr_sl.update(high_price=high_val, atr_val=atr_arr[idx])
+                    should_stop, stop_price, atr_reason = self.atr_sl.check_stop(close_price=price)
+                    if should_stop:
+                        self.sell(current_date, price, self.position, reason=atr_reason)
+                        continue
+                self._check_take_profit_stop_loss(row)
+
+            prev_golden = golden
+            prev_state = state
+
+        if len(df) > 0:
+            last_row = df.iloc[-1]
+            self._sell_all_at_end(last_row['trade_date'], self._get_price(last_row))
+
+        returns = self.calc_returns()
+        logger.info(f"✓ DualMA state-machine: raw golden={raw_golden} death={raw_death}, "
+                    f"entries={entries} exits={exits}, trades={len(self.trades)}, returns={returns:.2f}%")
+        return {"returns": returns, "trades": self.trades, "daily_values": self.daily_values}
+
+    def _state_of(self, row: pd.Series, close_col: str, ma_long_col: str,
+                  UP: str, DOWN: str, UNCLEAR: str) -> str:
+        """单日方向状态（Jim 框架的可重复定义，趋势过滤版）。
+
+        UP   : 收盘价 > 长均线 且 长均线斜率向上（长均线平滑→回踩不翻转，不过早出局）
+        DOWN : 收盘价 < 长均线 且 长均线斜率向下
+        UNCLEAR: 其余（价格在长均线附近/长均线走平）→ 不出手，天然过滤震荡 whipsaw
+        失效≠反转：UP 退出后先 UNCLEAR 空仓，不裸空，等再次明确 UP 才回补。
+        """
+        close = row.get(close_col)
+        ma_l = row.get(ma_long_col)
+        sl_l = row.get(f'{ma_long_col}_slope')
+        if any(pd.isna(x) for x in (close, ma_l, sl_l)):
+            return UNCLEAR
+        above = close > ma_l
+        below = close < ma_l
+        long_up = sl_l > self.slope_thresh
+        long_dn = sl_l < -self.slope_thresh
+        if above and long_up:
+            return UP
+        if below and long_dn:
+            return DOWN
+        return UNCLEAR
+
     def _get_price(self, row: pd.Series) -> float:
         """获取复权收盘价（兼容不同列名）"""
         for col in ['adj_close', 'close', '收盘价']:
@@ -218,16 +358,15 @@ class DualMAStrategyPlugin(BaseStrategy):
         
         return 0
     
-    def _buy_golden_cross(self, row: pd.Series):
-        """金叉买入（T+1，用开盘价）"""
+    def _buy_golden_cross(self, row: pd.Series, reason: str = "金叉买入"):
+        """买入（T+1，用开盘价）"""
         date = row['trade_date']
         price = self._get_open_price(row)
-        
+
         if price <= 0:
             return
-        
+
         # 买入 position_pct% 可用资金
-        reason = "金叉买入"
         # 计算可买股数（A股最小交易单位100股）
         cash_to_use = self.cash * self.position_pct
         shares = int(cash_to_use / price / 100) * 100
@@ -240,16 +379,15 @@ class DualMAStrategyPlugin(BaseStrategy):
         else:
             logger.debug(f"Dual MA buy: insufficient cash to buy at {date}, price={price:.2f}")
     
-    def _sell_death_cross(self, row: pd.Series):
-        """死叉卖出（T+1，用开盘价）"""
+    def _sell_death_cross(self, row: pd.Series, reason: str = "死叉卖出"):
+        """卖出（T+1，用开盘价）"""
         date = row['trade_date']
         price = self._get_open_price(row)
-        
+
         if price <= 0 or self.position <= 0:
             return
-        
+
         # 全仓卖出
-        reason = "死叉卖出"
         success = self.sell(date, price, self.position, reason)
         
         if success:

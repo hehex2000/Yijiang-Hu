@@ -28,7 +28,7 @@ GLOBAL = {
 
     "backtest_start": "20200103",
 
-    "backtest_end": "20260815",
+    "backtest_end": "20260825",
 
 
 
@@ -722,9 +722,10 @@ STRATEGIES = {
     # 与 run_macd_timing.py 核心一致，但跑在「已选出的个股」上，接入逐股对比框架。
     # 全市场 MACD 择时（含指数 MA 门控）请用独立脚本 run_macd_timing.py。
 
+    # [已被 macd_jim 替代·不采用为默认] 朴素金叉死叉版，保留作对照基线。
     "macd_timing": {
 
-        "enabled": True,
+        "enabled": False,
 
         "name": "MACD趋势跟随择时策略（金叉买入·死叉卖出）",
 
@@ -736,6 +737,39 @@ STRATEGIES = {
         # ── 零轴过滤（可选，默认关）──
         # True=多头区额外要求 DIF>0（更确认的上行，减少假死叉 whipshaw）
         "zero_line": False,
+
+        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,         # 趋势/突破类胜率保守估计
+        "kelly_win_loss_ratio": 2.5,    # 盈亏比（赚2.5元亏1元）
+        "kelly_fraction": 1.0,          # 半凯利
+        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_min_position": 0.05,     # 最小仓位5%
+        "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
+    },
+
+    # ── MACD 趋势跟随择时·Jim 状态机增强版（与 macd_timing 同参数 A/B）──
+    #    自动发现：macd_jim_plugin.py → 配置键 macd_jim → MacdJimPlugin（强制 state_machine=True）
+    #    与 macd_timing 唯一差异：信号逻辑（方向状态机 + 收盘确认 + 看不清 + 失效≠反转 + 信号漏斗）
+    # [MACD Jim状态机·部分有效·低风险择时增强·保留·替代 macd_timing] 用收益换风控，方向过滤降 whipsaw/回撤。
+    "macd_jim": {
+
+        "enabled": True,
+
+        "name": "MACD状态机(12/26/9·Jim)",
+
+        # ── MACD 参数 ──
+        "fast": 12,
+        "slow": 26,
+        "signal": 9,
+
+        # ── 零轴过滤（可选，默认关）──
+        "zero_line": False,
+
+        # ── Jim 状态机增强 ──
+        "state_machine": True,
+        "slope_lookback": 10,
+        "slope_thresh": 0.0,
 
         # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
         "use_kelly": True,
@@ -955,6 +989,7 @@ STRATEGIES = {
 
     # ── 均线策略 ──
 
+    # [双均线择时·证伪 vs 买入持有·不采用] 双窗口(2010-2019/2020-2025)均大幅跑输BH(+56%/+51%)，收益仅≈指数；趋势跟踪MA timing在A股无绝对alpha。保留作对照基线，不作为盈利策略采用。
     "dual_ma": {
 
         "enabled": True,
@@ -989,6 +1024,43 @@ STRATEGIES = {
         "kelly_max_position": 0.20,     # 最大仓位20%
         "kelly_min_position": 0.05,     # 最小仓位5%
         "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
+    },
+
+    # ── 均线策略·Jim 框架状态机增强版（与 dual_ma 同参数 A/B）──
+    #    自动发现：dual_ma_jim_plugin.py → 配置键 dual_ma_jim → DualMAJimPlugin（强制 state_machine=True）
+    #    与 dual_ma 唯一差异：信号逻辑（方向状态机 + 收盘确认 + 看不清 + 失效≠反转 + 信号漏斗）
+    # [双均线Jim状态机·部分有效·低风险择时增强·保留] 双窗口回撤改善稳健(基础-12.25%/-5.17% → Jim -1.57%/-1.21%)，Sharpe/交易/正收益全面更优、收益略低(用收益换风控)；holdout独立外推仍成立→非过拟合。
+
+    "dual_ma_jim": {
+
+        "enabled": True,
+
+        "name": "双均线状态机(MA10/MA30·Jim)",
+
+        "ma_short": 10,
+        "ma_long": 30,
+        "position_pct": 0.5,
+        "take_profit": 0.30,
+        "stop_loss": 0.10,
+        "enable_tp_sl": True,
+
+        "atr_stop_loss": True,
+        "atr_period": 14,
+        "atr_mult": 3.0,
+        "trail_mult": 3.0,
+
+        "use_kelly": True,
+        "kelly_win_rate": 0.40,
+        "kelly_win_loss_ratio": 2.5,
+        "kelly_fraction": 1.0,
+        "kelly_max_position": 0.20,
+        "kelly_min_position": 0.05,
+        "kelly_safety_discount": 1.0,
+
+        # ── Jim 框架状态机（子类强制 True，这里显式写出便于对照）──
+        "state_machine": True,
+        "slope_lookback": 10,
+        "slope_thresh": 0.0,
     },
 
     # ── 能量指标策略 ──

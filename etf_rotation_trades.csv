@@ -1,0 +1,10 @@
+﻿date,action,code,name,price,shares,reason
+20240108,BUY,518880.SH,黄金ETF,4.663,9600,rotation
+20240108,BUY,511010.SH,国债ETF,133.444,300,rotation
+20240307,SELL,518880.SH,黄金ETF,4.848,4600,timing_trim(cap=0.53)
+20240307,SELL,511010.SH,国债ETF,134.955,200,timing_trim(cap=0.53)
+20240409,SELL,518880.SH,黄金ETF,5.383,2900,timing_trim(cap=0.43)
+20240409,SELL,511010.SH,国债ETF,135.23,100,timing_trim(cap=0.43)
+20240510,SELL,518880.SH,黄金ETF,5.33,1100,timing_trim(cap=0.51)
+20240607,SELL,518880.SH,黄金ETF,5.413,200,timing_trim(cap=0.88)
+20240628,SELL,518880.SH,黄金ETF,5.297,800,backtest_end

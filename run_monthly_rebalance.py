@@ -210,7 +210,10 @@ SLIPPAGE_RATE = 0.001  # 滑点率（0.1%，模拟实盘买卖价差和冲击成
 
 
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    # timeout=30：延长锁等待（默认仅5s），消除长窗口回测中
+    # 主循环写事务 / get_stock_name 只读连接之间的 database-is-locked 超时。
+    # 不改变任何查询逻辑或回测数字。
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 
 def _data_fingerprint():
@@ -765,6 +768,35 @@ def calc_volatility(ts_code, trade_date, window=VOL_WINDOW):
     return float(np.std(returns) * np.sqrt(252))
 
 
+def calc_volatility_batch(codes, trade_date, window=VOL_WINDOW):
+    """向量化年化波动率（与 calc_volatility 同口径）：每只 code 取 <=trade_date 最近
+    window+1 个收盘，日收益 std × sqrt(252)。一次 SQL 拉取全部候选，避免逐股查询瓶颈。
+    返回 {ts_code: vol}。历史不足(minp=max(window*0.6,60))的 code 不返回。"""
+    if not codes:
+        return {}
+    from datetime import datetime, timedelta
+    d = datetime.strptime(str(trade_date), "%Y%m%d")
+    cutoff = (d - timedelta(days=window + 30)).strftime("%Y%m%d")
+    conn = get_conn()
+    ph = ",".join("?" * len(codes))
+    rows = pd.read_sql_query(f"""
+        SELECT ts_code, trade_date, close FROM daily
+        WHERE ts_code IN ({ph}) AND trade_date <= ? AND trade_date >= ?
+        ORDER BY ts_code, trade_date
+    """, conn, params=list(codes) + [int(trade_date), int(cutoff)])
+    conn.close()
+    out = {}
+    minp = max(int(window * 0.6), 60)
+    for c, g in rows.groupby('ts_code'):
+        closes = g['close'].values
+        if len(closes) < minp:
+            continue
+        closes = closes[-(window + 1):]
+        returns = (closes[1:] - closes[:-1]) / np.where(closes[:-1] == 0, 1.0, closes[:-1])
+        out[c] = float(np.std(returns) * np.sqrt(252))
+    return out
+
+
 # ============================================================
 #  选股函数
 # ============================================================
@@ -896,20 +928,102 @@ def select_dividend_low_vol_stocks(trade_date, top_n=None,
     if df.empty:
         return df
 
-    # 计算波动率
+    # 计算波动率（批量向量化，与 calc_volatility 同口径）
     print(f"  计算 {len(df)} 只股票波动率...")
-    volatilities = {}
-    for idx, row in df.iterrows():
-        code = row['ts_code']
-        vol = calc_volatility(code, actual_date)
-        if vol is not None:
-            volatilities[code] = vol
+    volatilities = calc_volatility_batch(df['ts_code'].tolist(), actual_date)
 
     vol_codes = set(volatilities.keys())
     df = df[df['ts_code'].isin(vol_codes)]
     if df.empty:
         return df
 
+    df['volatility'] = df['ts_code'].map(volatilities)
+
+    # 双重排序
+    df['dv_rank'] = df['dv_ttm'].rank(pct=True)
+    df['vol_rank'] = df['volatility'].rank(pct=True, ascending=False)
+    df['score'] = (df['dv_rank'] + df['vol_rank']) / 2
+
+    result = df.sort_values('score', ascending=False).head(top_n)
+    codes = result['ts_code'].tolist()
+    name_str = ', '.join([f"{c}({get_stock_name(c)})" for c in codes])
+    print(f"  最终选出：{name_str}")
+    return result[['ts_code']]
+
+
+def select_dividend_low_vol_clean(trade_date, top_n=None, stock_pool='000906.SH'):
+    """
+    红利低波双排序选股（干净版 · 顶替含MACD的旧版）：
+      - 股票池：默认中证800(zz800)，与 M1 已验证策略一致；stock_pool 可覆盖
+      - 估值过滤：0<PE_TTM<50, 0<PB<10, dv_ttm>0, total_mv>0（与 M1.select_div_low_vol 一致）
+      - 排除 ST
+      - 【不含】个股MACD金叉过滤 / 杠杆风控 / 红利质量三因子 / 大盘MACD择时层
+      - 双排序：股息率pct降序 + 年化波动率pct升序，取 top_n
+    返回含 ts_code 的 DataFrame（与 select_dividend_low_vol_stocks 同契约）。
+    """
+    if top_n is None:
+        top_n = get_top_n()
+
+    conn = get_conn()
+    # 解析 <= trade_date 最近有 daily_basic 的交易日（防未来函数）
+    actual_date = trade_date
+    while True:
+        cnt = pd.read_sql_query(
+            "SELECT COUNT(*) AS n FROM daily_basic WHERE trade_date = ?",
+            conn, params=(actual_date,)).iloc[0]['n']
+        if cnt > 0:
+            break
+        prev = pd.read_sql_query(
+            "SELECT MAX(trade_date) AS max_date FROM daily_basic WHERE trade_date < ?",
+            conn, params=(actual_date,)).iloc[0, 0]
+        if prev is None:
+            conn.close()
+            return pd.DataFrame()
+        actual_date = prev
+
+    index_code = None if stock_pool == "all" else (stock_pool or '000906.SH')
+    zz_set = get_index_constituents(index_code, trade_date=actual_date) if index_code else None
+
+    df = pd.read_sql_query("""
+        SELECT ts_code, dv_ttm, total_mv
+        FROM daily_basic
+        WHERE trade_date = ?
+          AND pe_ttm > 0 AND pe_ttm < 50
+          AND pb > 0 AND pb < 10
+          AND dv_ttm > 0
+          AND total_mv > 0
+    """, conn, params=(actual_date,))
+    conn.close()
+
+    if df.empty:
+        return df
+
+    if zz_set is not None:
+        df = df[df['ts_code'].isin(zz_set)]
+        if df.empty:
+            return df
+
+    # 排除ST
+    conn = get_conn()
+    st_codes = pd.read_sql_query(
+        "SELECT ts_code FROM stock_basic WHERE name LIKE '%ST%' OR name LIKE '%*%'",
+        conn
+    )
+    conn.close()
+    if len(st_codes) > 0:
+        st_set = set(st_codes["ts_code"].tolist())
+        df = df[~df['ts_code'].isin(st_set)]
+
+    if df.empty:
+        return df
+
+    # 波动率（批量向量化，与 calc_volatility 同口径，避免逐股SQL瓶颈）
+    print(f"  计算 {len(df)} 只股票波动率...")
+    volatilities = calc_volatility_batch(df['ts_code'].tolist(), actual_date)
+    vol_codes = set(volatilities.keys())
+    df = df[df['ts_code'].isin(vol_codes)]
+    if df.empty:
+        return df
     df['volatility'] = df['ts_code'].map(volatilities)
 
     # 双重排序
@@ -1700,6 +1814,10 @@ def select_by_method(method, trade_date, top_n=None, lookback_months=None,
         index_code = None if stock_pool == "all" else (stock_pool or get_stock_pool_index())
         return select_momentum_stocks(trade_date, lookback_months=lb, top_n=top_n, index_code=index_code)
     elif method == "div_low_vol":
+        # 顶替原含MACD版本：干净红利低波（zz800，无MACD/杠杆/质量过滤），与 M1 已验证策略一致
+        return select_dividend_low_vol_clean(trade_date, top_n, stock_pool=stock_pool)
+    elif method == "div_low_vol_macd":
+        # 旧版（含个股MACD金叉过滤 + 大盘MACD择时层），保留用于对照
         return select_dividend_low_vol_stocks(trade_date, top_n,
                                               leverage_filter=leverage_filter,
                                               de_ratio_exclude_pct=de_ratio_exclude_pct,
@@ -1912,7 +2030,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"月度调仓回测：{start_date} ~ {end_date}")
     print("=" * 70)
     print(f"  选股池：{_pool_name}成分股")
-    _sm_name = {"div_low_vol": "红利低波", "momentum": "动量追涨",
+    _sm_name = {"div_low_vol": "红利低波(满仓月度重选)", "div_low_vol_macd": "红利低波(MACD择时)",
+                "momentum": "动量追涨",
                 "div_growth": "高股息+基本面成长"}.get(selection_method, "价值选股")
     print(f"  选股策略：{_sm_name}")
     if selection_method == "value":
@@ -1931,7 +2050,7 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     if div_quality_filter:
         _growth_txt = f"≥{div_growth_min*100:.1f}%" if div_growth_min is not None else "不启用"
         print(f"  红利质量：连续分红≥{div_years_min if div_years_min > 0 else '不限制'}年 | 经营现金流覆盖分红={'是' if require_ocf_cover else '否'} | 分红增长CAGR{_growth_txt}")
-    print(f"  MACD信号模式：{macd_filter_mode or 'golden'}（golden=旧金叉死叉 | regime=金叉须指数>MA200且非盘整；不指定则红利低波默认 golden）")
+    print(f"  MACD信号模式：{macd_filter_mode or 'golden'}（golden=旧金叉死叉 | regime=金叉须指数>MA200且非盘整；不指定则 div_low_vol_macd 默认 golden）")
     print(f"  中枢回避过滤(--consolidation-filter)：{'开(剔除中枢期候选·win=%d/look=%d/th=%.2f)' % (con_win, con_lookback, con_th) if consolidation_filter else '关（对照基线）'}")
     if consolidation_filter:
         print(f"  ⚠️ OOS证伪·仅诊断：真实样本外2015-2019该过滤把价值策略+20.89%→-17.72%（跑输基准-26pp），不当alpha使用(见docs/consolidation_filter_oos_report.md)")
@@ -1946,8 +2065,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
             print(f"  [ERROR] 缠论买点门控需要 chan_lun_core_faithful.py（导入失败），无法启用")
             return
         print(f"  缠论买点门控(Mode A)：开启——月度选出新股后不立即买，等缠论买点(b1/b2/b3)确认后次日均价买入；卖出仍月度强制")
-        if selection_method == "div_low_vol":
-            print(f"  ⚠️ 提示：红利低波走 MACD 择时分支，缠论门控目前仅作用于「标准调仓分支」(价值/动量/高股息成长)；红利低波接入为后续 Mode C 范围")
+        if selection_method == "div_low_vol_macd":
+            print(f"  ⚠️ 提示：红利低波(MACD版)走 MACD 择时分支，缠论门控目前仅作用于「标准调仓分支」(价值/动量/高股息成长)；红利低波接入为后续 Mode C 范围")
 
     trade_dates = get_trade_dates(start_date, end_date)
     # 调仓频率（task #54 规则再平衡反事实）：默认1=每月；3=每季/6=半年/12=每年/999≈买入持有
@@ -2197,8 +2316,8 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
 
         prev_td = trade_dates[i-1] if i > 0 else td
 
-        # ═══ 红利低波：MACD大盘择时 ═══
-        if selection_method == "div_low_vol":
+        # ═══ 红利低波(MACD版)：MACD大盘择时 ═══
+        if selection_method == "div_low_vol_macd":
             # 获取基准指数代码（全A股模式用中证800作为MACD基准）
             benchmark_idx = get_stock_pool_index()
             if benchmark_idx is None:
@@ -4047,7 +4166,7 @@ if __name__ == "__main__":
     parser.add_argument("end_date", nargs="?", default="20251231", help="结束日期 YYYYMMDD")
     parser.add_argument("--top-n", type=int, default=None, help="选股数量")
     parser.add_argument("--selection-method", type=str, default="value",
-                        choices=["value", "div_low_vol", "momentum", "breakout", "reversal", "div_low_vol_quality"],
+                        choices=["value", "div_low_vol", "div_low_vol_macd", "momentum", "breakout", "reversal", "div_low_vol_quality"],
                         help="选股策略(momentum=动量, breakout=突破赢家, div_low_vol_quality=红利低波质量复合·季度调仓)")
     parser.add_argument("--dlvq-mode", type=str, default="official_compact",
                         choices=["official", "official_improved", "official_compact"],
