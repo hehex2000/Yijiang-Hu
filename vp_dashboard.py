@@ -140,6 +140,9 @@ def price_chart(ts_code, window, d):
 def tab_single():
     st.header("① 个股：现在在支撑位还是见顶压力位？")
     slist = load_stock_list()
+    only_a_single = st.checkbox("剔除 ST / *（个股下拉也过滤）", value=False)
+    if only_a_single:
+        slist = slist[~slist["name"].astype(str).str.contains("ST|\\*", na=False)]
     sel = st.selectbox("选一只股票", slist["label"].tolist(), index=0)
     code = slist.loc[slist["label"] == sel, "ts_code"].iloc[0]
     window = st.slider("看多长（交易日）", 60, 500, 250, 10)
@@ -284,21 +287,35 @@ def tab_scan():
             return None
         return np.where((df["poc_dist_pct"] < 0) == (df["rev_21"] < 0), "✅", "—")
 
+    def combined_col(df, side):
+        """综合判断：位置(支撑/压力) + 反转overlay 确认 -> ✅机会 / ⚠️风险 / ⚪待观察"""
+        if "rev_21" not in df.columns:
+            return None
+        ov = (df["poc_dist_pct"] < 0) == (df["rev_21"] < 0)
+        if side == "support":
+            return np.where(ov, "✅机会", "⚪待观察")
+        return np.where(ov, "⚠️风险", "⚪待观察")
+
     st.subheader("🟢 支撑位附近（跌到量架上，潜在机会）")
     s = filt(sup, "support_dist_pct")
     if s.empty:
         st.write("暂无")
     else:
         ov = overlay_col(s)
+        cmb = combined_col(s, "support")
         cols = ["name", "ts_code", "industry", "price", "support", "support_dist_pct"]
         if ov is not None:
             s = s.copy()
             s["反转overlay"] = ov
             cols.append("反转overlay")
+        if cmb is not None:
+            s["综合判断"] = cmb
+            cols.append("综合判断")
         cols.append("signal")
         show = s[cols].copy()
         show.columns = ["名称", "代码", "行业", "当前价", "支撑位", "距支撑%"] + \
-            (["反转overlay"] if ov is not None else []) + ["信号"]
+            (["反转overlay"] if ov is not None else []) + \
+            (["综合判断"] if cmb is not None else []) + ["信号"]
         show["距支撑%"] = (show["距支撑%"] * 100).round(2)
         show["当前价"] = show["当前价"].round(2)
         show["支撑位"] = show["支撑位"].round(2)
@@ -310,15 +327,20 @@ def tab_scan():
         st.write("暂无")
     else:
         ov = overlay_col(r)
+        cmb = combined_col(r, "resistance")
         cols = ["name", "ts_code", "industry", "price", "resistance", "resistance_dist_pct"]
         if ov is not None:
             r = r.copy()
             r["反转overlay"] = ov
             cols.append("反转overlay")
+        if cmb is not None:
+            r["综合判断"] = cmb
+            cols.append("综合判断")
         cols.append("signal")
         show = r[cols].copy()
         show.columns = ["名称", "代码", "行业", "当前价", "压力位", "距压力%"] + \
-            (["反转overlay"] if ov is not None else []) + ["信号"]
+            (["反转overlay"] if ov is not None else []) + \
+            (["综合判断"] if cmb is not None else []) + ["信号"]
         show["距压力%"] = (show["距压力%"] * 100).round(2)
         show["当前价"] = show["当前价"].round(2)
         show["压力位"] = show["压力位"].round(2)
