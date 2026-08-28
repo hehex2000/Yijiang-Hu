@@ -1,233 +1,250 @@
 # -*- coding: utf-8 -*-
 """
-vp_dashboard: Volume Profile Streamlit 仪表盘（计划 P4 / M6）
-对标 Kara 视频 6 Tab 展示层，但按我们实际产物落地，强调诚实红线：
-  - 日线级近似，非精确支撑压力
-  - 因子仅为弱描述工具，非已验证 alpha（见因子验证总览红牌）
-四个 Tab：
-  1) 个股 Volume Profile 分析（实时算，vp_data+vp_core）
-  2) 因子验证总览（IC / 宽成本净LS / walk-forward / 冗余 / overlay + 红牌结论）
-  3) 板块热力（31 申万一级）
-  4) 市场扫描（全A 支撑/压力/R 最优）
-运行：streamlit run vp_dashboard.py  （需 managed venv 装 streamlit+plotly）
+vp_dashboard: Volume Profile 最简看板
+只做一件事：把"量价密集区"翻译成人话——
+  - 个股：当前价跌到成交量密集的"支撑位"附近？还是顶在"压力位/见顶"附近？
+  - 全市场：哪些票在支撑位（潜在机会）、哪些在压力位（潜在见顶）？
+不堆指标、不装专业。前视/成本等严谨问题在代码与 CSV 里，看板只给结论。
 """
 import os
 import sqlite3
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 
 import config
 import vp_data
 import vp_core
-import vp_factor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.join(HERE, "data", "results", "volume_profile")
+OUT_DIR = os.path.join(HERE, "data", "results", "volume_profile")
 DB_PATH = config.DATA.get("local_db_path", "")
+NEAR_PCT = 0.03
 
-st.set_page_config(page_title="Volume Profile 仪表盘", layout="wide")
-st.title("Volume Profile（密集成交区）分析仪表盘")
-
-st.markdown(
-    "> **诚实红线**：日线高低价区间宽 → VPVR 为**日线级近似**（峰值偏软、箱宽敏感），"
-    "非精确支撑压力位；因子验证结论显示 dist_to_poc 为**弱描述因子**（|IC|≈0.06，64% 冗余于 MA 距离），"
-    "仅作反转信号廉价确认 overlay（+2.6pp/年），**非独立 alpha**。下方数字均为已跑完验证的产物，非实时重算策略收益。"
+st.set_page_config(page_title="Volume Profile 量价支撑/见顶看板", layout="wide")
+st.title("Volume Profile 量价支撑 / 见顶看板")
+st.caption(
+    "原理一句话：把一段时间每根 K 线的成交量按价位堆起来，堆得最高的价位就是"
+    "「大多数人在这成交」的地方。价格跌回这种密集区=下方有量撑（支撑位）；"
+    "涨到这种密集区=上方有量压（压力位/容易见顶）。本看板只告诉你「现在在哪」。"
 )
 
 
 @st.cache_data
 def load_stock_list():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        "SELECT ts_code, name FROM stock_basic WHERE ts_code LIKE '%.SH' OR ts_code LIKE '%.SZ'",
-        conn,
-    )
-    conn.close()
-    df["label"] = df["ts_code"] + " " + df["name"]
-    return df.sort_values("ts_code").reset_index(drop=True)
-
-
-def read_csv(name):
-    p = os.path.join(RESULTS, name)
-    if not os.path.exists(p):
-        return None
     try:
-        return pd.read_csv(p)
-    except Exception:
+        df = pd.read_sql_query("SELECT ts_code, name, industry FROM stock_basic", conn)
+    finally:
+        conn.close()
+    df["label"] = df["name"] + " (" + df["ts_code"] + ")"
+    return df.sort_values("label")
+
+
+@st.cache_data
+def load_scan(kind):
+    if kind == "support":
+        fs = [f for f in os.listdir(OUT_DIR) if f.startswith("scan_near_support_")]
+    else:
+        fs = [f for f in os.listdir(OUT_DIR) if f.startswith("scan_near_resistance_")]
+    if not fs:
+        return pd.DataFrame()
+    df = pd.read_csv(os.path.join(OUT_DIR, sorted(fs)[-1]), encoding="utf-8-sig")
+    return df
+
+
+def diagnose(ts_code, window):
+    df = vp_data.get_daily(ts_code)
+    if df is None or len(df) < window:
         return None
-
-
-# ───────────────────────── Tab 1: 个股 VP 实时分析 ─────────────────────────
-def tab_single():
-    st.header("① 个股 Volume Profile 分析（实时计算）")
-    sl = load_stock_list()
-    sel = st.selectbox("选择标的", sl["label"].tolist(), index=0)
-    ts_code = sel.split(" ")[0]
-    c1, c2, c3 = st.columns(3)
-    window = c1.slider("回看交易日", 60, 250, 120, 10)
-    n_bins = c2.slider("分箱数", 40, 160, 80, 10)
-    sigma = c3.slider("平滑 σ", 0.5, 4.0, 2.0, 0.5)
-    adjust = st.radio("复权口径", ["raw", "hfq"], horizontal=True,
-                      help="S/R 检测用 raw（真实成交价记忆）；因子可比用 hfq")
-    df = vp_data.get_daily(ts_code, adjust=adjust)
-    if df is None or len(df) < window + 5:
-        st.warning("数据不足，无法计算")
-        return
+    price = float(df["close"].iloc[-1])
     w = df.tail(window).reset_index(drop=True)
-    res = vp_core.volume_profile(w, n_bins=n_bins, smooth_sigma=sigma)
+    res = vp_core.volume_profile(w, n_bins=80, smooth_sigma=2.0)
     if res is None:
-        st.warning("volume_profile 返回 None")
-        return
+        return None
     centers, raw, sm = res
     zones, poc = vp_core.detect_zones(centers, sm)
-    va_low, va_high = vp_factor.value_area_band(raw, centers)
-    last_close = float(w["close"].iloc[-1])
-    dist_to_poc = (last_close - poc) / poc if poc > 0 else np.nan
-    supports = [p for p, _ in zones if p < last_close]
-    resist = [p for p, _ in zones if p > last_close]
-    near_sup = max(supports) if supports else np.nan
-    near_res = min(resist) if resist else np.nan
-    sup_dist = (last_close - near_sup) / last_close * 100 if near_sup == near_sup else np.nan
-    va_pass = 1.0 if last_close >= va_low else 0.0
+    if not zones:
+        return None
+    supports = [p for p, _ in zones if p < price]
+    resists = [p for p, _ in zones if p > price]
+    support = max(supports) if supports else None
+    resistance = min(resists) if resists else None
+    sup_dist = (price - support) / price if support else None
+    res_dist = (resistance - price) / price if resistance else None
 
-    m = st.columns(4)
-    m[0].metric("dist_to_poc", f"{dist_to_poc*100:.2f}%")
-    m[1].metric("最近支撑距离%", f"{sup_dist:.2f}%" if sup_dist == sup_dist else "NA")
-    m[2].metric("VA 通过(1=在VA上沿上)", f"{va_pass:.0f}")
-    m[3].metric("POC 价", f"{poc:.2f}")
-
-    st.markdown(f"**POC**={poc:.2f} ｜ **价值区**=[{va_low:.2f}, {va_high:.2f}] ｜ "
-                f"**最近支撑**={near_sup:.2f} ｜ **最近压力**={near_res:.2f} ｜ 显著区数={len(zones)}")
-
-    fig_price = go.Figure()
-    fig_price.add_trace(go.Scatter(x=w["date"], y=w["close"], mode="lines",
-                                   name="close", line=dict(color="#1f77b4", width=1.2)))
-    for lbl, val, col in [("POC", poc, "red"), ("VA高", va_high, "green"),
-                          ("VA低", va_low, "green"), ("最近支撑", near_sup, "orange"),
-                          ("最近压力", near_res, "purple")]:
-        if val == val:
-            fig_price.add_hline(y=val, line_dash="dash", line_color=col,
-                                annotation_text=lbl, annotation_font_size=10)
-    fig_price.update_layout(height=360, title="价格 + 关键价位",
-                            xaxis_title="trade_date", yaxis_title="price", margin=dict(t=30))
-    st.plotly_chart(fig_price, use_container_width=True)
-
-    fig_vp = go.Figure()
-    fig_vp.add_trace(go.Bar(x=sm, y=centers, orientation="h",
-                            marker=dict(color=sm, colorscale="Blues"), name="成交量分布"))
-    fig_vp.add_vline(x=sm.max(), line_color="red", annotation_text="POC")
-    fig_vp.update_layout(height=420, title="Volume Profile（水平直方图，价 vs 成交量）",
-                         xaxis_title="成交量(平滑)", yaxis_title="price", margin=dict(t=30))
-    st.plotly_chart(fig_vp, use_container_width=True)
-    st.caption("算法四步：range-weighted 分箱 → 加权 → scipy 高斯平滑 → find_peaks 检测峰值。"
-               "POC=成交量最大箱中心；价值区=从 POC 向两侧覆盖 70% 成交量的区间。")
-
-
-# ───────────────────────── Tab 2: 因子验证总览 ─────────────────────────
-def tab_validation():
-    st.header("② 因子验证总览（anti-overfitting 六闸产物）")
-    st.error("🔴 **红牌结论**：dist_to_poc 真实但弱（|IC|≈0.06）+ regime-dependent + "
-             "64% 冗余于 MA距离 → **不独立入库**，仅作 rev_21 反转信号的确认 overlay（+2.6pp/年）。", icon="🚫")
-
-    st.subheader("IC / 分层（Gate1，top-N 小宇宙，含幸存者偏差）")
-    ic = read_csv("ic_report.csv")
-    if ic is not None:
-        st.dataframe(ic, use_container_width=True)
+    if support and sup_dist <= NEAR_PCT:
+        verdict, color = "支撑位附近", "green"
+        tip = "价格跌到成交量密集区，下方有「量撑」，潜在机会区"
+    elif resistance and res_dist <= NEAR_PCT:
+        verdict, color = "见顶 / 压力位附近", "red"
+        tip = "价格顶在成交量密集区，上方有「量压」，容易见顶/回调"
+    elif resistance is None:
+        verdict, color = "突破（上方无压力）", "blue"
+        tip = "现价已在所有密集区之上，上方暂无量压"
     else:
-        st.warning("ic_report.csv 缺失")
-
-    st.subheader("宽成本组合层净 LS（Gate2，全市场面板，扣 0.60%/月）")
-    net = read_csv("m2_wide_net_portfolio.csv")
-    if net is not None:
-        st.dataframe(net, use_container_width=True)
-        alive = net[net["alive"] == "Y"]["factor"].tolist()
-        st.success("存活因子(alive=Y)：" + (", ".join(alive) if alive else "无"))
-    else:
-        st.warning("m2_wide_net_portfolio.csv 缺失")
-
-    st.subheader("Walk-forward OOS（Gate4）")
-    eq = read_csv("wf_equity.csv")
-    yt = read_csv("wf_year_table.csv")
-    wf = read_csv("wf_rolling_folds.csv")
-    if eq is not None:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=eq["date"], y=eq["cum_eq"], mode="lines", name="累计净净值"))
-        fig.update_layout(height=320, title="dist_to_poc 净LS 累计净值(滚动OOS)",
-                          yaxis_title="cum_eq", margin=dict(t=30))
-        st.plotly_chart(fig, use_container_width=True)
-    if yt is not None:
-        st.markdown("**逐年净LS**")
-        st.dataframe(yt, use_container_width=True)
-    if wf is not None:
-        st.markdown("**滚动折叠（train60/test12，仅test期OOS）**")
-        st.dataframe(wf, use_container_width=True)
-
-    st.subheader("冗余检验（Gate5）：与 rev/ma_dist/mom 横截面相关 + 残差增量")
-    corr = read_csv("redundancy_corr_raw.csv")
-    ric = read_csv("redundancy_ic.csv")
-    inc = read_csv("redundancy_incremental.csv")
-    if corr is not None:
-        cm = corr.set_index(corr.columns[0])
-        fig = go.Figure(go.Heatmap(z=cm.values, x=cm.columns.tolist(),
-                                   y=cm.index.tolist(), colorscale="RdBu", zmid=0))
-        fig.update_layout(height=360, title="Spearman 相关矩阵", margin=dict(t=30))
-        st.plotly_chart(fig, use_container_width=True)
-    if ric is not None:
-        st.dataframe(ric, use_container_width=True)
-    if inc is not None:
-        st.dataframe(inc, use_container_width=True)
-        st.info("残差 IC≈0 → 不提供超出 MA距离/长反转 的增量（冗余）")
-
-    st.subheader("Overlay 确认（Gate6）：dist_to_poc 确认 rev_21")
-    ov = read_csv("overlay_confirm.csv")
-    if ov is not None:
-        st.dataframe(ov, use_container_width=True)
+        verdict, color = "中性", "gray"
+        tip = "既不在支撑也不在压力附近"
+    return dict(
+        ts_code=ts_code, price=price, poc=poc, support=support,
+        sup_dist=sup_dist, resistance=resistance, res_dist=res_dist,
+        verdict=verdict, color=color, tip=tip,
+    )
 
 
-# ───────────────────────── Tab 3: 板块热力 ─────────────────────────
-def tab_sector():
-    st.header("③ 板块热力（31 申万一级，VP 视角）")
-    df = read_csv("sector_heatmap_20260828.csv")
-    if df is None:
-        st.warning("sector_heatmap_20260828.csv 缺失")
-        return
-    st.dataframe(df, use_container_width=True)
-    if "status" in df.columns and "support_dist_pct" in df.columns:
-        colmap = {"bullish": "red", "bearish": "green", "neutral": "gray"}
-        cols = df["status"].map(lambda s: colmap.get(str(s), "gray"))
-        fig = go.Figure(go.Bar(x=df["support_dist_pct"], y=df["name"],
-                               orientation="h", marker=dict(color=cols),
-                               text=df["status"], textposition="auto"))
-        fig.update_layout(height=720, title="距最近支撑距离%（红=偏多/近支撑, 绿=偏空/远支撑）",
-                          margin=dict(t=30), yaxis=dict(autorange="reversed"))
-        st.plotly_chart(fig, use_container_width=True)
+def price_chart(ts_code, window, d):
+    df = vp_data.get_daily(ts_code).tail(window).reset_index(drop=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["close"], name="收盘价",
+        line=dict(color="#1f77b4", width=1.5),
+    ))
+    lines = []
+    if d["support"] is not None:
+        lines.append(("支撑位", d["support"], "green"))
+    if d["resistance"] is not None:
+        lines.append(("压力位/见顶", d["resistance"], "red"))
+    if d["poc"] is not None:
+        lines.append(("POC(最密成交价)", d["poc"], "orange"))
+    for name, lvl, c in lines:
+        fig.add_hline(
+            y=lvl, line_color=c, line_dash="dash",
+            annotation_text=name, annotation_position="right",
+        )
+    fig.update_layout(
+        height=380, margin=dict(l=30, r=30, t=20, b=20),
+        yaxis_title="价格", xaxis_title="交易日(近%d根)" % window,
+        showlegend=False,
+    )
+    return fig
 
 
-# ───────────────────────── Tab 4: 市场扫描 ─────────────────────────
-def tab_scan():
-    st.header("④ 市场扫描（全A，2026-08-28 快照）")
-    near_s = read_csv("scan_near_support_20260828.csv")
-    near_r = read_csv("scan_near_resistance_20260828.csv")
-    best_r = read_csv("scan_best_R_20260828.csv")
-    kind = st.radio("扫描类型", ["近支撑", "近压力", "R最优"], horizontal=True)
-    d = {"近支撑": near_s, "近压力": near_r, "R最优": best_r}[kind]
+def tab_single():
+    st.header("① 个股：现在在支撑位还是见顶压力位？")
+    slist = load_stock_list()
+    sel = st.selectbox("选一只股票", slist["label"].tolist(), index=0)
+    code = slist.loc[slist["label"] == sel, "ts_code"].iloc[0]
+    window = st.slider("看多长（交易日）", 60, 500, 250, 10)
+    d = diagnose(code, window)
     if d is None:
-        st.warning("对应 CSV 缺失")
+        st.warning("数据不足，算不出来。")
         return
-    st.dataframe(d, use_container_width=True)
-    st.caption("signal/support_strength/resistance_strength/R 为 VPVR 描述性指标，"
-               "非买卖建议；R=潜在收益/风险比（带 RISK_FLOOR 防除零）。")
+    badge = (
+        "<span style='background:%s;color:white;padding:4px 12px;"
+        "border-radius:6px;font-size:20px;font-weight:bold'>%s</span>"
+        % (d["color"], d["verdict"])
+    )
+    st.markdown(badge, unsafe_allow_html=True)
+    st.caption(d["tip"])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("当前价", "%.2f" % d["price"])
+    c2.metric(
+        "支撑位",
+        "%.2f" % d["support"] if d["support"] else "—",
+        "%.1f%%" % (d["sup_dist"] * 100) if d["sup_dist"] is not None else "",
+    )
+    c3.metric(
+        "压力位/见顶",
+        "%.2f" % d["resistance"] if d["resistance"] else "—（突破）",
+        "%.1f%%" % (d["res_dist"] * 100) if d["res_dist"] is not None else "",
+    )
+
+    st.plotly_chart(price_chart(code, window, d), use_container_width=True)
+
+    parts = ["当前价 %.2f。" % d["price"]]
+    if d["support"]:
+        parts.append(
+            "下方支撑位 %.2f（差 %.1f%%），跌到这里大概率是「量撑」区。"
+            % (d["support"], d["sup_dist"] * 100)
+        )
+    if d["resistance"]:
+        parts.append(
+            "上方压力位 %.2f（差 %.1f%%），涨到这里容易见顶。"
+            % (d["resistance"], d["res_dist"] * 100)
+        )
+    elif d["support"]:
+        parts.append("上方已无密集压力，属突破状态。")
+    st.info("".join(parts))
 
 
-tabs = st.tabs(["① 个股分析", "② 因子验证总览", "③ 板块热力", "④ 市场扫描"])
-with tabs[0]:
+def tab_scan():
+    st.header("② 全市场扫描：谁在支撑位（机会）？谁在见顶（风险）？")
+    sup = load_scan("support")
+    res = load_scan("resistance")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("已扫描（有量价区）", "%d 只" % (len(sup) + len(res)) if not sup.empty else "—")
+    m2.metric("支撑位附近（潜在机会）", "%d 只" % len(sup) if not sup.empty else "0")
+    m3.metric("见顶压力附近（潜在风险）", "%d 只" % len(res) if not res.empty else "0")
+
+    maxd = st.slider("最大距离(%)——只看离得最近的", 1, 10, 5, 1)
+    only_a = st.checkbox("剔除 ST / *", value=True)
+    st.caption("列表按「离支撑/压力由近到远」排序，越靠前越贴合。")
+
+    def filt(df, dist_col):
+        if df.empty:
+            return df
+        df = df[df[dist_col] <= maxd / 100]
+        if only_a:
+            df = df[~df["name"].astype(str).str.contains("ST|\\*", na=False)]
+        return df
+
+    st.subheader("🟢 支撑位附近（跌到量架上，潜在机会）")
+    s = filt(sup, "support_dist_pct")
+    if s.empty:
+        st.write("暂无")
+    else:
+        show = s[["name", "ts_code", "industry", "price", "support",
+                  "support_dist_pct", "signal"]].copy()
+        show.columns = ["名称", "代码", "行业", "当前价", "支撑位", "距支撑%", "信号"]
+        show["距支撑%"] = (show["距支撑%"] * 100).round(2)
+        show["当前价"] = show["当前价"].round(2)
+        show["支撑位"] = show["支撑位"].round(2)
+        st.dataframe(show, use_container_width=True, height=360)
+
+    st.subheader("🔴 见顶 / 压力位附近（顶在量顶下，潜在风险）")
+    r = filt(res, "resistance_dist_pct")
+    if r.empty:
+        st.write("暂无")
+    else:
+        show = r[["name", "ts_code", "industry", "price", "resistance",
+                  "resistance_dist_pct", "signal"]].copy()
+        show.columns = ["名称", "代码", "行业", "当前价", "压力位", "距压力%", "信号"]
+        show["距压力%"] = (show["距压力%"] * 100).round(2)
+        show["当前价"] = show["当前价"].round(2)
+        show["压力位"] = show["压力位"].round(2)
+        st.dataframe(show, use_container_width=True, height=360)
+
+
+def tab_help():
+    st.header("③ 这东西怎么看（大白话）")
+    st.markdown(
+        "**它在算什么**\n"
+        "- 把最近 N 天每根 K 线的成交量，按它走过的价位区间分摊，堆成一条"
+        "「成交量 vs 价位」的直方图。\n"
+        "- 堆得最高的几个价位 = 大多数人曾经在这成交，叫「量价密集区」。\n"
+        "- 现价**下方**最近的密集区 = **支撑位**（跌到这里有人接）；现价**上方**"
+        "最近的密集区 = **压力位**（涨到这里有人砸）。\n\n"
+        "**两种结论**\n"
+        "- 🟢 **支撑位附近**：价格已跌回密集区，下方有「量撑」——传统上是观察低吸的区域。\n"
+        "- 🔴 **见顶 / 压力位附近**：价格涨到密集区，上方有「量压」——传统上是容易回落/见顶的区域。\n\n"
+        "**诚实提醒（不是免责，是事实）**\n"
+        "- 它只回答「**现在价格在哪**」，不保证「一定会弹 / 一定会跌」。量是历史成交，不是未来托单。\n"
+        "- 这是**看板 / 选股漏斗**：先圈出「在支撑、在压力」的票，再拿你自己的其它信号"
+        "（基本面、趋势、我们做好的反转 overlay）去筛，别单独照它买卖。\n"
+        "- 全市场「支撑附近」远多于「压力附近」时，说明大盘普遍趴在量架上"
+        "（可能超卖、也可能要破位），结合大势看。\n"
+        "- 扫描用的是本地日线（不复权），分红跳空不平移记忆位；截面快照，未做前视。\n"
+    )
+
+
+t1, t2, t3 = st.tabs(["① 个股诊断", "② 全市场扫描", "③ 怎么看"])
+with t1:
     tab_single()
-with tabs[1]:
-    tab_validation()
-with tabs[2]:
-    tab_sector()
-with tabs[3]:
+with t2:
     tab_scan()
+with t3:
+    tab_help()
