@@ -168,6 +168,28 @@ def tab_single():
         unsafe_allow_html=True,
     )
 
+    # 综合判断：位置 + 反转双确认 -> ✅机会 / ⚠️风险
+    if d["verdict"] == "支撑位附近":
+        if ok:
+            cmb_color, cmb_txt = "green", "✅ 机会（支撑位 + 反转双确认，偏低吸）"
+        else:
+            cmb_color, cmb_txt = "gray", "⚪ 在支撑但反转未确认（待观察，别急）"
+    elif d["verdict"] == "见顶 / 压力位附近":
+        if ok:
+            cmb_color, cmb_txt = "red", "⚠️ 风险（见顶压力 + 反转双确认，偏回落）"
+        else:
+            cmb_color, cmb_txt = "gray", "⚪ 见顶但反转未确认（待观察）"
+    elif d["verdict"] == "突破（上方无压力）":
+        cmb_color, cmb_txt = "blue", "🔵 突破（上方暂无量压）"
+    else:
+        cmb_color, cmb_txt = "gray", "⚪ 中性（既不在支撑也不在压力）"
+    st.markdown(
+        "<b>综合判断</b>："
+        "<span style='color:%s;font-weight:bold;font-size:18px'>%s</span>"
+        % (cmb_color, cmb_txt),
+        unsafe_allow_html=True,
+    )
+
     c1, c2, c3 = st.columns(3)
     c1.metric("当前价", "%.2f" % d["price"])
     c2.metric(
@@ -209,6 +231,36 @@ def tab_scan():
     m1.metric("已扫描（有量价区）", "%d 只" % (len(sup) + len(res)) if not sup.empty else "—")
     m2.metric("支撑位附近（潜在机会）", "%d 只" % len(sup) if not sup.empty else "0")
     m3.metric("见顶压力附近（潜在风险）", "%d 只" % len(res) if not res.empty else "0")
+
+    # 全市场冷热温度计：支撑数 - 压力数（用全量扫描，不看下方距离过滤）
+    support_n = len(sup)
+    pressure_n = len(res)
+    gap = support_n - pressure_n
+    if support_n + pressure_n > 0:
+        therm = go.Figure()
+        therm.add_trace(go.Bar(
+            x=["全市场冷热"], y=[max(gap, 0)],
+            marker_color="#2ca02c", name="支撑多出",
+            text="支撑 %d" % support_n, textposition="outside",
+        ))
+        therm.add_trace(go.Bar(
+            x=["全市场冷热"], y=[min(gap, 0)],
+            marker_color="#d62728", name="压力多出",
+            text="压力 %d" % pressure_n, textposition="outside",
+        ))
+        therm.update_layout(
+            height=150, margin=dict(l=20, r=20, t=34, b=10),
+            yaxis_title="只数差", showlegend=False,
+            title="🌡️ 支撑数 − 压力数 = %+d（读数偏暖 = 多数票趴在量撑区）" % gap,
+        )
+        st.plotly_chart(therm, use_container_width=True)
+        if gap > 100:
+            tone = "市场偏暖：全市场普遍落在量撑区——可能超卖待弹，也可能即将破位，结合大势看"
+        elif gap < -20:
+            tone = "市场偏冷：压力附近明显多于支撑，注意回落"
+        else:
+            tone = "多空大致平衡"
+        st.caption(tone)
 
     maxd = st.slider("最大距离(%)——只看离得最近的", 1, 10, 5, 1)
     only_a = st.checkbox("剔除 ST / *", value=True)
