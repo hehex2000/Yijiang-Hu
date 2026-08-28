@@ -318,11 +318,15 @@ _LIQ_CACHE = {}   # (ts_code, trade_date, lookback) -> (sigma, adv_yuan)
 
 
 def _compute_slippage(amount, trade_date=None, ts_code=None):
-    """返回滑点金额。默认 flat；开启平方根冲击且个股数据齐备时按流动性感知。"""
+    """返回滑点金额。默认 flat；开启平方根冲击且个股数据齐备时按流动性感知。
+
+    trade_date 缺省时回退到取价上下文；若上下文也缺，estimate_daily_liquidity
+    会以该票最新可得交易日为锚估计流动性（慢变量近似，不引入实质前视）。
+    """
     if USE_SQRT_IMPACT:
         tc = trade_date if trade_date is not None else _CTX_TRADE_DATE
         code = ts_code if ts_code is not None else _CTX_TS_CODE
-        if code is not None and tc is not None:
+        if code is not None:
             frac, adv, sigma = sqrt_impact_slippage(amount, code, tc)
             if frac is not None:
                 return amount * frac
@@ -337,15 +341,26 @@ def estimate_daily_liquidity(ts_code, trade_date, lookback=SQRT_IMPACT_LB):
     用 trade_date < ? 严格前视窗口（不含成交当日），避免开盘交易偷看当日收盘。
     按 (ts_code, trade_date, lookback) 缓存，避免 calc_fee 高频重复查询。
     """
-    key = (ts_code, int(trade_date), int(lookback))
+    key = (ts_code, int(trade_date) if trade_date is not None else -1, int(lookback))
     if key in _LIQ_CACHE:
         return _LIQ_CACHE[key]
     conn = get_conn()
     try:
+        # 防御：trade_date 上下文缺失时，锚定该票最新可得交易日（仅作流动性
+        # 估计兜底，流动性是慢变量，用最近窗口近似足够，不会引入实质前视）。
+        anchor = int(trade_date) if trade_date is not None else None
+        if anchor is None:
+            r = conn.execute(
+                "SELECT MAX(trade_date) FROM daily WHERE ts_code=?",
+                (ts_code,)).fetchone()
+            anchor = int(r[0]) if r and r[0] is not None else None
+        if anchor is None:
+            _LIQ_CACHE[key] = (None, None)
+            return (None, None)
         win = conn.execute(
             "SELECT trade_date FROM daily WHERE ts_code=? AND trade_date < ? "
             "ORDER BY trade_date DESC LIMIT ?",
-            (ts_code, int(trade_date), int(lookback))).fetchall()
+            (ts_code, anchor, int(lookback))).fetchall()
         if len(win) < 2:
             _LIQ_CACHE[key] = (None, None)
             return (None, None)
@@ -353,7 +368,7 @@ def estimate_daily_liquidity(ts_code, trade_date, lookback=SQRT_IMPACT_LB):
         rows = pd.read_sql_query(
             "SELECT close, amount FROM daily WHERE ts_code=? "
             "AND trade_date >= ? AND trade_date < ? ORDER BY trade_date",
-            conn, params=(ts_code, win_start, int(trade_date)))
+            conn, params=(ts_code, win_start, anchor))
         if len(rows) < 2:
             _LIQ_CACHE[key] = (None, None)
             return (None, None)
@@ -1060,13 +1075,16 @@ def select_dividend_low_vol_stocks(trade_date, top_n=None,
     return result[['ts_code']]
 
 
-def select_dividend_low_vol_clean(trade_date, top_n=None, stock_pool='000906.SH'):
+def select_dividend_low_vol_clean(trade_date, top_n=None, stock_pool='000906.SH',
+                                  require_low_pledge=True, pledge_ratio_max=30.0):
     """
     红利低波双排序选股（干净版 · 顶替含MACD的旧版）：
       - 股票池：默认中证800(zz800)，与 M1 已验证策略一致；stock_pool 可覆盖
       - 估值过滤：0<PE_TTM<50, 0<PB<10, dv_ttm>0, total_mv>0（与 M1.select_div_low_vol 一致）
       - 排除 ST
-      - 【不含】个股MACD金叉过滤 / 杠杆风控 / 红利质量三因子 / 大盘MACD择时层
+      - 含红利质量门禁（修回归：此前漏接；连续分红≥3年 + 经营现金流覆盖分红，
+        金融股按行业豁免，避免错杀银行类核心红利持仓）
+      - 【不含】个股MACD金叉过滤 / 杠杆风控 / 分红增长要求 / 大盘MACD择时层
       - 双排序：股息率pct降序 + 年化波动率pct升序，取 top_n
     返回含 ts_code 的 DataFrame（与 select_dividend_low_vol_stocks 同契约）。
     """
@@ -1123,6 +1141,19 @@ def select_dividend_low_vol_clean(trade_date, top_n=None, stock_pool='000906.SH'
         st_set = set(st_codes["ts_code"].tolist())
         df = df[~df['ts_code'].isin(st_set)]
 
+    if df.empty:
+        return df
+
+    # 红利质量门禁（修回归：clean 版此前漏接；金融豁免 + ②周期缓冲 + ③举债分红护栏）
+    df = apply_dividend_quality_filters(
+        df, trade_date, div_years_min=3,
+        require_ocf_cover=True, div_growth_min=None,
+        industry_exempt_ocf=True,
+        div_years_min_cyclical=10,
+        require_net_debt_check=True,
+        net_debt_ratio_jump=0.20,
+        require_low_pledge=require_low_pledge,
+        pledge_ratio_max=pledge_ratio_max)
     if df.empty:
         return df
 
@@ -1417,15 +1448,28 @@ def apply_leverage_filters(df, trade_date, de_ratio_exclude_pct=5, icover_min=3)
 # ============================================================
 def apply_dividend_quality_filters(df, trade_date,
                                    div_years_min=3, require_ocf_cover=True,
-                                   div_growth_min=None):
+                                   div_growth_min=None, industry_exempt_ocf=True,
+                                   div_years_min_cyclical=None,
+                                   require_net_debt_check=False,
+                                   net_debt_ratio_jump=0.20,
+                                   cyclical_industries=None,
+                                   require_low_pledge=False,
+                                   pledge_ratio_max=30.0):
     """
-    红利质量三因子过滤（视频「高/稳/增」框架的 稳 + 增 两块）：
+    红利质量过滤（视频「高/稳/增」框架的 稳 + 增，并扩展周期缓冲与举债分红两道护栏）：
       稳① 连续分红年数：dividend_detail 中连续 cash_div>0 的年数 ≥ div_years_min
                          （对标中证红利「过去3年连续现金分红」硬门槛）
       稳② 分红现金覆盖：最新年 ocfps（每股经营现金流）≥ 最新年 cash_div
                          （经营现金流覆盖每股分红，防「借钱/透支分红」陷阱）
+                         行业豁免：银行/保险/证券/多元金融 不适用工业 FCF 逻辑，
+                         跳过本项检查（避免错杀银行类核心红利持仓）
       增  分红增长：连续分红区间内 cash_div CAGR ≥ div_growth_min
                     （对标美股「分红贵族/连续增派」的质量维度；None=不要求）
+      稳④ 自利性分红护栏：最新可得股权质押比例(pledge_stat.pledge_ratio，单位%，
+          即占总股本比例) ≥ pledge_ratio_max(百分数，默认30=30%) 的非金融股剔除——
+          高分红叠加高整体质押，构成控股股东质押平仓压力下"自利性分红"嫌疑
+                         （整体质押占总股本；高质押背景下维持高分红=大股东质押增信/套现嫌疑）
+                         进池已是高分红票，叠加高质押即触发剔除
     数据窗口：分红历史取 trade_date 当年及之前 6 年（div_proc='实施'）；
               ocfps 取 2 年内最新年报。
     缺失处理：无分红历史的票 consec_years=0 → 被 稳① 剔除（红利策略本就不要非分红票）；
@@ -1440,10 +1484,23 @@ def apply_dividend_quality_filters(df, trade_date,
     ph = ','.join('?' * len(codes))
 
     ref_year = int(trade_date[:4])
-    div_min_date = f"{ref_year - 6}1231"
+    # 分红窗口随最大门槛动态扩展（周期行业需更长窗口统计连续年数）
+    _need = max(div_years_min, div_years_min_cyclical or 0)
+    div_min_date = f"{ref_year - _need - 1}1231"
     div_max_date = f"{ref_year}1231"
     ocf_min_date = f"{ref_year - 2}0101"
     ocf_max_date = f"{ref_year}1231"
+
+    # 内置周期行业集合（申万细分，强商品价格/产能周期属性）
+    if cyclical_industries is None:
+        cyclical_industries = {
+            '煤炭开采', '焦炭加工', '石油开采', '石油加工', '石油贸易',
+            '普钢', '特种钢', '钢加工', '铝', '铜', '铅锌', '小金属', '黄金', '矿物制品',
+            '化工原料', '化纤', '农药化肥', '染料涂料', '橡胶', '塑料',
+            '水泥', '玻璃', '其他建材',
+            '工程机械', '船舶', '水运', '港口', '航空',
+        }
+    fin_ind = {'银行', '保险', '证券', '多元金融'}
 
     conn = get_conn()
 
@@ -1469,6 +1526,45 @@ def apply_dividend_quality_filters(df, trade_date,
         ) lt ON f.ts_code = lt.ts_code AND f.end_date = lt.md
     """, conn, params=list(codes) + [ocf_min_date, ocf_max_date])
 
+    # 行业映射（无条件查询，供 ocf 豁免 + 周期判定共用）
+    df_ind = pd.read_sql_query(
+        f"SELECT ts_code, industry FROM stock_basic WHERE ts_code IN ({ph})",
+        conn, params=list(codes))
+    exempt_codes = set()
+    cyclical_codes = set()
+    if len(df_ind):
+        ind_map = dict(zip(df_ind['ts_code'], df_ind['industry']))
+        if industry_exempt_ocf:
+            exempt_codes = {c for c, i in ind_map.items() if i in fin_ind}
+        cyclical_codes = {c for c, i in ind_map.items() if i in cyclical_industries}
+
+    # 净负债检查数据（③ 举债维持分红）
+    df_nd = pd.DataFrame()
+    if require_net_debt_check:
+        df_nd = pd.read_sql_query(f"""
+            SELECT ts_code, end_date,
+                   st_borr, lt_borr, bond_payable,
+                   non_cur_liab_due_1y, st_bonds_payable, pledge_borr,
+                   money_cap, total_hldr_eqy_exc_min_int
+            FROM balance_sheet
+            WHERE ts_code IN ({ph})
+              AND end_date <= ?
+              AND end_date LIKE '____1231'
+            ORDER BY ts_code, end_date
+        """, conn, params=list(codes) + [f"{ref_year}1231"])
+
+    # 质押比例（④ 自利性分红护栏：高质押 + 高分红）
+    df_pl = pd.DataFrame()
+    if require_low_pledge:
+        df_pl = pd.read_sql_query(f"""
+            SELECT p.ts_code, p.pledge_ratio FROM pledge_stat p
+            JOIN (
+                SELECT ts_code, MAX(end_date) AS md FROM pledge_stat
+                WHERE ts_code IN ({ph}) AND end_date <= ?
+                GROUP BY ts_code
+            ) lt ON p.ts_code = lt.ts_code AND p.end_date = lt.md
+        """, conn, params=list(codes) + [trade_date])
+
     conn.close()
 
     n0 = len(df)
@@ -1476,6 +1572,7 @@ def apply_dividend_quality_filters(df, trade_date,
     consec_years = {}
     div_growth = {}
     latest_cd = {}
+    prev_cd = {}
     for ts_code, g in df_div.groupby('ts_code'):
         g = g.copy()
         g['yr'] = g['end_date'].str[:4].astype(int)
@@ -1492,6 +1589,8 @@ def apply_dividend_quality_filters(df, trade_date,
                 break
         consec_years[ts_code] = consec
         latest_cd[ts_code] = g.iloc[-1]['cash_div']
+        if len(g) >= 2:
+            prev_cd[ts_code] = g.iloc[-2]['cash_div']
         if len(run_years) >= 2:
             y0, y1 = min(run_years), max(run_years)
             d0, d1 = cds[y0], cds[y1]
@@ -1501,25 +1600,83 @@ def apply_dividend_quality_filters(df, trade_date,
     df['_consec_years'] = df['ts_code'].map(consec_years).fillna(0)
     df['_div_growth'] = df['ts_code'].map(div_growth)
     df['_latest_cd'] = df['ts_code'].map(latest_cd).fillna(0)
+    df['_prev_cd'] = df['ts_code'].map(prev_cd).fillna(0)
     df['_ocfps'] = df['ts_code'].map(
         dict(zip(df_ocf['ts_code'], df_ocf['ocfps'])) if len(df_ocf) else {})
+    df['_is_cyclical'] = df['ts_code'].isin(cyclical_codes)
 
-    # ── 稳① 连续分红年数门槛 ──
-    if div_years_min > 0:
-        drop = df['_consec_years'] < div_years_min
+    # ── 稳① 连续分红年数门槛（周期行业更严，要求穿越完整周期）──
+    if _need > 0:
+        _cyc_thr = div_years_min_cyclical if div_years_min_cyclical else div_years_min
+        def _min_years(r):
+            return _cyc_thr if (r['_is_cyclical'] and div_years_min_cyclical) else div_years_min
+        _thr = df.apply(_min_years, axis=1)
+        drop = df['_consec_years'] < _thr
         n_drop = int(drop.sum())
         if n_drop > 0:
             df = df[~drop]
-            print(f"  ⛔ 红利质量①：连续分红年数<{div_years_min}年 — 剔除 {n_drop} 只")
+            print(f"  ⛔ 红利质量①：连续分红年数不足（普通≥{div_years_min}年/周期≥{_cyc_thr}年）— 剔除 {n_drop} 只")
 
-    # ── 稳② 分红现金覆盖 ──
+    # ── 稳② 分红现金覆盖（金融股按行业豁免）──
     if require_ocf_cover:
+        if exempt_codes:
+            print(f"  🏦 红利质量②：行业豁免（银行/保险/证券/多元金融）跳过ocf覆盖 {len(exempt_codes)} 只")
         has_ocf = df['_ocfps'].notna()
-        mask = has_ocf & (df['_ocfps'] < df['_latest_cd'])
+        mask = has_ocf & (df['_ocfps'] < df['_latest_cd']) & (~df['ts_code'].isin(exempt_codes))
         n_drop = int(mask.sum())
         if n_drop > 0:
             df = df[~mask]
             print(f"  ⛔ 红利质量②：经营现金流未覆盖分红（ocfps<每股分红）— 剔除 {n_drop} 只（防借钱/透支分红）")
+
+    # ── 稳③ 举债维持分红（净负债率同比跳升且分红未降）──
+    if require_net_debt_check and len(df_nd):
+        def _nd_ratio(sub):
+            if len(sub) < 2:
+                return {}
+            out = {}
+            for _, row in sub.iterrows():
+                def _f(x):
+                    try:
+                        if x is None or x == '' or (isinstance(x, float) and pd.isna(x)):
+                            return 0.0
+                        return float(x)
+                    except Exception:
+                        return 0.0
+                ibd = (_f(row['st_borr']) + _f(row['lt_borr']) + _f(row['bond_payable'])
+                       + _f(row['non_cur_liab_due_1y'])
+                       + _f(row['st_bonds_payable']) + _f(row['pledge_borr']))
+                cash = _f(row['money_cap'])
+                eqy = _f(row['total_hldr_eqy_exc_min_int'])
+                net = ibd - cash
+                out[row['end_date']] = (net / eqy) if eqy > 0 else None
+            return out
+        nd_map = {c: _nd_ratio(g.sort_values('end_date'))
+                  for c, g in df_nd.groupby('ts_code')}
+        df['_nd_ratio_t'] = df['ts_code'].map(
+            lambda c: (list(nd_map[c].values())[-1] if c in nd_map and nd_map[c] else None))
+        df['_nd_ratio_t1'] = df['ts_code'].map(
+            lambda c: (list(nd_map[c].values())[-2] if c in nd_map and len(nd_map[c]) >= 2 else None))
+        has_both = df['_nd_ratio_t'].notna() & df['_nd_ratio_t1'].notna()
+        div_maintained = df['_latest_cd'] >= df['_prev_cd']
+        mask = (has_both & (~df['ts_code'].isin(exempt_codes))
+                & ((df['_nd_ratio_t'] - df['_nd_ratio_t1']) >= net_debt_ratio_jump)
+                & div_maintained)
+        n_drop = int(mask.sum())
+        if n_drop > 0:
+            df = df[~mask]
+            print(f"  ⛔ 红利质量③：净负债率同比跳升≥{net_debt_ratio_jump*100:.0f}pct 且分红未降（举债维持分红）— 剔除 {n_drop} 只")
+
+    # ── 稳④ 自利性分红护栏（高质押 + 高分红；进池已是高分红）──
+    # 金融股（银行/保险/证券/多元金融）的结构性质押（资管/战略配售/股权划转）
+    # 非控股股东掏空信号，按 ocf 豁免同例排除。
+    if require_low_pledge:
+        _pl_map = dict(zip(df_pl['ts_code'], df_pl['pledge_ratio'])) if len(df_pl) else {}
+        df['_pledge_ratio'] = df['ts_code'].map(_pl_map).fillna(0.0)
+        mask = (df['_pledge_ratio'] >= pledge_ratio_max) & (~df['ts_code'].isin(exempt_codes))
+        n_drop = int(mask.sum())
+        if n_drop > 0:
+            df = df[~mask]
+            print(f"  ⛔ 红利质量④：整体质押比例≥{pledge_ratio_max:.0f}%（自利性分红嫌疑，非金融）— 剔除 {n_drop} 只")
 
     # ── 增 分红增长 ──
     if div_growth_min is not None:
@@ -1530,7 +1687,9 @@ def apply_dividend_quality_filters(df, trade_date,
             df = df[~mask]
             print(f"  ⛔ 红利质量③：分红增长CAGR<{div_growth_min*100:.1f}% — 剔除 {n_drop} 只")
 
-    df = df.drop(columns=[c for c in ['_consec_years', '_div_growth', '_latest_cd', '_ocfps']
+    df = df.drop(columns=[c for c in ['_consec_years', '_div_growth', '_latest_cd',
+                                      '_prev_cd', '_ocfps', '_is_cyclical',
+                                      '_nd_ratio_t', '_nd_ratio_t1', '_pledge_ratio']
                           if c in df.columns])
 
     n1 = len(df)
