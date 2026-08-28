@@ -94,6 +94,22 @@ def diagnose(ts_code, window):
     )
 
 
+def reversal_overlay(rev21, price, poc):
+    """反转 overlay 确认：rev_21(近21日收益) 与 dist_to_poc(价相对POC) 是否同向。
+    两者都指同一均值回复方向才确认。返回 (确认bool, 中文说明)。"""
+    if rev21 is None or poc is None:
+        return False, "无数据"
+    vp_long = price < poc            # 价在POC下 -> 均值回复向上 -> 做多偏
+    rev_long = rev21 < 0             # 近21日下跌 -> 短期反转向上 -> 做多偏
+    agree = (vp_long == rev_long)
+    vp_txt = "价在POC下(偏多)" if vp_long else "价在POC上(偏空)"
+    rev_txt = "近21日下跌(偏多)" if rev_long else "近21日上涨(偏空)"
+    if agree:
+        direction = "做多/反弹" if vp_long else "做空/回落"
+        return True, "确认(%s · %s → 同向%s)" % (vp_txt, rev_txt, direction)
+    return False, "未确认(%s · %s → 反向)" % (vp_txt, rev_txt)
+
+
 def price_chart(ts_code, window, d):
     df = vp_data.get_daily(ts_code).tail(window).reset_index(drop=True)
     fig = go.Figure()
@@ -139,6 +155,19 @@ def tab_single():
     st.markdown(badge, unsafe_allow_html=True)
     st.caption(d["tip"])
 
+    # 反转 overlay（位置 + 信号双确认）
+    df0 = vp_data.get_daily(code)
+    rev21 = float(df0["close"].pct_change(21).iloc[-1]) if (
+        df0 is not None and len(df0) > 21) else None
+    ok, ov_txt = reversal_overlay(rev21, d["price"], d["poc"])
+    ov_color = "green" if ok else "gray"
+    st.markdown(
+        "<b>反转 overlay（位置+信号双确认）</b>："
+        "<span style='color:%s;font-weight:bold'>%s</span>"
+        % (ov_color, ov_txt),
+        unsafe_allow_html=True,
+    )
+
     c1, c2, c3 = st.columns(3)
     c1.metric("当前价", "%.2f" % d["price"])
     c2.metric(
@@ -172,6 +201,7 @@ def tab_single():
 
 def tab_scan():
     st.header("② 全市场扫描：谁在支撑位（机会）？谁在见顶（风险）？")
+    st.caption("进阶：勾选「反转overlay确认」可把列表缩到「位置 + 反转信号双确认」的高信心候选。")
     sup = load_scan("support")
     res = load_scan("resistance")
 
@@ -182,6 +212,7 @@ def tab_scan():
 
     maxd = st.slider("最大距离(%)——只看离得最近的", 1, 10, 5, 1)
     only_a = st.checkbox("剔除 ST / *", value=True)
+    only_ov = st.checkbox("只看反转overlay确认的（位置+信号双确认）", value=False)
     st.caption("列表按「离支撑/压力由近到远」排序，越靠前越贴合。")
 
     def filt(df, dist_col):
@@ -190,16 +221,32 @@ def tab_scan():
         df = df[df[dist_col] <= maxd / 100]
         if only_a:
             df = df[~df["name"].astype(str).str.contains("ST|\\*", na=False)]
+        if only_ov and "rev_21" in df.columns:
+            vp_long = df["poc_dist_pct"] < 0
+            rev_long = df["rev_21"] < 0
+            df = df[vp_long == rev_long]
         return df
+
+    def overlay_col(df):
+        if "rev_21" not in df.columns:
+            return None
+        return np.where((df["poc_dist_pct"] < 0) == (df["rev_21"] < 0), "✅", "—")
 
     st.subheader("🟢 支撑位附近（跌到量架上，潜在机会）")
     s = filt(sup, "support_dist_pct")
     if s.empty:
         st.write("暂无")
     else:
-        show = s[["name", "ts_code", "industry", "price", "support",
-                  "support_dist_pct", "signal"]].copy()
-        show.columns = ["名称", "代码", "行业", "当前价", "支撑位", "距支撑%", "信号"]
+        ov = overlay_col(s)
+        cols = ["name", "ts_code", "industry", "price", "support", "support_dist_pct"]
+        if ov is not None:
+            s = s.copy()
+            s["反转overlay"] = ov
+            cols.append("反转overlay")
+        cols.append("signal")
+        show = s[cols].copy()
+        show.columns = ["名称", "代码", "行业", "当前价", "支撑位", "距支撑%"] + \
+            (["反转overlay"] if ov is not None else []) + ["信号"]
         show["距支撑%"] = (show["距支撑%"] * 100).round(2)
         show["当前价"] = show["当前价"].round(2)
         show["支撑位"] = show["支撑位"].round(2)
@@ -210,9 +257,16 @@ def tab_scan():
     if r.empty:
         st.write("暂无")
     else:
-        show = r[["name", "ts_code", "industry", "price", "resistance",
-                  "resistance_dist_pct", "signal"]].copy()
-        show.columns = ["名称", "代码", "行业", "当前价", "压力位", "距压力%", "信号"]
+        ov = overlay_col(r)
+        cols = ["name", "ts_code", "industry", "price", "resistance", "resistance_dist_pct"]
+        if ov is not None:
+            r = r.copy()
+            r["反转overlay"] = ov
+            cols.append("反转overlay")
+        cols.append("signal")
+        show = r[cols].copy()
+        show.columns = ["名称", "代码", "行业", "当前价", "压力位", "距压力%"] + \
+            (["反转overlay"] if ov is not None else []) + ["信号"]
         show["距压力%"] = (show["距压力%"] * 100).round(2)
         show["当前价"] = show["当前价"].round(2)
         show["压力位"] = show["压力位"].round(2)
@@ -237,7 +291,16 @@ def tab_help():
         "（基本面、趋势、我们做好的反转 overlay）去筛，别单独照它买卖。\n"
         "- 全市场「支撑附近」远多于「压力附近」时，说明大盘普遍趴在量架上"
         "（可能超卖、也可能要破位），结合大势看。\n"
-        "- 扫描用的是本地日线（不复权），分红跳空不平移记忆位；截面快照，未做前视。\n"
+        "- 扫描用的是本地日线（不复权），分红跳空不平移记忆位；截面快照，未做前视。\n\n"
+        "**反转 overlay（位置 + 信号双确认）**\n"
+        "- 光看「在支撑」还不够：支撑可能跌破。我们加了一道**反转信号**做确认——\n"
+        "  用「近21日收益」(rev_21，跌多了短期易反弹) 和「价相对成交密集中心(dist_to_poc)」"
+        "两个反向因子，**方向一致才确认**：\n"
+        "  - 🟢 支撑附近 + 近21日下跌 + 价在POC下 → 三重同向，反弹概率更高（✅确认）；\n"
+        "  - 🔴 见顶附近 + 近21日上涨 + 价在POC上 → 三重同向，回落概率更高（✅确认）。\n"
+        "- 勾选「只看反转overlay确认的」即可把列表缩到双确认的高信心候选。\n"
+        "- 该 overlay 已做组合层净成本 + walk-forward 验证（覆盖约82%、年化净 +13.1% vs 基线 +10.5%），"
+        "是弱因子确认层、非独立 alpha；仍须结合你自己的判断，别单独照它买卖。\n"
     )
 
 

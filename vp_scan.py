@@ -70,6 +70,7 @@ def scan_one(ts_code):
     price = float(df["close"].iloc[-1])
     if price <= 0:
         return None
+    rev_21 = float(df["close"].pct_change(21).iloc[-1])  # 近21日收益(反转因子, 无前视)
     wdf = df.tail(WINDOW)
     res = vp_core.volume_profile(wdf, n_bins=N_BINS, smooth_sigma=SMOOTH)
     if res is None:
@@ -110,6 +111,7 @@ def scan_one(ts_code):
         "ts_code": ts_code,
         "price": price,
         "poc": poc,
+        "rev_21": rev_21,
         "poc_dist_pct": (price - poc) / price,
         "support": ns[0],
         "support_dist_pct": sup_dist,
