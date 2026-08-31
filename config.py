@@ -680,6 +680,41 @@ STRATEGIES = {
         "kelly_max_position": 0.20,     # 最大仓位20%
         "kelly_min_position": 0.05,     # 最小仓位5%
         "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
+
+        # ════════════════════════════════════════════════════════════════════
+        #  布林带改进候选开关 —— 全部默认关闭
+        #  验证结论见 docs/bollinger_enhancement_report.md（总报告，唯一权威）
+        #  四个候选经「单变量 A/B → regime-gate + 真实成本两关 → walk-forward
+        #  → 随机入场暴露度对照」四道检验，最终判定：0 个有 alpha。
+        #  ⚠️ 请勿仅凭全样本 A/B 的正数重新启用下面任何信号 —— 那只是 beta。
+        # ════════════════════════════════════════════════════════════════════
+
+        # ── 已证伪：负贡献，不要启用 ──
+        "headfake_filter": False,   # 假突破延迟确认闸门：Δ −1.53pp（证伪）
+        "mfi_filter": False,        # MFI<20 量能确认闸门：Δ −8.30pp 简单 / −7.96pp 真实（证伪，最差候选）
+        "mfi_period": 14,
+        "mfi_oversold": 20,
+
+        # ── 已验证无 alpha：全样本 A/B 看似为正，暴露度对齐后与随机入场无异 ──
+        #     %B : 对齐后 ≈ −1.8pp（跑输随机）   → 负 alpha
+        #     OBV: 对齐后 ≈  0.00pp（等于随机）  → 零 alpha，beta 占比 99~101%
+        #   → 增量全部来自「交易更多 = 在市更久 = 吃到长牛」，非选股 skill。
+        "pctb_divergence": False,   # %B 看涨背离额外买入（无 alpha）
+        "pctb_lookback": 10,
+        "obv_divergence": False,    # OBV 量能背离额外买入（无 alpha）
+        "obv_lookback": 10,
+
+        # ── 验证工具（非策略增强；供后续新信号做同样体检时复用）──
+        "market_regime_gate": False,  # 大盘 < MA60 禁止开仓
+                                      # ⚠️ 副作用：几乎关死基线（交易 26.6 → 0.6~2.7/窗，收益≈0）
+        "regime_idx": "000300.SH",
+        "regime_ma": 60,
+        "real_cost": False,           # 真实分科目成本（佣万2.5 + 滑点0.1% + 过户费 + 日期感知印花税）
+                                      # 关闭时维持原简单口径，与历史数字完全一致
+        "random_entry": False,        # 随机入场控制组（暴露度 / beta 对照）
+                                      # 🔧 任何「额外买入触发」型新信号，上线前必须先过这一关
+        "random_entry_p": 0.03,
+        "random_entry_seed": 42,
     },
 
     # ── 网格择时策略（固定中枢+趋势保护版）──

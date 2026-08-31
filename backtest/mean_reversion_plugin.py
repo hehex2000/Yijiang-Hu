@@ -13,6 +13,28 @@
 
 信号基于前一日数据（shift(1)），避免未来函数
 买入/卖出均用次日开盘价执行
+
+═══════════════════════════════════════════════════════════════
+⚠️ 布林带改进候选验证状态（2026-08-31，全部默认关闭）
+   完整结论见 docs/bollinger_enhancement_report.md（唯一权威）
+───────────────────────────────────────────────────────────────
+四个候选经四道检验（单变量 A/B → regime-gate+真实成本两关 →
+walk-forward → 随机入场暴露度对照），最终判定 **0 个有 alpha**：
+
+  headfake_filter   ❌ 证伪（Δ −1.53pp）
+  mfi_filter        ❌ 证伪（Δ −8.30pp 简单 / −7.96pp 真实）
+  pctb_divergence   ❌ 无 alpha（暴露度对齐后 ≈ −1.8pp，跑输随机）
+  obv_divergence    ❌ 无 alpha（暴露度对齐后 ≈ 0.00pp，等于随机）
+
+🔑 教训：后两者在全样本 A/B 上「看似为正」（+1.79 / +4.61pp），
+   但那只是「交易更多 = 在市更久 = 吃到长牛 beta」。
+   regime-gate 与 walk-forward 都洗不掉 beta —— 它们只检验稳定性，
+   而暴露度在每个子样本里被同等放大。
+   → 任何「额外买入触发」型新信号，上线前必须用 random_entry 做暴露度对照。
+
+✅ 真正赚钱的是本文件的**出场/风控框架**（Z>2 或 RSI>70 出场 + 止损）：
+   随机入场控制组用同一套出场逻辑也能拿到同等收益，证明正期望来自出场侧。
+═══════════════════════════════════════════════════════════════
 """
 import pandas as pd
 import numpy as np
@@ -65,6 +87,17 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         # 与 %B 背离机制平行，但信号源在成交量而非布林带相对位置。
         self.obv_divergence = cfg.get("obv_divergence", False)
         self.obv_lookback = cfg.get("obv_lookback", 10)
+        # ── 随机入场控制组（opt-in，默认关闭；仅用于暴露度/beta 对照实验）──
+        # 目的：判定"额外买入触发(如 OBV)的增量"是真 alpha，还是纯粹
+        #       "交易更多 → 在市时间更长 → 吃到长牛 beta"的机械结果。
+        # 机制：与 OBV 完全相同的准入条件（not_widening + market_allowed + 空仓），
+        #       仅把"何时入场"换成伯努利随机触发（概率 random_entry_p）。
+        #       出场逻辑与基线完全一致（Z>2 或 RSI>70 + 止损），不做任何改动。
+        # 对照方法：扫描 p 得到"入场笔数→收益"响应曲线，再与 OBV 在同等
+        #       入场笔数下比较。若随机组收益≈OBV，则 OBV 无超越暴露度的增量。
+        self.random_entry = cfg.get("random_entry", False)
+        self.random_entry_p = cfg.get("random_entry_p", 0.03)
+        self.random_entry_seed = cfg.get("random_entry_seed", 42)
         # ── 市场环境门控（opt-in，默认关闭）──
         # 大盘处于下行趋势(基准指数 t-1 收盘 < MA(regime_ma))时禁止一切新开仓，
         # 消除"%B 背离/均值回归在熊市接飞刀"的告警。C0/C1 同等施加，隔离单一变量 pctb。
@@ -166,6 +199,8 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         self._mfi_suppressed = 0  # MFI 闸门过滤掉的 buy_signal 次数（归因）
         self._obv_entries = 0  # OBV 背离触发的买入次数
         self._obv_overlap = 0  # 其中与 buy_signal 同日的重叠次数（归因用）
+        self._rand_entries = 0  # 随机入场控制组触发的买入次数
+        self._rng = np.random.default_rng(self.random_entry_seed)  # 随机流（每次 run 复位，可复现）
 
         if len(df) == 0:
             return {"returns": 0.0, "trades": [], "daily_values": []}
@@ -246,6 +281,7 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         # prev_widening：NaN → True（未知时保守视为布林带张开，禁止入场）
         # 然后用 ~ 取反（此时已无 NaN，~ 可安全使用）
         cond_not_widening = ~(prev_widening.fillna(True))
+        data['cond_not_widening'] = cond_not_widening  # 供随机入场控制组复用同一准入条件
 
         # === %B 指标与看涨背离（opt-in 买入增强，须放在 cond_not_widening 之后）===
         # %B = (close - lower) / (upper - lower)，∈[0,1] 在下轨~上轨之间
@@ -356,6 +392,17 @@ class MeanReversionStrategyPlugin(BaseStrategy):
                     self._obv_entries += 1
                     if bool(data.iloc[i]['buy_signal']):
                         self._obv_overlap += 1
+
+            # ── 随机入场控制组（opt-in，暴露度/beta 对照实验用）──
+            # 与 OBV 相同准入条件（空仓 + 未待确认 + 大盘允许 + 布林带未张开），
+            # 仅把入场时机换成伯努利随机触发；出场逻辑与基线完全一致。
+            if self.random_entry and self.position == 0 and self._pending is None \
+                    and self.market_allowed[i] and bool(data.iloc[i]['cond_not_widening']) \
+                    and self._rng.random() < self.random_entry_p:
+                success = self._enter_long(date, open_price, 0.0, 0.0, atr_arr[i],
+                                reason_suffix="[随机入场]")
+                if success:
+                    self._rand_entries += 1
 
             if self.position == 0 and self._pending is None and self.market_allowed[i] \
                     and bool(data.iloc[i]['buy_signal']):
