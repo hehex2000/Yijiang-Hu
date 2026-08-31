@@ -43,6 +43,34 @@ class MeanReversionStrategyPlugin(BaseStrategy):
             trail_mult=cfg.get("trail_mult", 3.0),
         )
         self.position_mode = cfg.get("position_mode", "half")
+        # ── Head-fake 假突破过滤（opt-in，默认关闭）──
+        # 视频 BV1FP876bEAo 进阶篇：收口期假突破(向下击穿下轨洗止损)后，
+        # 需随后 1-2 根 K 线重新站回下轨(顺轨站稳)才确认买入；连续贴轨外下行=真破位陷阱，取消。
+        self.headfake_filter = cfg.get("headfake_filter", False)
+        # ── %B 背离额外买入（opt-in，默认关闭）──
+        # 视频 BV1FP876bEAo：价格创 N 日新低但 %B 未同步创新低 = 动能衰减/抛压枯竭的看涨背离，
+        # 作为均值回归的额外买入触发。固定滞后 K 比较（t 与 t-K 均属过去），无未来函数。
+        self.pctb_divergence = cfg.get("pctb_divergence", False)
+        self.pctb_lookback = cfg.get("pctb_lookback", 10)
+        # ── MFI 量能过滤闸门（opt-in，默认关闭）──
+        # MFI=量加权 RSI，< 超卖阈值表示下跌伴随放量抛压(恐慌性抛售/capitulation)。
+        # 作为均值回归买入的确认闸门：仅在 MFI 也超卖时才允许入场，
+        # 过滤"无量阴跌/死水"式假超卖信号。纯量能确认，不改变 %B/OBV 逻辑。
+        self.mfi_filter = cfg.get("mfi_filter", False)
+        self.mfi_period = cfg.get("mfi_period", 14)
+        self.mfi_oversold = cfg.get("mfi_oversold", 20)
+        # ── OBV 量能背离额外买入（opt-in，默认关闭）──
+        # OBV 累积量能：价格创 K 日新低但 OBV 未同步创 K 日新低 = 下跌未获量能确认
+        # (抛压枯竭/暗中吸筹) 的看涨量能背离，作为均值回归额外买入触发。
+        # 与 %B 背离机制平行，但信号源在成交量而非布林带相对位置。
+        self.obv_divergence = cfg.get("obv_divergence", False)
+        self.obv_lookback = cfg.get("obv_lookback", 10)
+        # ── 市场环境门控（opt-in，默认关闭）──
+        # 大盘处于下行趋势(基准指数 t-1 收盘 < MA(regime_ma))时禁止一切新开仓，
+        # 消除"%B 背离/均值回归在熊市接飞刀"的告警。C0/C1 同等施加，隔离单一变量 pctb。
+        self.market_regime_gate = cfg.get("market_regime_gate", False)
+        self.regime_idx = cfg.get("regime_idx", "000300.SH")
+        self.regime_ma = cfg.get("regime_ma", 60)
         logger.info(
             f"MeanReversionStrategyPlugin initialized: "
             f"bb_period={self.bb_period}, bb_std={self.bb_std}, "
@@ -67,6 +95,59 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         """计算RSI指标（使用 TA-Lib）"""
         return pd.Series(ta.RSI(close.values, timeperiod=self.rsi_period), index=close.index)
 
+    def _load_market_regime_mask(self, data: pd.DataFrame) -> list[bool]:
+        """构建大盘趋势门控掩码（与 data 行对齐，无未来函数）。
+
+        规则：t-1 基准指数收盘 >= 其 MA(regime_ma) → 允许开仓；否则禁止。
+        早期(MA 未成形/缺失)默认允许（保守）。
+        """
+        import sqlite3
+        import config
+        dates = [str(d) for d in data["trade_date"].tolist()]
+        if not dates:
+            return [True]
+        lo, hi = dates[0], dates[-1]
+        try:
+            conn = sqlite3.connect(config.DATA["local_db_path"])
+            df = pd.read_sql_query(
+                "SELECT trade_date, close FROM index_daily "
+                "WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+                conn, params=(self.regime_idx, lo, hi))
+            conn.close()
+        except Exception:  # noqa BLE001
+            return [True] * len(data)
+        if df.empty:
+            return [True] * len(data)
+        df["trade_date"] = df["trade_date"].astype(str)
+        s = df.set_index("trade_date")["close"].astype(float)
+        s = s.reindex(dates).ffill()
+        closes = s.values
+        ma = pd.Series(closes).rolling(self.regime_ma).mean().values
+        allowed = []
+        for i in range(len(data)):
+            if i == 0 or pd.isna(ma[i - 1]) or pd.isna(closes[i - 1]):
+                allowed.append(True)
+            else:
+                allowed.append(closes[i - 1] >= ma[i - 1])
+        return allowed
+
+
+
+    def _enter_long(self, date, open_price, z_val, rsi_val, atr_val, reason_suffix=""):
+        """执行买入（半/全仓 + 凯利封顶 + ATR 初始化），供即时买入与 headfake 确认复用。"""
+        if self.position > 0:
+            return False
+        position_pct = 0.95 if self.position_mode == 'full' else 0.50
+        buy_amount = self.cash * position_pct
+        shares = int(buy_amount / open_price / 100) * 100
+        if shares <= 0:
+            return False
+        reason = f"均值回归入场(Z={z_val:.2f},RSI={rsi_val:.1f}){reason_suffix}"
+        success = self._kelly_buy(date, open_price, shares, reason=reason)
+        if success and self.use_atr_sl:
+            self.atr_sl.on_entry(entry_price=open_price, atr_val=atr_val)
+        return success
+
     def run(self, df: pd.DataFrame, start_idx: int = 0) -> dict:
         """
         运行均值回归策略
@@ -77,6 +158,14 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         self.daily_values = []
         self.position = 0
         self.cash = self.capital
+        self._pending = None  # headfake 待确认状态（每次 run 复位）
+        self._cancelled_count = 0  # 被判为假突破陷阱而取消的信号数
+        self._confirmed_count = 0  # 经 headfake 确认成交的次数
+        self._pctb_entries = 0  # %B 背离触发的买入次数
+        self._pctb_overlap = 0  # 其中与 buy_signal 同日的重叠次数（归因用）
+        self._mfi_suppressed = 0  # MFI 闸门过滤掉的 buy_signal 次数（归因）
+        self._obv_entries = 0  # OBV 背离触发的买入次数
+        self._obv_overlap = 0  # 其中与 buy_signal 同日的重叠次数（归因用）
 
         if len(df) == 0:
             return {"returns": 0.0, "trades": [], "daily_values": []}
@@ -126,12 +215,28 @@ class MeanReversionStrategyPlugin(BaseStrategy):
             atr_arr = np.zeros(len(data))
 
         # === 信号生成（避免未来函数：用 shift(1)）===
+        # ── MFI / OBV 量能指标（opt-in 量能确认用，仅当开启时计算）──
+        high_c = data['adj_high'] if 'adj_high' in data.columns else data['adj_close']
+        low_c = data['adj_low'] if 'adj_low' in data.columns else data['adj_close']
+        vol = data['volume'] if 'volume' in data.columns else None
+        if vol is not None:
+            mfi_arr = ta.MFI(high_c.values, low_c.values, data['adj_close'].values,
+                             vol.values, timeperiod=self.mfi_period)
+            data['mfi'] = mfi_arr
+            obv_arr = ta.OBV(data['adj_close'].values, vol.values)
+            data['obv'] = obv_arr
+        else:
+            data['mfi'] = np.nan
+            data['obv'] = np.nan
+
         prev_close = data['adj_close'].shift(1)
         prev_z = data['z_score'].shift(1)
         prev_rsi = data['rsi'].shift(1)
         prev_widening = data['band_widening'].shift(1)
         prev_lower = data['lower'].shift(1)
         prev_upper = data['upper'].shift(1)
+        prev_mfi = data['mfi'].shift(1) if 'mfi' in data.columns else pd.Series(np.nan, index=data.index)
+        prev_obv = data['obv'].shift(1) if 'obv' in data.columns else pd.Series(np.nan, index=data.index)
 
         # 处理 NaN：NaN 视为不满足条件（保守做法）
         # prev_z < -threshold：NaN → False（不入场）
@@ -142,8 +247,41 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         # 然后用 ~ 取反（此时已无 NaN，~ 可安全使用）
         cond_not_widening = ~(prev_widening.fillna(True))
 
+        # === %B 指标与看涨背离（opt-in 买入增强，须放在 cond_not_widening 之后）===
+        # %B = (close - lower) / (upper - lower)，∈[0,1] 在下轨~上轨之间
+        denom = (data['upper'] - data['lower']).replace(0, np.nan)
+        data['pct_b'] = (data['adj_close'] - data['lower']) / denom
+        prev_pctb = data['pct_b'].shift(1)
+        # 看涨背离：用 t-1 与过去 K 日窗口极值比较（均属过去，无未来函数）。
+        # 严格定义（非两点比较）：t-1 收盘创 K 日新低（窗口含 t-1），
+        # 但 t-1 的 %B 未同步创 K 日新低 = 价格更便宜而布林带相对位置未更低
+        # = 抛压枯竭、动能衰减预警。
+        K = self.pctb_lookback
+        prev_close_div = data['adj_close'].shift(1)
+        price_lower = prev_close_div <= prev_close_div.rolling(K).min()
+        pctb_higher = prev_pctb > prev_pctb.rolling(K).min()
+        pctb_bull_div = (price_lower & pctb_higher & cond_not_widening).fillna(False)
+
+        # === MFI 量能闸门 & OBV 量能背离（opt-in，须放在 cond_not_widening 之后）===
+        # MFI 超卖确认闸门：下跌需伴随放量抛压(MFI<阈值)才确认"真超卖"，
+        # 过滤无量阴跌。仅当 mfi_filter 开启时计入 buy_signal。
+        cond_mfi_low = (prev_mfi < self.mfi_oversold).fillna(False)
+        # OBV 看涨量能背离：价格创 K 日新低但 OBV 未同步创 K 日新低
+        # (下跌未获量能确认=抛压枯竭/暗中吸筹) = 量能版看涨背离，平行 %B 背离。
+        K_obv = self.obv_lookback
+        obv_price_lower = prev_close_div <= prev_close_div.rolling(K_obv).min()
+        obv_higher = prev_obv > prev_obv.rolling(K_obv).min()
+        obv_bull_div = (obv_price_lower & obv_higher & cond_not_widening).fillna(False)
+
         # 入场信号：Z < -2 AND RSI < 30 AND 布林带未张开（双重共振）
-        buy_signal = cond_z_low & cond_rsi_low & cond_not_widening
+        base_buy = cond_z_low & cond_rsi_low & cond_not_widening
+        if self.mfi_filter:
+            # 仅当 MFI 也超卖才允许入场；记录被过滤掉的基数（归因）
+            buy_signal = base_buy & cond_mfi_low
+            self._mfi_suppressed = int((base_buy & ~cond_mfi_low).sum())
+        else:
+            buy_signal = base_buy
+            self._mfi_suppressed = 0
 
         # 出场信号：Z > 2 OR RSI > 70
         # NaN → False（不触发出场）
@@ -153,6 +291,13 @@ class MeanReversionStrategyPlugin(BaseStrategy):
 
         data['buy_signal'] = buy_signal
         data['sell_signal'] = sell_signal
+        data['pctb_bull_div'] = pctb_bull_div
+        data['obv_bull_div'] = obv_bull_div
+
+        # ── 大盘趋势门控掩码（opt-in）──
+        self.market_allowed = [True] * len(data)
+        if self.market_regime_gate:
+            self.market_allowed = self._load_market_regime_mask(data)
 
         # === 遍历数据执行交易 ===
         for i in range(start_idx, len(data)):
@@ -171,19 +316,56 @@ class MeanReversionStrategyPlugin(BaseStrategy):
             prev_close_val = float(data.iloc[i - 1]['adj_close']) if i >= 1 else None
 
             # === 买入逻辑 ===
-            if self.position == 0 and bool(data.iloc[i]['buy_signal']):
-                buy_amount = self.cash * (0.95 if self.position_mode == 'full' else 0.50)
-                shares = int(buy_amount / open_price / 100) * 100
-                if shares > 0:
-                    z_val = float(prev_z.iloc[i]) if i < len(prev_z) else 0
-                    rsi_val = float(prev_rsi.iloc[i]) if i < len(prev_rsi) else 0
-                    success = self._kelly_buy(
-                        date, open_price, shares,
-                        reason=f"均值回归入场(Z={z_val:.2f},RSI={rsi_val:.1f})"
-                    )
-                    # ATR初始化（仅当买入成功时）
-                    if success and self.use_atr_sl:
-                        self.atr_sl.on_entry(entry_price=open_price, atr_val=atr_arr[i])
+            # ── Head-fake 假突破确认（opt-in）──
+            # 信号触发(价格击穿下轨)不立即买，改用「前一根」收盘是否重新站回下轨判定：
+            #   站回下轨(顺轨站稳) → 假突破洗盘完成，确认买入；
+            #   连续 2 根仍贴轨外下行 → 真破位陷阱，取消信号。
+            # 用 i-1 的收盘/下轨判定、在 i 开盘成交，无未来函数。
+            if self.headfake_filter and self._pending is not None and self.position == 0:
+                wait = i - self._pending["start_i"]
+                p_close = data.iloc[i - 1]['adj_close'] if i >= 1 else np.nan
+                p_lower = data.iloc[i - 1]['lower'] if i >= 1 else np.nan
+                if not pd.isna(p_lower) and not pd.isna(p_close):
+                    if p_close >= p_lower:
+                        success = self._enter_long(date, open_price, self._pending["z_val"],
+                                        self._pending["rsi_val"], atr_arr[i],
+                                        reason_suffix="[headfake确认]")
+                        if success:
+                            self._confirmed_count += 1
+                        self._pending = None
+                    elif wait >= 2:
+                        self._cancelled_count += 1  # 陷阱：连续贴轨外，取消
+                        self._pending = None
+
+            # ── %B 看涨背离额外买入（opt-in，独立即时入场，不经 headfake 闸门）──
+            if self.pctb_divergence and self.position == 0 and self._pending is None \
+                    and self.market_allowed[i] and bool(data.iloc[i]['pctb_bull_div']):
+                success = self._enter_long(date, open_price, 0.0, 0.0, atr_arr[i],
+                                reason_suffix="[%B背离买]")
+                if success:
+                    self._pctb_entries += 1
+                    if bool(data.iloc[i]['buy_signal']):
+                        self._pctb_overlap += 1
+
+            # ── OBV 看涨量能背离额外买入（opt-in，独立即时入场，不经 headfake 闸门）──
+            if self.obv_divergence and self.position == 0 and self._pending is None \
+                    and self.market_allowed[i] and bool(data.iloc[i]['obv_bull_div']):
+                success = self._enter_long(date, open_price, 0.0, 0.0, atr_arr[i],
+                                reason_suffix="[OBV背离买]")
+                if success:
+                    self._obv_entries += 1
+                    if bool(data.iloc[i]['buy_signal']):
+                        self._obv_overlap += 1
+
+            if self.position == 0 and self._pending is None and self.market_allowed[i] \
+                    and bool(data.iloc[i]['buy_signal']):
+                z_val = float(prev_z.iloc[i]) if i < len(prev_z) else 0
+                rsi_val = float(prev_rsi.iloc[i]) if i < len(prev_rsi) else 0
+                if self.headfake_filter:
+                    # 仅登记待确认，不立即成交
+                    self._pending = {"start_i": i, "z_val": z_val, "rsi_val": rsi_val}
+                else:
+                    self._enter_long(date, open_price, z_val, rsi_val, atr_arr[i])
 
             # === 卖出逻辑 ===
             elif self.position > 0:

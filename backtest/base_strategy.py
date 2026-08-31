@@ -60,6 +60,13 @@ class BaseStrategy:
         # 单股回测时 total_capital 未设 → 退化为 self.capital，行为不变。
         self.total_capital = cfg.get("total_capital", self.capital)
 
+        # ── 真实分科目成本开关（opt-in，默认关 → 维持历史简单成本口径）──
+        # 开时 buy/sell 改用 _real_fee_buy/_real_fee_sell：
+        #   佣金万2.5 + 滑点0.1% + 过户费0.001%（双边）+ 日期感知印花税(2023-08-28前0.1%后0.05%)。
+        # 关时维持原 base 简单口径（佣金万2 + 卖出印花税0.1%固定，无滑点/过户费），
+        # 与历史回测数字完全一致，其他插件不受影响。
+        self.real_cost = bool(cfg.get("real_cost", False))
+
     def run(self, df, start_idx=0):
         """
         运行策略（子类必须实现）
@@ -78,6 +85,33 @@ class BaseStrategy:
             }
         """
         raise NotImplementedError("子类必须实现 run() 方法")
+
+    @staticmethod
+    def _stamp_duty_rate(trade_date) -> float:
+        """日期感知印花税：2023-08-28 起减半（0.1% → 0.05%）。
+
+        trade_date 缺省/不可解析时回退 0.1%（保守）。
+        """
+        try:
+            td = int(trade_date)
+        except (TypeError, ValueError):
+            return 0.001
+        return 0.0005 if td >= 20230828 else 0.001
+
+    def _real_fee_buy(self, amount: float, trade_date) -> float:
+        """真实买入成本：佣金万2.5 + 滑点0.1% + 过户费0.001%（双边统一）。"""
+        commission = max(amount * 0.00025, 5.0)
+        slippage = amount * 0.001
+        transfer = amount * 0.00001
+        return commission + slippage + transfer
+
+    def _real_fee_sell(self, amount: float, trade_date):
+        """真实卖出成本：佣金万2.5 + 滑点0.1% + 过户费0.001% + 日期感知印花税。"""
+        commission = max(amount * 0.00025, 5.0)
+        slippage = amount * 0.001
+        transfer = amount * 0.00001
+        stamp = amount * self._stamp_duty_rate(trade_date)
+        return commission + slippage + transfer, stamp
 
     @staticmethod
     def cap_by_kelly(capital, position, cash, kelly_cap, price, intended_shares):
@@ -129,7 +163,7 @@ class BaseStrategy:
     def buy(self, date, price, shares, reason=""):
         """买入操作（子类可调用）"""
         cost = shares * price
-        fee = max(cost * 0.0002, 5.0)      # ← 万分之二，最低5元
+        fee = self._real_fee_buy(cost, date) if self.real_cost else max(cost * 0.0002, 5.0)
         total_cost = cost + fee
         if total_cost > self.cash:
             return False  # 资金不足
@@ -169,8 +203,11 @@ class BaseStrategy:
             return False
 
         revenue = shares * price
-        fee = max(revenue * 0.0002, 5.0)   # ← 万分之二，最低5元
-        tax = revenue * 0.001    # 印花税（A股卖出收）
+        if self.real_cost:
+            fee, tax = self._real_fee_sell(revenue, date)
+        else:
+            fee = max(revenue * 0.0002, 5.0)   # 万分之二，最低5元
+            tax = revenue * 0.001    # 印花税（A股卖出收，固定0.1%，历史口径）
         net_revenue = revenue - fee - tax
 
         self.cash += net_revenue
