@@ -35,7 +35,7 @@ def main():
     ap.add_argument('--etf', default='510300', choices=sorted(ETF_MAP))
     ap.add_argument('--start', default=None, help='默认取上市后次月')
     ap.add_argument('--end', default='20251231')
-    ap.add_argument('--etf-cost', type=float, default=0.002, help='ETF管理费+跟踪误差年化, 默认0.2%')
+    ap.add_argument('--etf-cost', type=float, default=0.002, help='ETF管理费+跟踪误差年化, 默认0.2%%')
     ap.add_argument('--out', default=None, help='净值CSV输出路径(默认 etf_macd_timing_<etf>.csv)')
     args = ap.parse_args()
 

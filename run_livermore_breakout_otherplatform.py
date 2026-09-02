@@ -496,8 +496,8 @@ def main():
     ap.add_argument("--windows", default=None,
                     help="多窗口: 20180101-20251231,20190101-20251231,...")
     ap.add_argument("--lookback", type=int, default=20, help="关键点窗口(日)")
-    ap.add_argument("--sector-top-pct", type=float, default=0.30, help="行业内前X%算强势")
-    ap.add_argument("--exit-pct", type=float, default=0.03, help="跌回突破位X%退出")
+    ap.add_argument("--sector-top-pct", type=float, default=0.30, help="行业内前X%%算强势")
+    ap.add_argument("--exit-pct", type=float, default=0.03, help="跌回突破位X%%退出")
     ap.add_argument("--ma-period", type=int, default=20, help="退出MA周期")
     ap.add_argument("--stop-loss", type=float, default=0.05, help="硬止损(跌破入场价X)")
     ap.add_argument("--max-hold", type=int, default=5, help="最多持仓数")

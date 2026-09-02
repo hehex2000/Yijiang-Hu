@@ -629,8 +629,8 @@ def main():
     ap.add_argument("--windows", default=None,
                     help="多窗口: 20180101-20251231,20190101-20251231,...")
     ap.add_argument("--lookback", type=int, default=20, help="关键点窗口(日)")
-    ap.add_argument("--sector-top-pct", type=float, default=0.30, help="行业内前X%算强势")
-    ap.add_argument("--exit-pct", type=float, default=0.03, help="跌回突破位X%退出")
+    ap.add_argument("--sector-top-pct", type=float, default=0.30, help="行业内前X%%算强势")
+    ap.add_argument("--exit-pct", type=float, default=0.03, help="跌回突破位X%%退出")
     ap.add_argument("--ma-period", type=int, default=20, help="退出MA周期")
     ap.add_argument("--stop-loss", type=float, default=0.05, help="硬止损(跌破入场价X)")
     ap.add_argument("--max-hold", type=int, default=5, help="最多持仓数")
@@ -639,7 +639,7 @@ def main():
     ap.add_argument("--no-market-exit", action="store_true", help="市场转熊不强制清仓(仅关新开)")
     ap.add_argument("--fail-exit", type=int, default=2, help="突破后N日不创新高即失败离场(0=关)")
     ap.add_argument("--sector-mode", default="momentum", choices=["momentum", "lowvol", "none"],
-                    help="板块过滤: momentum(原动量前30%,负贡献)/lowvol(低波筛选)/none(关闭)")
+                    help="板块过滤: momentum(原动量前30%%,负贡献)/lowvol(低波筛选)/none(关闭)")
     ap.add_argument("--vol-size", action="store_true", help="改进B: 逆波动定权(风险平价-lite)")
     ap.add_argument("--vol-skip", action="store_true", help="改进C: 市场波动率破顶时暂停新开仓")
     ap.add_argument("--vol-lookback", type=int, default=20, help="已实现波动率窗口(日)")

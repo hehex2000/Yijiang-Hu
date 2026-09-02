@@ -1274,7 +1274,7 @@ if __name__ == "__main__":
     p.add_argument("--pool-mode", choices=list(POOL_DESC.keys()), default="zz2000",
                    help="选股宇宙: cyb(纯创业板) / zz2000(中证2000风格·含微盘尾) / zz1000(中证1000风格·剔除微盘尾)")
     p.add_argument("--bucket", choices=["small", "mid", "large"], default=None,
-                   help="市值分位桶(单独跑某一档, 替代默认最小桶): small=最小N只 / mid=宇宙40%分位档 / large=宇宙最大N只")
+                   help="市值分位桶(单独跑某一档, 替代默认最小桶): small=最小N只 / mid=宇宙40%%分位档 / large=宇宙最大N只")
     p.add_argument("--mode", choices=["single", "compare", "sensitivity"], default="single",
                    help="single=单次回测; compare=含退市vs剔除退市对照; sensitivity=持仓数/流动性网格")
     p.add_argument("--hold-grid", default="5,7,10,15", help="sensitivity模式: 持仓数网格(逗号分隔)")

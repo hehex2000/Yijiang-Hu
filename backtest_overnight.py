@@ -174,7 +174,7 @@ def main():
     ap.add_argument("--start", default=START)
     ap.add_argument("--end", default=END)
     ap.add_argument("--modes", default="all,momentum,sector")
-    ap.add_argument("--cost", action="store_true", help="扣除0.35%往返成本")
+    ap.add_argument("--cost", action="store_true", help="扣除0.35%%往返成本")
     ap.add_argument("--out", default="data/results/overnight/overnight_summary.csv")
     args = ap.parse_args()
 

@@ -334,7 +334,7 @@ if __name__ == "__main__":
     ap.add_argument("--min-avg-amount-k", type=float, default=None)
     ap.add_argument("--exclude-688", action="store_true", help="剔除科创板(688)，用于对照加科创板选股的贡献")
     ap.add_argument("--trailing-stop", type=float, default=0.0,
-                    help="移动止损比例，0=关闭；例如 0.10 表示 10% 回撤止损（次日开盘卖出）")
+                    help="移动止损比例，0=关闭；例如 0.10 表示 10%% 回撤止损（次日开盘卖出）")
     args = ap.parse_args()
     res = run_backtest(start=args.start, end=args.end, hold_count=args.hold_count,
                        pool_mode=args.pool_mode, min_avg_amount_k=args.min_avg_amount_k,
