@@ -27,6 +27,7 @@ import sqlite3, bisect, datetime, collections
 import numpy as np
 import pandas as pd
 import config
+from pit_ann import norm_ann          # ann_date 规范化(fina_indicator.ann_date 是 REAL 浮点)
 
 DB = config.DATA["local_db_path"]
 START      = "20140101"
@@ -106,7 +107,7 @@ print(f"[load] 矩阵就绪 close{close_p.shape} mv{mv_p.shape} pe{pe_p.shape}")
 # ---------- 3. point-in-time 财报映射 ----------
 def build_pit_map(sql, valcol, denom=None):
     df = pd.read_sql(sql, con)
-    df["ann"] = df["ann_date"].astype(str)
+    df["ann"] = norm_ann(df["ann_date"])
     df[valcol] = pd.to_numeric(df[valcol], errors="coerce")
     if denom is not None:
         df[denom] = pd.to_numeric(df[denom], errors="coerce")

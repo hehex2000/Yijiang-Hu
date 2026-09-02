@@ -107,6 +107,12 @@ def _conn(conn=None):
 
 
 def _read_official(tr_code, start, end, conn):
+    # 🔴 必须按 tr_code 精确查，禁止按 local_code 裸查：
+    #    同一个 local_code 可能挂多条序列（口径不同、数值不等）。实测 000922.SH 挂了两条：
+    #      H00922.CSI       全收益·不扣税
+    #      000922CNY020.CSI 净收益·扣税
+    #    4045 个交易日**全部不一致**，差 62~63 点（约 1.6%）。按 local_code 裸查会随机取到一条，
+    #    使基准悄悄变成另一个口径（表主键是 (tr_code, trade_date)，故 tr_code 查询安全无重复）。
     df = pd.read_sql_query(
         "SELECT trade_date, close FROM index_tr_official WHERE tr_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
         conn, params=(tr_code, start, end))

@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import config
 import market_timing_overlay as mto   # A：市场情绪择时 overlay
+from pit_ann import norm_ann          # ann_date 规范化(fina_indicator.ann_date 是 REAL 浮点)
 
 # ---------- CLI ----------
 import argparse
@@ -122,7 +123,7 @@ print(f"[load] 矩阵: close {close_p.shape}, amount {amount_p.shape}, turn {tur
 def build_pit_map(sql, valcol, denom=None):
     """返回 {ts_code: (sorted_ann_dates[], values[])}，ann_date<调仓日时取最新。"""
     df = pd.read_sql(sql, con)
-    df["ann"] = df["ann_date"].astype(str)
+    df["ann"] = norm_ann(df["ann_date"])
     df[valcol] = pd.to_numeric(df[valcol], errors="coerce")
     if denom is not None:
         df[denom] = pd.to_numeric(df[denom], errors="coerce")

@@ -38,6 +38,7 @@ import sqlite3
 
 import numpy as np
 import pandas as pd
+from pit_ann import norm_ann          # ann_date 规范化(fina_indicator.ann_date 是 REAL 浮点)
 
 DILUTION_THRESHOLD = 0.05  # 第7项：total_share 同比增幅 < 5% 视为"未显著稀释"（可调）
 
@@ -46,7 +47,7 @@ DILUTION_THRESHOLD = 0.05  # 第7项：total_share 同比增幅 < 5% 视为"未�
 #            改为接收 con 参数，避免 import 该脚本触发重跑）----------
 def _build_pit_map(con, sql, valcol, denom=None):
     df = pd.read_sql(sql, con)
-    df["ann"] = df["ann_date"].astype(str)
+    df["ann"] = norm_ann(df["ann_date"])
     df[valcol] = pd.to_numeric(df[valcol], errors="coerce")
     if denom is not None:
         df[denom] = pd.to_numeric(df[denom], errors="coerce")
