@@ -13,6 +13,7 @@
 """
 
 import sqlite3
+import bisect
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -23,6 +24,17 @@ import json
 import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_index as bi
+
+# ── NAV 计价口径声明 ────────────────────────────────────────────
+# 本引擎的持仓估值/成交均用**未复权价**（get_price / get_open_price 取 daily.close/open，
+# 不乘 adj_factor），因此 NAV **不含分红再投**。
+# 基准口径由 bench_index.resolve_mode() 据此自动对齐：
+#   nav=raw → 价格指数（口径一致，超额 = 纯选股α，不含股息）
+#   nav=hfq → 全收益指数（口径一致，超额 = 总回报α）
+# 若此处与实际计价方式不符，会直接导致超额系统性偏差，改计价时必须同步改这个常量。
+PRICE_MODE = "raw"
+
 try:
     from config import DATA, BACKTEST, SELECTION, FACTOR_CALCULATOR, FACTOR_PROCESSOR
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -411,8 +423,62 @@ def sqrt_impact_slippage(amount, ts_code, trade_date, k=SQRT_IMPACT_K,
 #  价格获取（复权）
 # ============================================================
 
+# ── hfq 价格空间（--price-mode hfq 时启用）────────────────────────
+# 三个必须遵守的约束（缺一即产生虚假损益，详见 plan_totalreturn_audit.md §8.2）：
+#   1. 成交价与估值价必须同空间 → get_price / get_open_price 都要乘同一条因子链
+#   2. 必须归一化 → hfq 绝对价位会被累计因子放大到几十~上百倍，而回测按整股下单
+#      int(cash/px)，放大会导致买不进整股、资金趴现金的伪现金拖累。
+#      归一化基准取「该股首次被调用时的因子」，价格量级≈raw，保留分红增长。
+#   3. adj_factor 缺行必须 ffill → 该表存在整交易日缺行（2020-2026 共 132 天，全市场同缺），
+#      fillna(1.0) 会让缺失日掉回 raw、次日跳回 hfq，制造巨额假跳空。
+#      adj_factor 是阶跃函数（仅除权除息日变化），前向填充数学上精确、不丢信息。
+_ADJ_CACHE = {}   # ts_code -> (dates:list[str], vals:list[float])，按日期升序
+_ADJ_REF = {}     # ts_code -> 归一化基准因子（首次取到即锁定）
+
+
+def _adj_asof(ts_code, trade_date):
+    """返回 (adj_t, adj_ref)：trade_date 当日的后复权因子（已 ffill）与该股归一化基准。"""
+    ent = _ADJ_CACHE.get(ts_code)
+    if ent is None:
+        conn = get_conn()
+        df = pd.read_sql_query(
+            "SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code=? ORDER BY trade_date",
+            conn, params=(ts_code,))
+        conn.close()
+        if df.empty:
+            _ADJ_CACHE[ts_code] = (None, None)
+            return 1.0, 1.0
+        dates = [str(x) for x in df["trade_date"].tolist()]
+        vals = [float(v) for v in df["adj_factor"].tolist()]
+        _ADJ_CACHE[ts_code] = (dates, vals)
+        ent = (dates, vals)
+    dates, vals = ent
+    if dates is None:
+        return 1.0, 1.0
+    key = str(trade_date)
+    i = bisect.bisect_right(dates, key) - 1
+    adj = float(vals[i]) if i >= 0 else 1.0
+    ref = _ADJ_REF.get(ts_code)
+    if ref is None:
+        ref = adj or 1.0
+        _ADJ_REF[ts_code] = ref
+    return adj, ref
+
+
+def _apply_hfq(ts_code, trade_date, raw_px):
+    """把未复权价换算到当前 NAV 价格空间。PRICE_MODE=raw 时原样返回。"""
+    if PRICE_MODE != "hfq" or raw_px is None:
+        return raw_px
+    adj, ref = _adj_asof(ts_code, trade_date)
+    return float(raw_px) * adj / ref
+
+
 def get_price(ts_code, trade_date):
-    """获取不复权收盘价（实际使用价格）"""
+    """获取收盘价（实际使用价格）
+
+    PRICE_MODE="raw"（默认）：返回**未复权**收盘价，NAV 不含分红。
+    PRICE_MODE="hfq"       ：返回归一化后复权价 = close × adj_t / adj_ref，NAV 含分红再投。
+    """
     set_trade_date_ctx(trade_date)   # 登记成交日 → calc_fee 自动用对当期印花税率
     set_ts_code_ctx(ts_code)         # 登记个股 → 滑点冲击模型按流动性估算
     if ts_code in ("000906.SH",):
@@ -444,7 +510,7 @@ def get_price(ts_code, trade_date):
     if len(row) > 0:
         price = float(row.iloc[0]["raw_close"])
         conn.close()
-        return price
+        return _apply_hfq(ts_code, trade_date, price)
 
     row2 = pd.read_sql_query("""
         SELECT d.close AS raw_close
@@ -456,7 +522,7 @@ def get_price(ts_code, trade_date):
     if len(row2) > 0:
         price = float(row2.iloc[0]["raw_close"])
         conn.close()
-        return price
+        return _apply_hfq(ts_code, trade_date, price)
 
     conn.close()
     return None
@@ -489,7 +555,7 @@ def get_open_price(ts_code, trade_date):
     if len(row) > 0:
         price = float(row.iloc[0]["raw_open"])
         conn.close()
-        return price
+        return _apply_hfq(ts_code, trade_date, price)
 
     row2 = pd.read_sql_query("""
         SELECT d.open AS raw_open
@@ -501,7 +567,7 @@ def get_open_price(ts_code, trade_date):
     if len(row2) > 0:
         price = float(row2.iloc[0]["raw_open"])
         conn.close()
-        return price
+        return _apply_hfq(ts_code, trade_date, price)
 
     conn.close()
     return None
@@ -1984,10 +2050,18 @@ def _apply_backadjust(df, end_date):
     df["trade_date"] = df["trade_date"].astype(int)
     merged = df.merge(adj[["ts_code", "trade_date", "adj_factor"]],
                       on=["ts_code", "trade_date"], how="left")
+    # ⚠️ adj_factor 是**阶跃函数**（仅除权除息日变化），且该表存在整交易日缺行
+    # （2020-2026 共 132 天全市场同缺，占 8.5%）。缺行日正确值是「沿用上一交易日的因子」，
+    # 用 fillna(1.0) 会让价格当天掉回不复权、次日跳回后复权 → 制造巨额假跳空 → 假突破信号。
+    # 修复顺序：先按个股 ffill（缺行沿用上一日，数学精确），再 bfill（上市首日之前无因子时
+    # 用最早已知因子反推，仍优于 1.0），最后 fillna(1.0) 兜底（整只股票完全无 adj 记录）。
     na_rate = float(merged["adj_factor"].isna().mean())
-    if na_rate > 0.05:
+    if na_rate > 0.02:
         # 匹配率异常时显式报警，绝不静默不调权
-        print(f"[突破信号] ⚠️ adj_factor 匹配缺失率 {na_rate:.1%}（异常），未匹配行按1.0填充", flush=True)
+        print(f"[突破信号] ⚠️ adj_factor 原始匹配缺失率 {na_rate:.1%}，按个股 ffill+bfill 补全"
+              f"（缺行为该表整日缺口，非个股问题）", flush=True)
+    merged["adj_factor"] = merged.groupby("ts_code")["adj_factor"].ffill()
+    merged["adj_factor"] = merged.groupby("ts_code")["adj_factor"].bfill()
     merged["adj_factor"] = merged["adj_factor"].fillna(1.0)
     hfq_close = merged["close"].astype("float64") * merged["adj_factor"].astype("float64")
     merged["close"] = hfq_close.astype("float32")
@@ -2135,14 +2209,9 @@ def _print_annual_pnl(daily_vals, init_capital, benchmark_idx=None):
     if benchmark_idx:
         conn = get_conn()
         for y in years:
-            s = pd.read_sql_query(
-                "SELECT close FROM index_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date ASC LIMIT 1",
-                conn, params=(benchmark_idx, f"{y}0101", f"{y}1231"))
-            e = pd.read_sql_query(
-                "SELECT close FROM index_daily WHERE ts_code=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
-                conn, params=(benchmark_idx, f"{y}0101", f"{y}1231"))
-            if len(s) > 0 and len(e) > 0:
-                bench_year[y] = (float(s.iloc[0]["close"]), float(e.iloc[0]["close"]))
+            bf, bl, _bm = bi.benchmark_year_endpoints(benchmark_idx, y, conn=conn, nav_price_mode=PRICE_MODE)
+            if bf is not None and bl is not None:
+                bench_year[y] = (bf, bl)
         conn.close()
 
     bench_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx) if benchmark_idx else "基准"
@@ -3022,26 +3091,18 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     _pool_bench = _pool_idx if _pool_idx else "000906.SH"
     benchmark_idx = STOCK_POOL_INDEX.get(_pool_bench, _pool_bench)
     benchmark_name = INDEX_DISPLAY_NAME.get(benchmark_idx, benchmark_idx)
-    
-    conn = get_conn()
-    b_start = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date >= ? ORDER BY trade_date ASC LIMIT 1",
-        conn, params=(benchmark_idx, trade_dates[0])
-    )
-    b_end = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT 1",
-        conn, params=(benchmark_idx, trade_dates[-1])
-    )
-    conn.close()
 
-    if len(b_start) > 0 and len(b_end) > 0:
-        idx_start = float(b_start.iloc[0]['close'])
-        idx_end = float(b_end.iloc[0]['close'])
-        idx_return = (idx_end / idx_start - 1) * 100
-        outperf = total_return - idx_return
-        print(f"\n{'='*70}")
-        print(f"  {benchmark_name}涨幅：{idx_return:+.2f}%")
-        print(f"  策略{'跑赢' if outperf>0 else '跑输'}指数：{outperf:+.2f}%")
+    conn = get_conn()
+    idx_return, _bmeta = bi.benchmark_return_between(benchmark_idx, trade_dates[0], trade_dates[-1], conn=conn, nav_price_mode=PRICE_MODE)
+    conn.close()
+    idx_return = idx_return if idx_return is not None else 0.0
+    outperf = total_return - idx_return
+    print(f"\n{'='*70}")
+    _warn = bi.check_consistency(PRICE_MODE, _bmeta)
+    print(f"  {benchmark_name}涨幅{bi.benchmark_meta_label(_bmeta)}：{idx_return:+.2f}%")
+    if _warn:
+        print(f"  {_warn}")
+    print(f"  策略{'跑赢' if outperf>0 else '跑输'}指数：{outperf:+.2f}%")
 
     # 年度盈亏窗口
     annual_rows = _print_annual_pnl(daily_vals, INIT_CAPITAL, benchmark_idx)
@@ -3058,7 +3119,10 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
         _gate_tag = f"_blend{int(round(piotroski_blend*100))}"
     else:
         _gate_tag = ""
-    csv_path = f"{csv_dir}/backtest{_gate_tag}_{start_date}_{end_date}.csv"
+    # 计价口径后缀：hfq 与 raw 的 NAV 不同量级，若共用文件名会静默覆盖 raw 结果，
+    # 导致 A/B 对照丢证据。raw 保持无后缀（向后兼容既有文件名）。
+    _pm_tag = "_hfq" if PRICE_MODE == "hfq" else ""
+    csv_path = f"{csv_dir}/backtest{_gate_tag}{_pm_tag}_{start_date}_{end_date}.csv"
     pd.DataFrame(daily_vals).to_csv(csv_path, index=False)
     try:
         with open(csv_path + ".fingerprint", "w", encoding="utf-8") as _fh:
@@ -3069,14 +3133,14 @@ def run_backtest(start_date="20200102", end_date="20251231", top_n=None, selecti
     print(f"  数据指纹已保存：{csv_path}.fingerprint")
 
     if annual_rows:
-        annual_path = f"{csv_dir}/annual_pnl{_gate_tag}_{start_date}_{end_date}.csv"
+        annual_path = f"{csv_dir}/annual_pnl{_gate_tag}{_pm_tag}_{start_date}_{end_date}.csv"
         pd.DataFrame(annual_rows).to_csv(annual_path, index=False)
         print(f"  年度盈亏明细已保存：{annual_path}")
 
     # ── 成交明细 CSV 导出（含 reason 列，调试友好）──
     if trades:
         _trades_cols = ["date", "action", "code", "name", "price", "shares", "reason"]
-        _trades_path = f"{csv_dir}/trades{_gate_tag}_{selection_method}_{start_date}_{end_date}.csv"
+        _trades_path = f"{csv_dir}/trades{_gate_tag}{_pm_tag}_{selection_method}_{start_date}_{end_date}.csv"
         pd.DataFrame(trades)[_trades_cols].to_csv(_trades_path, index=False, encoding="utf-8-sig")
         print(f"  成交明细已保存：{_trades_path}（{len(trades)} 笔，含 reason 列）")
 
@@ -3700,21 +3764,9 @@ def run_momentum_backtest(start_date="20200101", end_date="20251231",
     # === 基准指数 ===
     benchmark_idx = STOCK_POOL_INDEX.get(stock_pool) or "000906.SH"  # 池名→指数代码
     conn = get_conn()
-    b_start = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date >= ? ORDER BY trade_date ASC LIMIT 1",
-        conn, params=(benchmark_idx, trade_dates[0])
-    )
-    b_end = pd.read_sql_query(
-        "SELECT close FROM index_daily WHERE ts_code = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT 1",
-        conn, params=(benchmark_idx, trade_dates[-1])
-    )
+    idx_return, _bmeta = bi.benchmark_return_between(benchmark_idx, trade_dates[0], trade_dates[-1], conn=conn, nav_price_mode=PRICE_MODE)
     conn.close()
-
-    idx_return = 0
-    if len(b_start) > 0 and len(b_end) > 0:
-        idx_start = float(b_start.iloc[0]['close'])
-        idx_end = float(b_end.iloc[0]['close'])
-        idx_return = (idx_end / idx_start - 1) * 100
+    idx_return = idx_return if idx_return is not None else 0.0
 
     # === 输出 ===
     print(f"\n{'=' * 70}")
@@ -4451,6 +4503,12 @@ if __name__ == "__main__":
                         help="突破赢家量能倍数（仅 breakout 模式，默认1.5）")
     parser.add_argument("--compare", action="store_true",
                         help="对比模式：依次跑3/6/12个月动量回测")
+    parser.add_argument("--price-mode", type=str, default="raw",
+                        choices=["raw", "hfq"],
+                        help="NAV 计价口径（默认 raw，保持历史结果可复现）："
+                             "raw=未复权价, NAV 不含分红（基准自动对齐到价格指数, 超额=纯选股α）；"
+                             "hfq=归一化后复权价 close×adj_t/adj_ref, NAV 含分红再投"
+                             "（基准自动对齐到全收益指数, 超额=总回报α）")
     parser.add_argument("--stock-pool", type=str, default=None,
                         help="股票池指数代码（如 000300.SH），默认全A股")
     parser.add_argument("--rebalance-freq", type=int, default=1,
@@ -4507,7 +4565,7 @@ if __name__ == "__main__":
     parser.add_argument("--interrupt-pct", type=float, default=0.0,
                         help="中断模拟：撤出资金比例(0~1，如0.5=撤一半)，默认0=不模拟")
     parser.add_argument("--consolidation-filter", action="store_true", default=False,
-                        help="【已证伪·仅诊断·默认关】缠论中枢回避过滤：剔除中枢/盘整期(布林带宽分位<th)候选股。OOS 2015-2019 证伪(价值+20.89%→-17.72%)，不作alpha、不进主策略默认开")
+                        help="【已证伪·仅诊断·默认关】缠论中枢回避过滤：剔除中枢/盘整期(布林带宽分位<th)候选股。OOS 2015-2019 证伪(价值+20.89%%→-17.72%%)，不作alpha、不进主策略默认开")
     parser.add_argument("--con-win", type=int, default=20,
                         help="中枢回避：布林带宽窗口(默认20)")
     parser.add_argument("--con-lookback", type=int, default=120,
@@ -4529,6 +4587,16 @@ if __name__ == "__main__":
                              "次日均价买入；卖出仍按月度强制。复用 chan_lun_core_faithful 流式引擎(无未来函数)。"
                              "仅作用于标准调仓分支(价值/动量/高股息成长)")
     args = parser.parse_args()
+
+    # NAV 计价口径 → 模块全局（同时决定基准自动对齐：raw→价格指数 / hfq→全收益指数）
+    # 注：此处位于 `if __name__ == "__main__"` 的模块级块内，赋值即绑定模块全局，无需 global。
+    PRICE_MODE = args.price_mode
+    if PRICE_MODE == "hfq":
+        print(f"[计价口径] hfq = close × adj_t / adj_ref（含分红再投）"
+              f"→ 基准自动对齐到全收益指数，超额 = 总回报α")
+    else:
+        print(f"[计价口径] raw = 未复权价（不含分红）"
+              f"→ 基准自动对齐到价格指数，超额 = 纯选股α")
 
     if args.selection_method == "momentum":
         if args.compare:
