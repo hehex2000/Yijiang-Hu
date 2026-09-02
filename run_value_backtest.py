@@ -26,7 +26,8 @@ class ValueStrategyBacktest:
     
     def __init__(self, initial_cash=50000, db_path="D:/tu-shareData/astock_daily.db",
                  freq="monthly", size_neutral=False, value_pct=None, top_n=5,
-                 stock_pool="zz800", value_mode="pobreak", downside_filter=False):
+                 stock_pool="zz800", value_mode="pobreak", downside_filter=False,
+                 price_mode="raw"):
         """
         初始化回测
 
@@ -39,6 +40,8 @@ class ValueStrategyBacktest:
             top_n: 每期选股数量
             stock_pool: 股票池 hs300/zz500/zz800/zz1000
             value_mode: 选股模式 pobreak(破净价值) / pure_bm(放宽破净·BM分位门槛)
+            price_mode: NAV 计价口径 raw(原始价，不含分红) / hfq(后复权，逐持仓 buy_factor 归一化，
+                        含分红+送转；买价与整手判定恒为 raw)
         """
         self.initial_cash = initial_cash
         self.db_path = db_path
@@ -49,6 +52,7 @@ class ValueStrategyBacktest:
         self.stock_pool = stock_pool
         self.value_mode = value_mode
         self.downside_filter = downside_filter
+        self.price_mode = price_mode
         self.data_fetcher = DataFetcher()
 
         # 读取配置
@@ -148,6 +152,39 @@ class ValueStrategyBacktest:
         if len(df) > 0:
             return df['close'].iloc[0]
         return None
+
+    def _adj_factor(self, ts_code, trade_date):
+        """查某股票截至某交易日的**最近一个** adj_factor（自带 as-of 语义，天然 ffill）。
+
+        缺行日（全市场同缺 132 天那类）自动继承前一交易日的因子；
+        该代码在 trade_date 之前无任何因子记录时返回 None（调用方按 1.0 处理并如实降级）。
+        """
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query(
+            "SELECT adj_factor FROM adj_factor WHERE ts_code=? AND trade_date<=? "
+            "ORDER BY trade_date DESC LIMIT 1",
+            conn, params=(ts_code, str(trade_date)))
+        conn.close()
+        if len(df) > 0 and df['adj_factor'].iloc[0]:
+            return float(df['adj_factor'].iloc[0])
+        return None
+
+    def _hfq_ratio(self, pos, trade_date):
+        """hfq 估值比率 = f(今) / f(买入)。raw 模式恒为 1.0。
+
+        - adj_factor 单调不减 → 比率 ≥ 1（含分红+送转的累计贡献）；
+        - 买入日因子缺失（fb=None）时**永久锁 1.0**——绝不拿 f(今)/1.0，
+          否则绝对因子值（~7.8×）会整段虚增（同 §12.13 跨空间教训）。
+        """
+        if self.price_mode != "hfq":
+            return 1.0
+        fb = pos.get('buy_factor')
+        if not fb:
+            return 1.0
+        ft = self._adj_factor(pos['ts_code'], trade_date)
+        if not ft:
+            return 1.0
+        return float(ft) / float(fb)
     
     def select_stocks_for_month(self, rebalance_date):
         """
@@ -260,6 +297,11 @@ class ValueStrategyBacktest:
               f"BM分位筛选={('前%.0f%%'%(self.value_pct*100)) if self.value_pct else '关'} | "
               f"模式={self.value_mode} | 池={self.stock_pool} | "
               f"下跌通道风控筛={'开' if self.downside_filter else '关'}")
+        if self.price_mode == "hfq":
+            print("【NAV 计价口径】hfq 后复权（逐持仓 buy_factor 归一化：估值/卖出=f(今)/f(买入)×raw，"
+                  "含分红+送转；买入价与整手判定恒为 raw）。无全收益基准可比——本脚本不打印超额。")
+        else:
+            print("【NAV 计价口径】raw 原始价（不含分红；送转股会导致持仓市值凭空蒸发，见审计报告 §10）")
         print("=" * 80)
 
         # 获取所有交易日
@@ -291,9 +333,10 @@ class ValueStrategyBacktest:
                     for pos in positions:
                         price = self.get_stock_price(pos['ts_code'], trade_date)
                         if price:
-                            sell_amount = pos['shares'] * price
+                            sell_px = price * self._hfq_ratio(pos, trade_date)
+                            sell_amount = pos['shares'] * sell_px
                             cash += sell_amount
-                            print(f"    ✓ {pos['ts_code']} ({pos['name']}) 卖出 {pos['shares']}股 @ {price:.2f} = {sell_amount:,.0f}元")
+                            print(f"    ✓ {pos['ts_code']} ({pos['name']}) 卖出 {pos['shares']}股 @ {sell_px:.2f} = {sell_amount:,.0f}元")
                         else:
                             print(f"    ⚠️ {pos['ts_code']} 无数据，无法卖出")
                 
@@ -321,7 +364,10 @@ class ValueStrategyBacktest:
                                 'name': stock['name'],
                                 'shares': actual_shares,
                                 'cost_price': stock['price'],
-                                'cost_amount': cost
+                                'cost_amount': cost,
+                                # hfq 归一化基准因子（买入日 as-of）；raw 模式下不用
+                                'buy_factor': (self._adj_factor(stock['ts_code'], trade_date)
+                                               if self.price_mode == "hfq" else 1.0),
                             })
                             
                             print(f"    ✓ {stock['ts_code']} ({stock['name']}) 买入 {actual_shares}股 @ {stock['price']:.2f} = {cost:,.0f}元")
@@ -331,7 +377,7 @@ class ValueStrategyBacktest:
             for pos in positions:
                 price = self.get_stock_price(pos['ts_code'], trade_date)
                 if price:
-                    portfolio_value += pos['shares'] * price
+                    portfolio_value += pos['shares'] * price * self._hfq_ratio(pos, trade_date)
             
             portfolio_values.append({
                 'trade_date': trade_date,
@@ -357,7 +403,8 @@ class ValueStrategyBacktest:
         result_df = pd.DataFrame(portfolio_values)
         result_df['return'] = (result_df['portfolio_value'] / self.initial_cash - 1)
         
-        output_file = f"data/results/value_strategy/backtest_result_{start_date}_{end_date}.csv"
+        pm_tag = "_hfq" if self.price_mode == "hfq" else ""
+        output_file = f"data/results/value_strategy/backtest_result{pm_tag}_{start_date}_{end_date}.csv"
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         result_df.to_csv(output_file, index=False, encoding='utf-8-sig')
         
@@ -390,6 +437,9 @@ def main():
                     help="pobreak=破净价值(PB<1+ROE质量) | pure_bm=放宽破净·全市场BM前N%门槛")
     ap.add_argument("--downside-filter", action="store_true",
                     help="下跌通道风控筛：剔除仍处下跌通道(贴lows/在MA下/量未缩)的候选，降波动不增收益")
+    ap.add_argument("--price-mode", default="raw", choices=["raw", "hfq"],
+                    help="NAV 计价口径: raw=原始价(不含分红) | hfq=后复权(逐持仓 buy_factor 归一化, 含分红+送转). "
+                         "默认 raw，历史结论零漂移")
     ap.add_argument("--portfolio-layer", default=None,
                     help="组合层分散: 权重 equity,bond,gold 逗号分隔(如 0.7,0.15,0.15), "
                          "把本策略日频NAV与国债511260+黄金518880做月度再平衡。默认None=不开启")
@@ -407,6 +457,7 @@ def main():
         stock_pool=args.pool,
         value_mode=args.mode,
         downside_filter=args.downside_filter,
+        price_mode=args.price_mode,
     )
 
     result = backtest.run_backtest(start_date=args.start, end_date=args.end)
@@ -418,8 +469,9 @@ def main():
         lowcorr = ("bond", "gold")
         names = ["equity"] + list(lowcorr)
         weights = {n: wk[i] for i, n in enumerate(names)}
+        pm_tag = "_hfq" if args.price_mode == "hfq" else ""
         layer = PortfolioLayer(
-            equity_csv=f"data/results/value_strategy/backtest_result_{args.start}_{args.end}.csv",
+            equity_csv=f"data/results/value_strategy/backtest_result{pm_tag}_{args.start}_{args.end}.csv",
             weights=weights, lowcorr=lowcorr, scheme=args.layer_scheme,
             equity_col="portfolio_value")
         layer.run().report()

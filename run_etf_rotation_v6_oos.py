@@ -38,13 +38,24 @@ N_PICK = 4
 
 
 def load(code):
+    """加载 close 并拼上 etf_adj_factor（as-of ffill）→ close_adj = close × f。
+
+    🔴 2026-09-01 审计 §12.15：512100 份额合并（2022-09-05，close 0.982→2.713 ×2.76，
+    因子 1.0→0.3622）落在 in-sample 窗口内，raw 排名被灌 +182pp 假收益，
+    把它虚顶到第 1 名选进 top-4。排名与持有收益一律改用 close_adj。
+    """
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT trade_date, close FROM etf_daily "
-        "WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+        "SELECT d.trade_date, d.close, f.adj_factor "
+        "FROM etf_daily d LEFT JOIN etf_adj_factor f "
+        "ON d.ts_code=f.ts_code AND d.trade_date=f.trade_date "
+        "WHERE d.ts_code=? AND d.trade_date BETWEEN ? AND ? ORDER BY d.trade_date",
         conn, params=(code, "20180101", OOS_END))
     conn.close()
     df["trade_date"] = df["trade_date"].astype(str)
+    # as-of ffill：整表缺行日继承最近因子；从未有因子 → 1.0（诚实降级）
+    df["adj_factor"] = df["adj_factor"].ffill().fillna(1.0)
+    df["close_adj"] = df["close"] * df["adj_factor"]
     return df
 
 
@@ -52,9 +63,9 @@ def metrics_insample(df):
     ins = df[(df.trade_date >= IN_START) & (df.trade_date <= IN_END)]
     if len(ins) < 50:
         return None
-    first_c, last_c = ins.iloc[0]["close"], ins.iloc[-1]["close"]
+    first_c, last_c = ins.iloc[0]["close_adj"], ins.iloc[-1]["close_adj"]
     cum = last_c / first_c - 1.0
-    rets = np.log(ins["close"].values[1:] / ins["close"].values[:-1])
+    rets = np.log(ins["close_adj"].values[1:] / ins["close_adj"].values[:-1])
     n = len(rets)
     ann_ret = (last_c / first_c) ** (252.0 / n) - 1.0
     vol = rets.std() * np.sqrt(252)
@@ -76,7 +87,7 @@ def oos_hold(df_map, codes):
         if len(oos) < 2:
             return None
         e_d, x_d = oos.iloc[0]["trade_date"], oos.iloc[-1]["trade_date"]
-        pe, px = oos.iloc[0]["close"], oos.iloc[-1]["close"]
+        pe, px = oos.iloc[0]["close_adj"], oos.iloc[-1]["close_adj"]
         ri = px / pe - 1.0
         entry_amt = per_unit
         exit_amt = per_unit * (1 + ri)
@@ -100,6 +111,7 @@ def main():
     print(f"in-sample 选择窗口: {IN_START}~{IN_END} (只用此区间数据)")
     print(f"OOS 测试窗口:       {OOS_START}~{OOS_END} (与后视镜V6牛市窗口一致)")
     print(f"成本: 佣0.025%+最低5元+滑点0.1%双向, ETF免印花税; 初始{INIT_CAPITAL/10000:.0f}万等权{N_PICK}只")
+    print(f"口径: 2026-09-01 审计修正——排名与持有收益一律用 close_adj(含分红+份额合并校正，§12.15)")
     print("-" * 72)
 
     ins, df_map = {}, {}
@@ -146,7 +158,9 @@ def main():
     print(f"  后视镜V6 4只(含答案, 全段2018-2026挑):  +61.67%  <-- 要证伪的数字")
     print(f"  沪深300ETF(被动):                      +42.59%")
     print(f"  平台 active(20只广覆盖轮动):           -10.78%")
-    print(f"  本实验 OOS选4(2018-2023挑,固定持有):   见上(+38%量级, 且<HS300)")
+    print(f"  本实验 OOS选4(2018-2023挑,固定持有):   +34.88% (2026-09-01 adj修正后；"
+          f"污染版raw曾得+52.50%——512100被+182pp假排名虚选入)")
+    print(f"  ⚠️ 公式怪癖: 净==毛(比例成本在几何比中精确抵消,¥5最低佣不触发时'净'列无意义)")
     print("=" * 72)
 
 

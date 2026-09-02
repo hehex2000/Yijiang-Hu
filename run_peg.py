@@ -88,6 +88,57 @@ def _slow_conn():
     return _SLOW_CONN
 
 
+# ════════════════════════════════════════════════════════════
+#  NAV 计价口径: raw(漏分红) / hfq(含分红再投)
+# ════════════════════════════════════════════════════════════
+#  只切换 NAV 侧(估值/卖出所得)。信号侧(动量/选股)恒用 raw, 保证双跑差异可归因。
+#  买入侧恒用 raw 价: 整手判定与 affordability 必须用真实成交价。
+#  买入日因子缺失 → 该持仓永久锁 1.0(绝不能拿 f(今)/1.0, 否则绝对因子值整段虚增)。
+PRICE_MODE   = "raw"
+_ADJ_CACHE   = {}
+
+
+def _adj_series(ts_code):
+    """整条因子序列按 code 一次性载入(返回 日期list/因子list, 升序)。
+    ⚠️ 不能按 (code, date) 逐日查库: 19 仓 × 3046 天 = 5.8 万次 SQL, 单次回测要 45+ 分钟。
+    按 code 预载后 bisect 做 as-of, 查询量从 O(持仓×天数) 降到 O(股票数)。"""
+    e = _ADJ_CACHE.get(ts_code)
+    if e is not None:
+        return e
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT trade_date, adj_factor FROM adj_factor WHERE ts_code=? "
+        "ORDER BY trade_date", conn, params=(ts_code,))
+    conn.close()
+    e = ((df["trade_date"].astype(str).tolist(),
+          df["adj_factor"].astype(float).tolist()) if len(df) else None)
+    _ADJ_CACHE[ts_code] = e
+    return e
+
+
+def _adj_factor(ts_code, trade_date):
+    """as-of 后复权因子(<=date 最近一条)。天然 ffill, 自动继承整市场缺行日。"""
+    e = _adj_series(ts_code)
+    if not e:
+        return None
+    ds, fs = e
+    i = bisect.bisect_right(ds, str(trade_date)) - 1
+    return float(fs[i]) if i >= 0 else None
+
+
+def _hfq_ratio(ts_code, buy_factor, trade_date):
+    """持仓的 hfq 折算比 = f(今)/f(买入)。
+    raw 模式恒 1.0; 买入日因子缺失 → 1.0(该持仓不再补分红, 保守)。"""
+    if PRICE_MODE != "hfq":
+        return 1.0
+    if not buy_factor:
+        return 1.0
+    ft = _adj_factor(ts_code, trade_date)
+    if not ft:
+        return 1.0
+    return float(ft) / float(buy_factor)
+
+
 def _day_close(trade_date):
     """某交易日全市场收盘价（一次性查询并缓存）。用于每日市值循环，
     避免对每只持仓逐日调用 get_price（每次都新建连接）导致回测极慢。"""
@@ -456,7 +507,10 @@ def run_backtest(start_date="20140101", end_date="20260715",
     print(f"  剔除：ST / .BJ / 金融 / 公用事业 / 上市<60天")
     print(f"  佣金万{COMMISSION_RATE*1e4:.1f}(最低{COMMISSION_MIN}) "
           f"印花税千1→千0.5(2023-08-28起) 滑点{SLIPPAGE_RATE*100:.1f}%")
-    print(f"  初始资金：{_CAPITAL:,.0f}\n")
+    print(f"  初始资金：{_CAPITAL:,.0f}")
+    print(f"  NAV 计价口径：{'hfq(后复权·含分红再投)' if PRICE_MODE == 'hfq' else 'raw(原始价·漏分红)'}"
+          f"   [信号侧/买入成交价恒用 raw]")
+    print()
 
     trade_dates = get_trade_dates(start_date, end_date)
     rebal_set = _rebalance_dates(trade_dates, freq)
@@ -490,8 +544,9 @@ def run_backtest(start_date="20140101", end_date="20260715",
                 if op is None:
                     continue
                 pos = positions[code]
-                fee = calc_fee('sell', op, pos["shares"])
-                cash += pos["shares"] * op - fee
+                sell_px = op * _hfq_ratio(code, pos.get("buy_factor"), td)
+                fee = calc_fee('sell', sell_px, pos["shares"])
+                cash += pos["shares"] * sell_px - fee
                 trades.append({"date": td, "action": "SELL", "code": code,
                                "name": _name(code), "price": op,
                                "shares": pos["shares"], "reason": "var_guard_off"})
@@ -526,8 +581,9 @@ def run_backtest(start_date="20140101", end_date="20260715",
                             if op is None:
                                 continue
                             pos = positions[code]
-                            fee = calc_fee('sell', op, pos["shares"])
-                            cash += pos["shares"] * op - fee
+                            sell_px = op * _hfq_ratio(code, pos.get("buy_factor"), td)
+                            fee = calc_fee('sell', sell_px, pos["shares"])
+                            cash += pos["shares"] * sell_px - fee
                             trades.append({"date": td, "action": "SELL",
                                            "code": code, "name": _name(code),
                                            "price": op, "shares": pos["shares"],
@@ -560,7 +616,12 @@ def run_backtest(start_date="20140101", end_date="20260715",
                             if cost + fee <= cash:
                                 cash -= cost + fee
                                 positions[code] = {"shares": max_shares,
-                                                   "buy_price": op, "last_price": op}
+                                                   "buy_price": op, "last_price": op,
+                                                   # 买入价/整手判定恒用 raw(真实 affordability);
+                                                   # buy_factor 只用于 NAV 侧折算
+                                                   "buy_factor": (_adj_factor(code, td)
+                                                                  if PRICE_MODE == "hfq"
+                                                                  else None)}
                                 trades.append({"date": td, "action": "BUY",
                                                "code": code, "name": _name(code),
                                                "price": op, "shares": max_shares,
@@ -580,7 +641,7 @@ def run_backtest(start_date="20140101", end_date="20260715",
                 px = pos.get("last_price") or 0
             else:
                 pos["last_price"] = px
-            total += pos["shares"] * px
+            total += pos["shares"] * px * _hfq_ratio(code, pos.get("buy_factor"), td)
         daily_vals.append({"date": td, "value": total})
         nav_hist.append(total)
         if risk_off:
@@ -610,8 +671,9 @@ def run_backtest(start_date="20140101", end_date="20260715",
             px = last_close.get(code)
             if px is not None:
                 pos = positions[code]
-                fee = calc_fee('sell', px, pos["shares"])
-                cash += pos["shares"] * px - fee
+                sell_px = px * _hfq_ratio(code, pos.get("buy_factor"), last)
+                fee = calc_fee('sell', sell_px, pos["shares"])
+                cash += pos["shares"] * sell_px - fee
                 trades.append({"date": last, "action": "SELL", "code": code,
                                "name": _name(code), "price": px,
                                "shares": pos["shares"], "reason": "backtest_end"})
@@ -735,8 +797,9 @@ def _report(daily_vals, trades, trade_dates, start_date, end_date, top_n=TOP_N,
 
     os.makedirs("data/results/peg", exist_ok=True)
     var_tag = f"_v{int(var_cap*1000)}" if var_guard else ""
+    _pm = "_hfq" if PRICE_MODE == "hfq" else ""
     tag = (f"n{top_n}_c{int(_CAPITAL)}_{freq}_s{stab_years}"
-           f"_p{stock_pool}_r{int(min_roe)}_d{int(max_debt)}_m{int(momentum_months)}_w{weight}"
+           f"_p{stock_pool}_r{int(min_roe)}_d{int(max_debt)}_m{int(momentum_months)}_w{weight}{_pm}"
            f"{var_tag}"
            f"_{start_date}_{end_date}")
     csv_path = f"data/results/peg/backtest_{tag}.csv"
@@ -783,13 +846,18 @@ if __name__ == "__main__":
                     help="VaR(95%) 日度上限（小数），默认 0.025=2.5%/日")
     ap.add_argument("--var-window", type=int, default=60,
                     help="VaR 计算回看天数，默认 60")
+    ap.add_argument("--price-mode", choices=["raw", "hfq"], default="raw",
+                    help="NAV 计价口径: raw=原始价(漏分红, 旧行为) / "
+                         "hfq=后复权(含分红再投, 正确总回报)。信号侧恒用 raw。")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--interrupt-start", default=None)
     ap.add_argument("--interrupt-months", type=int, default=0)
     ap.add_argument("--interrupt-pct", type=float, default=0.0)
     args = ap.parse_args()
 
+    # if __name__ 块内赋值即改模块全局, 此处不需要(也不能)加 global
     _CAPITAL = args.capital  # 覆盖模块级常量供报告使用
+    PRICE_MODE = args.price_mode
     run_backtest(
         start_date=args.start, end_date=args.end, top_n=args.topn,
         verbose=args.verbose, stock_pool=args.pool, freq=args.freq,

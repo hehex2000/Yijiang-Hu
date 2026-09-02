@@ -180,6 +180,57 @@ def get_etf_open(ts_code, trade_date):
     return _query_price(ts_code, trade_date, field="open", fallback_field="close")
 
 
+# ── NAV 计价口径（2026-09-01 审计 §12.15）──────────────────
+#   raw: 原始价——ETF 除息日价格下跌，分红凭空消失（红利ETF 年股息 3~6%）
+#   hfq: 逐持仓 buy_factor 归一化——估值/卖出 × f(今)/f(买入)，含分红；
+#        买入价与整手判定恒为 raw；信号侧（动量/RSRS/溢价）恒为 raw。
+#   数据源：etf_adj_factor 表（29/29 全覆盖，2005→2026）。
+PRICE_MODE = "raw"
+_ADJ_CACHE = {}
+
+
+def _etf_adj_factor(ts_code, trade_date):
+    """查 etf_adj_factor 截至 trade_date 的最近因子（as-of 查询，天然 ffill）。
+
+    缺行日自动继承前一交易日因子；该代码无任何记录（如 index_daily fallback 代码）
+    返回 None → 调用方按 1.0 处理（诚实降级为 raw，绝不跨空间相除）。
+    """
+    key = (ts_code, int(trade_date))
+    if key in _ADJ_CACHE:
+        return _ADJ_CACHE[key]
+    conn = get_conn()
+    row = pd.read_sql_query(
+        "SELECT adj_factor FROM etf_adj_factor WHERE ts_code=? AND trade_date<=? "
+        "ORDER BY trade_date DESC LIMIT 1",
+        conn, params=(ts_code, str(int(trade_date))))
+    conn.close()
+    v = None
+    if len(row) > 0 and row.iloc[0]["adj_factor"]:
+        v = float(row.iloc[0]["adj_factor"])
+    _ADJ_CACHE[key] = v
+    return v
+
+
+def _hfq_ratio(ts_code, buy_factor, trade_date):
+    """hfq 估值比率 = f(今)/f(买入)。raw 模式恒 1.0。
+
+    ⚠️ ETF 与股票不同：**因子可能下降**——份额合并（如 512100 2022-09-05，
+    价格 0.982→2.713，因子 1.0→0.3622=1/2.76）。
+      - 股票送转/分红：因子升、raw 价跌 → raw 凭空【蒸发】市值（§10）
+      - ETF 份额合并：因子降、raw 价跳升 → raw 凭空【虚增】市值 ×n（本节实测 +47k）
+    两种情况 hfq 都恢复真实连续净值。买入日因子缺失 → 永久锁 1.0
+    （绝不拿 f(今)/1.0，防绝对因子整段虚增——同 §12.13 跨空间教训）。
+    """
+    if PRICE_MODE != "hfq":
+        return 1.0
+    if not buy_factor:
+        return 1.0
+    ft = _etf_adj_factor(ts_code, trade_date)
+    if not ft:
+        return 1.0
+    return ft / float(buy_factor)
+
+
 # ── ETF 费用计算（免印花税）────────────────────────────────
 
 def calc_etf_fee(buy_or_sell, price, shares):
@@ -860,9 +911,18 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
 
     # ── 初始化 ──
     cash = float(capital)
-    positions = {}  # { code: {"shares": int, "buy_price": float} }
+    positions = {}  # { code: {"shares": int, "buy_price": float, "buy_factor": float|None} }
     trades = []
     daily_vals = []
+
+    # ── NAV 计价口径标注（审计 §12.15）──
+    if verbose:
+        if PRICE_MODE == "hfq":
+            print("  【NAV 计价口径】hfq 后复权（逐持仓 buy_factor 归一化：估值/卖出=f(今)/f(买入)×raw，"
+                  "含分红；买入价/整手/信号侧恒为 raw）")
+        else:
+            print("  【NAV 计价口径】raw 原始价（ETF 除息日价格下跌，分红凭空消失——红利类标的年漏 3~6%）")
+        print()
 
     # ── 折溢价闸门（默认 off，不影响历史结果）──
     gate = PremiumGate(universe, mode=premium_filter)
@@ -991,8 +1051,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                         keep_shares = int(pos["shares"] * scale / 100) * 100
                         sell_shares = pos["shares"] - keep_shares
                         if sell_shares >= 100:
-                            proceeds = sell_shares * open_price
-                            fee = calc_etf_fee('sell', open_price, sell_shares)
+                            sell_px = open_price * _hfq_ratio(code, pos.get("buy_factor"), td)
+                            proceeds = sell_shares * sell_px
+                            fee = calc_etf_fee('sell', sell_px, sell_shares)
                             cash += proceeds - fee
                             trades.append({
                                 "date": td, "action": "SELL", "code": code,
@@ -1019,8 +1080,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                     if open_price is None or open_price <= 0:
                         continue
                     pos = positions[code]
-                    proceeds = pos["shares"] * open_price
-                    fee = calc_etf_fee('sell', open_price, pos["shares"])
+                    sell_px = open_price * _hfq_ratio(code, pos.get("buy_factor"), td)
+                    proceeds = pos["shares"] * sell_px
+                    fee = calc_etf_fee('sell', sell_px, pos["shares"])
                     cash += proceeds - fee
                     trades.append({
                         "date": td, "action": "SELL", "code": code,
@@ -1053,7 +1115,12 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                             fee = calc_etf_fee('buy', open_price, max_shares)
                             if cost + fee <= cash:
                                 cash -= cost + fee
-                                positions[code] = {"shares": max_shares, "buy_price": open_price}
+                                positions[code] = {
+                                    "shares": max_shares, "buy_price": open_price,
+                                    # hfq 归一化基准（买入日 as-of）；raw 模式下不使用
+                                    "buy_factor": (_etf_adj_factor(code, td)
+                                                   if PRICE_MODE == "hfq" else None),
+                                }
                                 trades.append({
                                     "date": td, "action": "BUY", "code": code,
                                     "name": name, "price": open_price,
@@ -1074,7 +1141,11 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
                                 fee = calc_etf_fee('buy', open_price, max_shares)
                                 if cost + fee <= cash:
                                     cash -= cost + fee
-                                    positions[MONEY_FUND_CODE] = {"shares": max_shares, "buy_price": open_price}
+                                    positions[MONEY_FUND_CODE] = {
+                                        "shares": max_shares, "buy_price": open_price,
+                                        "buy_factor": (_etf_adj_factor(MONEY_FUND_CODE, td)
+                                                       if PRICE_MODE == "hfq" else None),
+                                    }
                                     mf_name = next((e["name"] for e in universe if e["code"] == MONEY_FUND_CODE), CASH_NAME)
                                     trades.append({
                                         "date": td, "action": "BUY", "code": MONEY_FUND_CODE,
@@ -1089,7 +1160,7 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         for code, pos in list(positions.items()):
             price = get_etf_price(code, td)
             if price is not None:
-                total_value += pos["shares"] * price
+                total_value += pos["shares"] * price * _hfq_ratio(code, pos.get("buy_factor"), td)
         daily_vals.append({"date": td, "value": total_value})
 
     # ── 回测结束：平仓 ──
@@ -1099,8 +1170,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
             price = get_etf_price(code, last_date)
             if price is not None:
                 pos = positions[code]
-                proceeds = pos["shares"] * price
-                fee = calc_etf_fee('sell', price, pos["shares"])
+                sell_px = price * _hfq_ratio(code, pos.get("buy_factor"), last_date)
+                proceeds = pos["shares"] * sell_px
+                fee = calc_etf_fee('sell', sell_px, pos["shares"])
                 cash += proceeds - fee
                 trades.append({
                     "date": last_date, "action": "SELL", "code": code,
@@ -1192,8 +1264,9 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         _trades_df = pd.DataFrame(trades)[
             ["date", "action", "code", "name", "price", "shares", "reason"]
         ]
-        _trades_df.to_csv("etf_rotation_trades.csv", index=False, encoding="utf-8-sig")
-        print(f"  成交明细：已导出 etf_rotation_trades.csv（{len(_trades_df)} 笔，含 reason 列）")
+        _trades_csv = f"etf_rotation_trades{_PM_TAG}.csv"
+        _trades_df.to_csv(_trades_csv, index=False, encoding="utf-8-sig")
+        print(f"  成交明细：已导出 {_trades_csv}（{len(_trades_df)} 笔，含 reason 列）")
 
     return {
         "total_return": total_return,
@@ -1201,6 +1274,7 @@ def run_etf_rotation(start_date="20200101", end_date="20251231",
         "max_drawdown": max_dd,
         "sharpe": sharpe,
         "trades": len(trades),
+        "daily_vals": daily_vals,   # [{"date","value"}]，供 hfq/raw 比值诊断
         "idx_return": idx_return,
         "final_value": final_value,
         "pool": pool,
@@ -1285,7 +1359,14 @@ if __name__ == "__main__":
                         help="宽度口径：proxy=8大指数代理(默认,已验证) | full=全A个股(较重,需复验)")
     parser.add_argument("--min-consecutive", type=int, default=2,
                         help="BULL 滞后确认月数(默认2=连续2月BULL才生效，降whipsaw误触)")
+    parser.add_argument("--price-mode", default="raw", choices=["raw", "hfq"],
+                        help="NAV 计价口径: raw=原始价(除息日下跌,漏分红) | "
+                             "hfq=后复权(逐持仓 buy_factor 归一化,含分红). 默认 raw，历史结论零漂移")
     args = parser.parse_args()
+
+    # 模块级块内赋值即绑定全局（此处【不能】加 global——会报 SyntaxError）
+    PRICE_MODE = args.price_mode
+    _PM_TAG = "_hfq" if PRICE_MODE == "hfq" else ""
 
     # ── 构造 regime hook（仅 --regime on 时惰性导入，off 时完全不触发）──
     regime_hook = None

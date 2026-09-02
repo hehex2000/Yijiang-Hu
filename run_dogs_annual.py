@@ -214,6 +214,71 @@ def get_index_close(index_code, trade_date):
     return None
 
 
+_TR_SERIES = {}          # index_code -> {trade_date: close}（全收益序列缓存）
+_TR_SERIES_DATES = {}    # index_code -> 排序后的日期列表（供序列内 ffill 二分查找）
+_TR_META = {}            # index_code -> bench_index meta（用于打印口径标签）
+
+
+def _tr_level(index_code, trade_date):
+    """取**全收益序列内**的收盘（当天无则向前 ffill）。取不到返回 None。
+
+    ⚠️ 本函数**绝不回退价格指数**——那会造成"一端价格、一端全收益"的跨空间相除
+       （实测 000985.SH 2014→2026 会算出 −99.94% 这种荒谬数字）。
+       是否需要回退由 `get_bench_pair()` 在**整段**层面决定。
+    """
+    if index_code not in _TR_SERIES:
+        import bench_index as bi
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            df, meta = bi.load_benchmark(index_code, "19900101", "20991231",
+                                         conn=conn, nav_price_mode="hfq")
+        finally:
+            conn.close()
+        s = ({} if df is None or df.empty else
+             dict(zip(df["trade_date"].astype(str), df["close"].astype(float))))
+        _TR_SERIES[index_code] = s
+        _TR_SERIES_DATES[index_code] = sorted(s.keys())
+        _TR_META[index_code] = meta
+    s = _TR_SERIES[index_code]
+    if not s:
+        return None
+    if trade_date in s and s[trade_date] and s[trade_date] > 0:
+        return s[trade_date]
+    # 序列内向前取最近交易日（全收益序列自己的日历，不查 index_daily）
+    import bisect
+    dates = _TR_SERIES_DATES[index_code]
+    i = bisect.bisect_right(dates, str(trade_date)) - 1
+    while i >= 0:
+        v = s.get(dates[i])
+        if v and v > 0:
+            return v
+        i -= 1
+    return None
+
+
+def get_bench_pair(index_code, d0, d1):
+    """返回 (price_ret_pct, tr_ret_pct, tr_note)。
+
+    **保证每条收益的两端都取自同一价格空间**：
+      - 若全收益序列覆盖 [d0, d1] → tr_ret 用全收益；
+      - 否则 tr_ret **整段回退**为 price_ret（并标注），绝不跨空间混算。
+
+    用途：raw 轨道用 price_ret，hfq / real 轨道用 tr_ret。
+    """
+    p0 = get_index_close(index_code, d0)
+    p1 = get_index_close(index_code, d1)
+    price_ret = (p1 / p0 - 1) * 100 if p0 and p1 and p0 > 0 else 0.0
+
+    t0 = _tr_level(index_code, d0)
+    t1 = _tr_level(index_code, d1)
+    meta = _TR_META.get(index_code) or {}
+    note = meta.get("note") or ""
+    if t0 and t1 and t0 > 0:
+        return price_ret, (t1 / t0 - 1) * 100, note
+    # 全收益未覆盖 → 整段回退价格指数（同空间，安全）
+    return price_ret, price_ret, f"价格指数(全收益未覆盖 {d0}~{d1}，已回退)"
+
+
 def get_stock_pool_index():
     """根据股票池配置返回对应的基准指数代码"""
     pool = SELECTION.get("stock_pool", "zz800")
@@ -926,7 +991,12 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"  [口径] 策略(raw) = 原始价(不含分红，漏计股息，【偏低】)")
     print(f"  [口径] 基准 = {benchmark_idx} 价格指数(不含分红)")
     print(f"  [提示] 带 * 年度为区间未结束的半年度，收益按实际持有期计")
-    print(f"  {'年份':<9} {'策略(真实)':>10} {'策略(hfq)':>10} {'策略(raw)':>10} {'基准':>10} {'超额(真实)':>11} {'超额(hfq)':>10} {'持仓'}")
+    # 口径说明（三轨道已各配同口径基准，必须让读者看懂"基准"这一列到底是什么）
+    _bmeta = _TR_META.get(benchmark_idx) or {}
+    print(f"  [口径] 基准(TR)={_bmeta.get('note') or '全收益'} → 供 真实/hfq 轨道；"
+          f"基准(价格)=不含分红 → 供 raw 轨道。"
+          f"（某年全收益未覆盖时，该年整段回退价格指数，不跨空间混算）")
+    print(f"  {'年份':<9} {'策略(真实)':>10} {'策略(hfq)':>10} {'策略(raw)':>10} {'基准(TR)':>10} {'超额(真实)':>11} {'超额(hfq)':>10} {'持仓'}")
     print(f"  {'─'*80}")
 
     # 按年计算收益
@@ -974,16 +1044,16 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         else:
             strategy_ret_real = 0
 
-        # 基准指数年度收益（价格指数，不含分红）
-        benchmark_ret = 0
-        b_start_idx = get_index_close(benchmark_idx, yg["first_date"])
-        b_end_idx = get_index_close(benchmark_idx, yg["last_date"])
-        if b_start_idx and b_end_idx and b_start_idx > 0:
-            benchmark_ret = (b_end_idx / b_start_idx - 1) * 100
+        # 基准指数年度收益 —— **两条轨道各配一条同口径基准**
+        #   raw（不含分红）  → 价格指数；hfq / real（含分红）→ 全收益。
+        #   旧代码三轨道共用一个价格指数 → hfq / real 的超额被系统性高估
+        #   （宽基约 2.5%/年；狗股是高股息策略，实际偏差更大）。
+        benchmark_ret, benchmark_ret_tr, _bn = get_bench_pair(
+            benchmark_idx, yg["first_date"], yg["last_date"])
 
-        excess = strategy_ret - benchmark_ret
-        excess_raw = strategy_ret_raw - benchmark_ret
-        excess_real = strategy_ret_real - benchmark_ret
+        excess = strategy_ret - benchmark_ret_tr          # hfq vs 全收益
+        excess_raw = strategy_ret_raw - benchmark_ret     # raw  vs 价格指数
+        excess_real = strategy_ret_real - benchmark_ret_tr  # real vs 全收益（近似）
 
         # 区间未结束的年度（如回测截止在年中）标注 *
         is_partial = yg.get("n_days", 0) < 200
@@ -995,7 +1065,7 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
         else:
             year_stocks = "-"
 
-        print(f"  {year_label:<9} {strategy_ret_real:>+9.2f}% {strategy_ret:>+9.2f}% {strategy_ret_raw:>+9.2f}% {benchmark_ret:>+9.2f}% {excess_real:>+10.2f}% {excess:>+9.2f}%  {year_stocks[:20]}")
+        print(f"  {year_label:<9} {strategy_ret_real:>+9.2f}% {strategy_ret:>+9.2f}% {strategy_ret_raw:>+9.2f}% {benchmark_ret_tr:>+9.2f}% {excess_real:>+10.2f}% {excess:>+9.2f}%  {year_stocks[:20]}")
         total_strategy_return = strategy_ret
         total_strategy_return_raw = strategy_ret_raw
         total_strategy_return_real = strategy_ret_real
@@ -1011,16 +1081,18 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     # 基准总收益
     first_date = daily_vals[0]["date"]
     last_date = daily_vals[-1]["date"]
-    b_total_start = get_index_close(benchmark_idx, first_date)
-    b_total_end = get_index_close(benchmark_idx, last_date)
-    b_total_ret = (b_total_end / b_total_start - 1) * 100 if b_total_start and b_total_end else 0
+    # 同样两条基准：价格指数给 raw，全收益给 hfq / real（整段同空间，不跨空间混算）
+    b_total_ret, b_total_ret_tr, _btn = get_bench_pair(
+        benchmark_idx, first_date, last_date)
 
-    total_excess = total_return - b_total_ret
-    total_excess_raw = total_return_raw - b_total_ret
-    total_excess_real = total_return_real - b_total_ret
+    total_excess = total_return - b_total_ret_tr          # hfq vs 全收益
+    total_excess_raw = total_return_raw - b_total_ret     # raw  vs 价格指数
+    total_excess_real = total_return_real - b_total_ret_tr  # real vs 全收益（近似）
 
     print(f"  {'─'*80}")
-    print(f"  {'全程':<8} {total_return_real:>+9.2f}% {total_return:>+9.2f}% {total_return_raw:>+9.2f}% {b_total_ret:>+9.2f}% {total_excess_real:>+10.2f}% {total_excess:>+9.2f}%")
+    print(f"  {'全程':<8} {total_return_real:>+9.2f}% {total_return:>+9.2f}% {total_return_raw:>+9.2f}% {b_total_ret_tr:>+9.2f}% {total_excess_real:>+10.2f}% {total_excess:>+9.2f}%")
+    print(f"  [注] 基准(价格)= {b_total_ret:+.2f}% → raw 轨道超额 {total_excess_raw:+.2f}%；"
+          f"基准(TR)= {b_total_ret_tr:+.2f}% → hfq 轨道超额 {total_excess:+.2f}%")
 
     # 年化收益（真实趴账轨道为主口径）
     days = len(trade_dates)
@@ -1061,10 +1133,13 @@ def run_backtest(start_date="20200102", end_date="20261231", top_n=None, select_
     print(f"  总收益率(raw·原始价·漏分红):     {total_return_raw:>+9.2f}%")
     print(f"  年化收益率(真实): {annual_return:>+9.2f}%")
     print(f"  {'─'*66}")
-    print(f"  基准收益({benchmark_idx}价格指数·不含分红): {b_total_ret:>+9.2f}%")
-    print(f"  超额收益(真实·分红趴账总回报-基准): {total_excess_real:>+9.2f}%")
-    print(f"  超额收益(hfq·高估): {total_excess:>+9.2f}%")
-    print(f"  超额收益(raw·纯选股α·漏分红): {total_excess_raw:>+9.2f}%")
+    # ⚠️ 三条超额各自对应**不同的基准**，必须分开标注——
+    #    旧写法只打印一条"价格指数"基准却列了三个超额，读者会以为都跟它比。
+    print(f"  基准收益(价格指数·不含分红): {b_total_ret:>+9.2f}%   ← 供 raw 轨道")
+    print(f"  基准收益(全收益·含分红):     {b_total_ret_tr:>+9.2f}%   ← 供 真实/hfq 轨道  [{_btn}]")
+    print(f"  超额收益(真实·分红趴账总回报 - 全收益基准): {total_excess_real:>+9.2f}%  ★主口径")
+    print(f"  超额收益(hfq·含分红当日再投 - 全收益基准): {total_excess:>+9.2f}%")
+    print(f"  超额收益(raw·纯选股α·漏分红 - 价格基准):  {total_excess_raw:>+9.2f}%")
     print(f"  分红趴账 vs 后复权溢价(hfq-真实=立即再投复利增益): {total_return - total_return_real:>+9.2f}%")
     print(f"  {'─'*66}")
     print(f"  最大回撤(raw·原始价·真实价格波动): {max_dd:>+9.2f}%   ← 主口径(后复权除息不跌致回撤偏低)")
