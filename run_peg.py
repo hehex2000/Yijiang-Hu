@@ -94,7 +94,7 @@ def _slow_conn():
 #  只切换 NAV 侧(估值/卖出所得)。信号侧(动量/选股)恒用 raw, 保证双跑差异可归因。
 #  买入侧恒用 raw 价: 整手判定与 affordability 必须用真实成交价。
 #  买入日因子缺失 → 该持仓永久锁 1.0(绝不能拿 f(今)/1.0, 否则绝对因子值整段虚增)。
-PRICE_MODE   = "raw"
+PRICE_MODE   = "hfq"   # 2026-09-02 起默认总回报口径；命令行 --price-mode 可覆盖
 _ADJ_CACHE   = {}
 
 
@@ -833,22 +833,23 @@ if __name__ == "__main__":
     ap.add_argument("--stab-years", type=int, default=STAB_YEARS,
                     help="护栏③：要求连续正增长的年报年数")
     ap.add_argument("--min-roe", type=float, default=8.0,
-                    help="质量叠加：要求最新 ROE>=该值(%)，0=不启用（默认8）")
+                    help="质量叠加：要求最新 ROE>=该值(%%)，0=不启用（默认8）")
     ap.add_argument("--max-debt", type=float, default=70.0,
-                    help="质量叠加：要求资产负债率<=该值(%)，100=不启用（默认70）")
+                    help="质量叠加：要求资产负债率<=该值(%%)，100=不启用（默认70）")
     ap.add_argument("--momentum", type=int, default=12,
                     help="动量叠加：要求 N 个月价格动量>0，0=不启用（默认12）")
     ap.add_argument("--weight", choices=["equal", "liquidity"], default="equal",
                     help="仓位加权：equal 等权 / liquidity 按成交额加权")
     ap.add_argument("--no-var", action="store_true",
-                    help="关闭默认开启的 VaR(95%) 风控（回撤控制兜底，默认开启）")
+                    help="关闭默认开启的 VaR(95%%) 风控（回撤控制兜底，默认开启）")
     ap.add_argument("--var-cap", type=float, default=0.025,
-                    help="VaR(95%) 日度上限（小数），默认 0.025=2.5%/日")
+                    help="VaR(95%%) 日度上限（小数），默认 0.025=2.5%%/日")
     ap.add_argument("--var-window", type=int, default=60,
                     help="VaR 计算回看天数，默认 60")
-    ap.add_argument("--price-mode", choices=["raw", "hfq"], default="raw",
-                    help="NAV 计价口径: raw=原始价(漏分红, 旧行为) / "
-                         "hfq=后复权(含分红再投, 正确总回报)。信号侧恒用 raw。")
+    ap.add_argument("--price-mode", choices=["raw", "hfq"], default="hfq",
+                    help="NAV 计价口径: hfq=后复权(默认,含分红再投,正确总回报) / "
+                         "raw=原始价(旧口径,漏分红;送转致 NAV 虚假巨亏,本策略实测低估 +13~14pp/年,见 §12.17)。"
+                         "信号侧恒用 raw。")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--interrupt-start", default=None)
     ap.add_argument("--interrupt-months", type=int, default=0)

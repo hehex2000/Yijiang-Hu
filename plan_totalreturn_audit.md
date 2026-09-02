@@ -1322,6 +1322,108 @@ PEG 数据自洽性校验（基于旧代码 trades，341 笔）：逐笔 P&L 求
 
 ---
 
+## §12.18 hfq 切默认值（raw 变 opt-in）2026-09-02
+
+### (1) 切换清单：8 个已验证脚本默认 raw → hfq
+
+审计到此，hfq 的正确性已在 §12.13~§12.17 逐脚本双跑验证过。继续保留 raw 默认 = 让"漏分红 +
+不处理送转"的旧口径成为平台默认行为。故把**已验证的 8 个脚本**默认切到 hfq，raw 降级为 opt-in。
+
+| 脚本 | 模块级默认 | argparse 默认 | 双跑验证出处 |
+|---|---|---|---|
+| `run_daily20_macd.py` | raw → **hfq** | raw → **hfq** | §12.12（+2.38pp/年） |
+| `run_ab_weight.py` | raw → **hfq** | （`sys.argv` 手动解析） | §12.12（+2.01pp/年） |
+| `run_ep_neutral.py` | raw → **hfq** | raw → **hfq** | §12.11（+1.96pp/年） |
+| `run_multifactor.py` | 走 `_ep.PRICE_MODE` | raw → **hfq** | §12.11（+2.78pp/年） |
+| `run_value_backtest.py` | 类参数 raw → **hfq** | raw → **hfq** | §12.14（+5.8pp/年） |
+| `run_etf_rotation_v6_merged.py` | raw → **hfq** | raw → **hfq** | §12.15（反转：raw 虚增 47pp） |
+| `run_peg.py` | raw → **hfq** | raw → **hfq** | §12.17（+13~14pp/年） |
+| `run_dividend_low_vol_quality_bt.py` | raw → **hfq** | raw → **hfq** | §8/+3.67pp（主线①策略） |
+
+**三处易漏的"模块级"定义**已同步修正（`run_daily20_macd.py` L51 / `run_etf_rotation_v6_merged.py`
+L188 / `run_peg.py` L97）——只改 argparse 不改模块级，命令行跑没事，但**被 import 复用时会退回 raw**。
+
+同时更新全部 help 文案与注释（`raw=不复权(默认…)` → `hfq=后复权(默认…)`），避免文档自相矛盾。
+
+### (2) 验证：默认 ≡ 显式（逐字节一致）
+
+决定性对照实验——`git show HEAD:run_value_backtest.py`（切换前的代码）+ 显式 `--price-mode hfq`，
+对比当前代码**不传参数**：
+
+| 运行方式 | 最终资产 | 收益率 |
+|---|---|---|
+| HEAD 版本 + `--price-mode hfq`（切换前） | 59,245 | +18.49% |
+| **当前版本 + 不传参（默认 hfq）** | **59,245** | **+18.49%** |
+
+**逐字节一致 → 切换无副作用，默认路径与显式路径完全等价。**
+另跑两次当前版本，输出文件 `diff` 逐字节一致 → 无随机性。
+
+**输出落盘保护已确认生效**：hfq 结果写入 `backtest_result_hfq_20220102_20231229.csv`，
+raw 结果留在 `backtest_result_20220102_20231229.csv`，**两者并存未互相覆盖**（第 5 次守住了这个纪律）。
+
+### (3) ⚠️ 新发现：hfq 结果依赖 `adj_factor` 数据快照，raw 不漂移
+
+验证时发现：§12.14 记录的 hfq **+19.89%**，同样参数今天重跑是 **+18.49%**（差 1.4pp），
+而 raw 的 **+7.13% 完全复现**。排查链：
+
+1. 连跑两次 → 逐字节一致 → **排除非确定性**（按 §12.9 纪律，先复现再下结论）；
+2. HEAD 版本 + 显式 hfq → 也是 18.49% → **排除我的代码改动**；
+3. raw 完全复现 → 选股路径与 `daily.close` 未变；
+4. **DB 最后修改时间 = 2026-09-01 16:32，而 §12.14 的 hfq 文件生成于 16:17**
+   → 数据在两次运行之间被更新（`adj_factor` 表覆盖到 20260901）。
+
+**结论**：这是**数据快照漂移**，不是 bug。但它有方法论后果，必须记账：
+
+| 口径 | 依赖的数据 | 数据更新后历史回测数字 |
+|---|---|---|
+| raw | 仅 `daily.close`（历史价格基本不再变） | **不漂移**，可复现 |
+| hfq | `daily.close` × `adj_factor` | **会漂移**，且漂移幅度随持仓期分红/送转累积 |
+
+→ **记账规则（新增）**：凡引用 hfq 口径结论，必须同时标注**数据快照时间**（DB mtime）；
+跨时段对比两组 hfq 数字前，先确认 `adj_factor` 快照一致，否则差异可能只是数据刷新。
+raw 口径无此约束。
+
+### (4) 顺手修掉的既有 bug：argparse help 未转义 `%`
+
+跑 `--help` 时崩溃：`ValueError: unsupported format character '?' (0xff08)`。
+根因：argparse 会对 help 字符串做 `%` 格式化，中文文案里的 `30%（Fama…）`、`前N%门槛`、`95%`
+会被当成格式符。**这是既有 bug（非本次引入），且让大量脚本的 `--help` 完全不可用**。
+
+- 全局扫描：**30 处**（`_triage` 式 ast 扫描，覆盖全部 `*.py` 的 `add_argument(help=...)`）
+- 本轮已修（只动本次涉及的 3 个脚本，共 6 处）：
+  `run_value_backtest.py` L435/437、`run_peg.py` L836/838/844/846、`run_dividend_low_vol_quality_bt.py` L1183
+- **剩余 27 处挂账**（未动，因属无关文件）：`run_livermore_*` 家族 8 个文件 16 处、
+  `run_monthly_rebalance.py` L4567、`run_left_right_regime.py` L706/708/710、
+  `backtest_kara_small_cap.py` L336、`backtest_overnight.py` L177、`backtest_small_cap_rotation.py` L1276、
+  `run_etf_macd_timing.py` L38、`run_peg.py` 已修。
+
+### (5) 未切：`run_monthly_rebalance.py` 共享引擎（70 下游）
+
+引擎（`PRICE_MODE="raw"` + argparse default raw）**本次不切**，理由：
+
+- 它是 70 个 `run_*.py` 的共享底座，一刀切会同时改变所有下游策略的历史可比性；
+- 其中**只有 4 个**（daily20/ab_weight/ep_neutral/multifactor）做过 hfq 双跑量化，
+  其余 60+ 从未验证过 hfq 下的差异量级 → 直接切默认违反"先量化再改"的纪律；
+- 引擎已有 `_pm_tag` 输出保护，切换本身安全，缺的是**逐脚本的暴露量化**。
+
+→ 建议后续用 §12.17 的 `_measure_raw_exposure.py` 对引擎系下游做一轮批量暴露测量，
+按 `drag_nav` 排序分批切，而不是一刀切。
+
+### (6) 对日常使用的影响（必读）
+
+以下 `.bat` 调用**未传** `--price-mode`，切默认后跑出的数字**会变化**（方向与幅度均为已知）：
+
+| 调用 | 位置 | 变化 |
+|---|---|---|
+| `run_value_backtest.py` | `run_backtest.bat` L653 | 破净价值：raw +7.13% → hfq **+18.49%**（2022-2023 窗口，+11.4pp） |
+| `run_etf_rotation_v6_merged.py` | `run_backtest.bat` L181 | ETF 轮动：raw 虚增 → hfq 真实（§12.15：10 万口径 −47pp 假财富） |
+| `run_dividend_low_vol_quality_bt.py` | `rerun_remaining.bat` L11 | 主线①红利低波：+3.67pp/年，且**结论从"跑输"翻转为"跑赢"**（§8） |
+
+**这些都是修正方向（旧数字系统性低估），不是回归。** 要复现 2026-09-02 之前的历史数字，
+显式加 `--price-mode raw`。
+
+---
+
 ## §6 一句话结论
 
 **视频给的最值钱的东西不是结论，是那把"全收益口径"的尺子。拿它量我们自己，先量出 ±2.5%/年 的基准偏差（§5），再量出策略 NAV 漏计分红（§8），再量出最狠的一条——raw 口径回测从不处理送转股，单次凭空蒸发 17%–45% 持仓市值（§10）。按尺子修到杠杆点上（§11→§12）才发现：红利/价值策略的真实选股 alpha 一直被低估 2.0–2.8%/年——不是策略变好了，是账算对了。而量两次还不够：以为撞见第三例非确定性，跑两次是逐字节一致（§12.9 证伪）；以为告警在岗，其实它读错了键名、从未真正响过（§12.10）。这把尺子量出的最后一件事是——最该被审计的不是收益，是审计本身。**

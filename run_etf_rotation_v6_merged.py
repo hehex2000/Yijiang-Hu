@@ -185,7 +185,7 @@ def get_etf_open(ts_code, trade_date):
 #   hfq: 逐持仓 buy_factor 归一化——估值/卖出 × f(今)/f(买入)，含分红；
 #        买入价与整手判定恒为 raw；信号侧（动量/RSRS/溢价）恒为 raw。
 #   数据源：etf_adj_factor 表（29/29 全覆盖，2005→2026）。
-PRICE_MODE = "raw"
+PRICE_MODE = "hfq"     # 2026-09-02 起默认总回报口径；命令行 --price-mode 可覆盖
 _ADJ_CACHE = {}
 
 
@@ -1359,9 +1359,10 @@ if __name__ == "__main__":
                         help="宽度口径：proxy=8大指数代理(默认,已验证) | full=全A个股(较重,需复验)")
     parser.add_argument("--min-consecutive", type=int, default=2,
                         help="BULL 滞后确认月数(默认2=连续2月BULL才生效，降whipsaw误触)")
-    parser.add_argument("--price-mode", default="raw", choices=["raw", "hfq"],
-                        help="NAV 计价口径: raw=原始价(除息日下跌,漏分红) | "
-                             "hfq=后复权(逐持仓 buy_factor 归一化,含分红). 默认 raw，历史结论零漂移")
+    parser.add_argument("--price-mode", default="hfq", choices=["raw", "hfq"],
+                        help="NAV 计价口径: hfq=后复权(默认,逐持仓 buy_factor 归一化,含分红且免疫份额合并) | "
+                             "raw=原始价(旧口径,除息日下跌漏分红;ETF 份额合并会凭空虚增市值,见 §12.15). "
+                             "raw 仅供复现历史结论")
     args = parser.parse_args()
 
     # 模块级块内赋值即绑定全局（此处【不能】加 global——会报 SyntaxError）

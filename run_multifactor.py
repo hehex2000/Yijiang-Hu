@@ -24,6 +24,7 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bench_index as bi   # 统一基准真相源：口径自动跟随 NAV（raw→价格指数 / hfq→全收益）
 from run_monthly_rebalance import (
     get_conn, calc_fee, calc_win_rate, get_trade_dates,
     get_monthly_5th_trading_days,
@@ -313,7 +314,7 @@ def run_backtest(start_date="20120401", end_date="20260715", top_n=TOP_N,
     name_cache = {}
     limit_up_skip = 0
     limit_down_skip = 0
-    _ep._DAY_PX.clear()
+    _ep.reset_price_cache()   # 回测开始：连 _ADJ_REF/_ADJ_LAST 一并重置（归一化基准必须重算）
 
     def _name(code):
         if code not in name_cache:
@@ -404,6 +405,9 @@ def run_backtest(start_date="20120401", end_date="20260715", top_n=TOP_N,
         daily_vals.append({"date": td, "value": total})
 
         # 每日清掉价格缓存，避免全区间交易日堆积撑爆内存（沙箱/长区间回测必需）
+        # ⚠️ 这里**只能**清 _DAY_PX，绝不能调 reset_price_cache()：
+        #    _ADJ_LAST（跨日 ffill 状态）与 _ADJ_REF（hfq 归一化基准）必须跨交易日存活，
+        #    每天重置会让 hfq 退化为 raw、并在整表缺行日制造假跳空。
         _ep._DAY_PX.clear()
 
     # ── 末日平仓 ──
@@ -470,16 +474,18 @@ def _report(daily_vals, trades, trade_dates, start_date, end_date, top_n=TOP_N,
     win_rate, win_cnt, tot_cnt = calc_win_rate(trades)
 
     bench = {}
+    bench_meta = {}      # idx -> meta（逐个保留：不同基准的全收益覆盖度不同）
     conn = get_conn()
     for idx in BENCHMARKS:
-        b = pd.read_sql_query(
-            "SELECT close FROM index_daily WHERE ts_code=? AND trade_date>=? "
-            "ORDER BY trade_date ASC LIMIT 1", conn, params=(idx, trade_dates[0]))
-        e = pd.read_sql_query(
-            "SELECT close FROM index_daily WHERE ts_code=? AND trade_date<=? "
-            "ORDER BY trade_date DESC LIMIT 1", conn, params=(idx, trade_dates[-1]))
-        if len(b) > 0 and len(e) > 0:
-            bench[idx] = (float(e.iloc[0]["close"]) / float(b.iloc[0]["close"]) - 1) * 100
+        # 经统一真相源 bench_index：基准口径自动跟随 NAV 口径
+        #   raw NAV → 价格指数；hfq NAV → 官方全收益（缺失则回退自建/价格）
+        # 两端必须同含或同不含分红，否则超额系统性失真（中证全指/沪深300 约 2~3%/年）。
+        r, meta = bi.benchmark_return_between(idx, trade_dates[0], trade_dates[-1],
+                                              conn=conn,
+                                              nav_price_mode=_ep.PRICE_MODE)
+        if r is not None:
+            bench[idx] = r
+            bench_meta[idx] = meta
     conn.close()
 
     print(f"\n{'=' * 72}")
@@ -498,8 +504,17 @@ def _report(daily_vals, trades, trade_dates, start_date, end_date, top_n=TOP_N,
     print(f"  成交价：{ex} | 涨跌停约束：{'开' if limit_on else '关'} | 滑点：{slippage*100:.2f}%")
     if limit_on:
         print(f"  涨跌停跳过：涨停未买 {limit_up_skip} 次 | 跌停未卖 {limit_down_skip} 次")
+    print(f"  NAV 口径：{_ep.PRICE_MODE}"
+          f"{'（含分红再投）' if _ep.PRICE_MODE == 'hfq' else '（不含分红）'}")
     for idx, r in bench.items():
-        print(f"  {INDEX_DISPLAY_NAME.get(idx, idx)}：{r:+.2f}%  超额：{total_return - r:+.2f}%")
+        _m = bench_meta.get(idx)
+        _lbl = bi.benchmark_meta_label(_m) if _m else ""
+        print(f"  {INDEX_DISPLAY_NAME.get(idx, idx)}：{r:+.2f}%  超额：{total_return - r:+.2f}%"
+              f"   {_lbl}")
+        # 逐个基准检查：中证全指(000985.SH) 无官方全收益，会回退价格指数 → hfq 下超额被高估
+        _w = bi.check_consistency(_ep.PRICE_MODE, _m)
+        if _w:
+            print(f"    ⚠️ {_w}")
 
     # ── 现实折扣三件套（扣通胀 / 定投拖累 / 中断模拟）──
     disc = compute_reality_discounts(
@@ -531,7 +546,9 @@ def _report(daily_vals, trades, trade_dates, start_date, end_date, top_n=TOP_N,
     if not fac_tag:
         fac_tag = "none"
     reb_tag = "m" if rebalance == "monthly" else "q"
-    tag = f"n{top_n}{ex_tag}_{fac_tag}_{reb_tag}"
+    # 口径后缀：hfq 与 raw 必须落不同文件，否则后跑的会静默覆盖先跑的 → A/B 丢证据
+    pm_tag = "_hfq" if _ep.PRICE_MODE == "hfq" else ""   # 口径在 _ep 上，本模块无同名变量
+    tag = f"n{top_n}{ex_tag}_{fac_tag}_{reb_tag}{pm_tag}"
     csv_path = (f"data/results/multifactor/"
                 f"backtest_{tag}_c{int(_CAPITAL)}_{start_date}_{end_date}.csv")
     pd.DataFrame(daily_vals).to_csv(csv_path, index=False)
@@ -579,7 +596,12 @@ if __name__ == "__main__":
                    help="中断模拟持续月数（默认0=关闭）")
     p.add_argument("--interrupt-pct", type=float, default=0.0,
                    help="中断模拟撤出比例(0~1，如 0.5=撤一半)，默认0")
+    p.add_argument("--price-mode", choices=["raw", "hfq"], default="hfq",
+                   help="NAV 计价口径: hfq=后复权(默认,总回报,含分红+免疫送转,自动配全收益基准) / "
+                        "raw=不复权(旧口径,漏分红且不处理送转,仅供复现历史结论)")
     args = p.parse_args()
+
+    _ep.PRICE_MODE = args.price_mode   # 价格全走 _ep._px/_exec_price → 一处开关覆盖本脚本
 
     _CAPITAL = args.capital
     top_n = args.top_n

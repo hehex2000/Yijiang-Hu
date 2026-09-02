@@ -35,6 +35,20 @@ from run_monthly_rebalance import (get_conn, calc_fee, get_trade_dates,
 SIG = '000300.SH'          # MACD 信号基准
 POOL_INDEX = '000906.SH'   # 股票池（中证800 时点成分）
 CLOSES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_closes_cache.pkl')
+CLOSES_CACHE_HFQ = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '_closes_cache_hfq.pkl')
+CLOSES_MAX_DATE = 20251231   # load_closes 的查询上限；超出则价格为 NaN（main 中有硬校验）
+
+# ════════════════════════════════════════════════════════════════
+#  NAV 计价口径（2026-09-01 新增；2026-09-02 起默认 hfq，raw 变 opt-in）
+# ════════════════════════════════════════════════════════════════
+# "raw" = 不复权（旧行为）：NAV 不含现金分红，且**不处理送转股**
+#         → shares 从不随送转增加，除权日市值凭空蒸发 (1 - 1/送转比例)，单次 17%~45%。
+# "hfq" = 后复权（含分红再投 + 免疫送转）：NAV 是**总回报**口径，须配全收益基准。
+# ⚠️ 本模块的 closes 矩阵同时供给【选股信号】(波动率/MACD) 与【NAV 估值+成交】。
+#    切换口径时**信号侧必须锁定 raw**、只切 NAV 侧，否则双跑差异无法归因
+#    （分不清是口径修正还是选股改变）。见 main() 中的 raw_closes_full / closes_full。
+PRICE_MODE = "hfq"     # 2026-09-02 起默认总回报口径；命令行 --price-mode 可覆盖
 
 
 # ───────────────────────── 波动率预计算 ─────────────────────────
@@ -118,31 +132,67 @@ def select_div_low_vol(prev_date, top_n, vol_lookup, verbose=False):
 
 
 # ───────────────────────── 数据 ─────────────────────────
-def load_closes():
-    """zz800 全部历史成分日收盘（不复权），整段缓存后按需切片。"""
-    if os.path.exists(CLOSES_CACHE):
-        codes, df = pd.read_pickle(CLOSES_CACHE)
+def load_closes(hfq=False):
+    """zz800 全部历史成分日收盘，整段缓存后按需切片。
+
+    hfq=False（默认）：不复权（旧行为，历史可复现）。
+    hfq=True        ：后复权 = close × adj_factor / 该股首个已知因子（归一化）。
+
+    ⚠️ 调用方必须区分用途分别取：
+       · 选股信号（波动率 build_vol_lookup / 逐只 MACD 金叉）→ **永远用 hfq=False**，
+         锁定 raw 以隔离变量，让 raw/hfq 双跑的差异纯粹来自 NAV 口径、可归因。
+       · NAV 估值与成交 → 按 PRICE_MODE 切换。
+       两处共用同一矩阵会导致"改口径"与"改选股"两个变量耦合，双跑结论不可解释。
+
+    hfq 口径两个必须守住的坑：
+      ① adj_factor 是阶跃函数且 2020-2026 有 132 个**整交易日全市场同缺** → 缺行必须按股
+         ffill+bfill，绝不能 fillna(1.0)（会让缺行日掉回不复权、次日跳回复权，假跳空）。
+      ② 必须除以该股首个已知因子做**归一化**，否则绝对价位被累计因子放大数十倍
+         （000651.SZ raw 67.9 → hfq 10589），按整股下单 int(cash//px) 会买入 0 股 → 伪现金拖累。
+    """
+    cache = CLOSES_CACHE_HFQ if hfq else CLOSES_CACHE
+    if os.path.exists(cache):
+        codes, df = pd.read_pickle(cache)
         return codes, df
     conn = get_conn()
     codes = [r[0] for r in conn.execute(
         "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code='000906.SH'")]
-    print(f"[load] zz800 历史成分 {len(codes)} 只，bulk 日线...", flush=True)
+    print(f"[load] zz800 历史成分 {len(codes)} 只，bulk 日线"
+          f"{'(后复权)' if hfq else '(不复权)'}...", flush=True)
     frames = []
     for i in range(0, len(codes), 400):
         b = codes[i:i + 400]
         ph = ",".join("?" * len(b))
-        d = pd.read_sql_query(
-            f"SELECT ts_code,trade_date,close FROM daily WHERE ts_code IN ({ph}) "
-            f"AND trade_date>=? AND trade_date<=? ORDER BY ts_code,trade_date",
-            conn, params=b + [20100101, 20251231])
+        if hfq:
+            d = pd.read_sql_query(
+                f"SELECT t.ts_code, t.trade_date, t.close, a.adj_factor "
+                f"FROM daily t "
+                f"LEFT JOIN adj_factor a ON t.ts_code=a.ts_code AND t.trade_date=a.trade_date "
+                f"WHERE t.ts_code IN ({ph}) "
+                f"AND t.trade_date>=? AND t.trade_date<=? ORDER BY t.ts_code,t.trade_date",
+                conn, params=b + [20100101, 20251231])
+        else:
+            d = pd.read_sql_query(
+                f"SELECT ts_code,trade_date,close FROM daily WHERE ts_code IN ({ph}) "
+                f"AND trade_date>=? AND trade_date<=? ORDER BY ts_code,trade_date",
+                conn, params=b + [20100101, 20251231])
         if len(d):
             frames.append(d)
     conn.close()
     alld = pd.concat(frames, ignore_index=True)
     alld['trade_date'] = alld['trade_date'].astype(int)
+    if hfq:
+        alld = alld.sort_values(["ts_code", "trade_date"])
+        # ① ffill 补中间缺行（阶跃函数，数学精确）；bfill 补上市初期未覆盖段；
+        #    整列全缺才兜底 1.0（此时整股用 raw，无跳变风险）
+        alld["adj_factor"] = (alld.groupby("ts_code")["adj_factor"]
+                                  .ffill().bfill().fillna(1.0))
+        # ② 归一化：除以该股首个已知因子，使首日 hfq 严格 == raw
+        ref = alld.groupby("ts_code")["adj_factor"].transform("first")
+        alld["close"] = alld["close"] * alld["adj_factor"] / ref
     df = alld.pivot(index='trade_date', columns='ts_code', values='close').sort_index()
-    pd.to_pickle((codes, df), CLOSES_CACHE)
-    print(f"[load] 收盘矩阵 {df.shape} 已缓存", flush=True)
+    pd.to_pickle((codes, df), cache)
+    print(f"[load] 收盘矩阵 {df.shape} 已缓存 -> {os.path.basename(cache)}", flush=True)
     return codes, df
 
 
@@ -362,7 +412,16 @@ def main():
     ap.add_argument('--all-modes', action='store_true',
                     help='跑全部三档(日频锁篮/月度锁篮/月度重选)做干净A/B对比')
     ap.add_argument('--out', default='data/results/daily20_divlow')
+    ap.add_argument('--price-mode', choices=['raw', 'hfq'], default='hfq',
+                    help='NAV 计价口径: hfq=后复权(默认,总回报,含分红再投+免疫送转,自动配全收益基准) / '
+                         'raw=不复权(旧口径,漏分红且不处理送转,仅供复现历史结论;须配价格指数基准)。'
+                         '仅影响 NAV 侧，选股信号(波动率/MACD)恒定用 raw 以隔离变量')
     args = ap.parse_args()
+
+    global PRICE_MODE          # main() 是函数，此处必须 global
+    PRICE_MODE = args.price_mode
+    if PRICE_MODE == 'hfq' and not args.out.endswith('_hfq'):
+        args.out = args.out + '_hfq'   # 避免 hfq 结果静默覆盖 raw 留证
 
     trade_dates = get_trade_dates(args.start, args.end)
     dates_i = [int(d) for d in trade_dates]
@@ -377,10 +436,27 @@ def main():
             month_starts.add(d)
             prev_ym = ym
 
-    _, closes_full = load_closes()
-    vol_lookup = build_vol_lookup(closes_full)
+    # 信号侧（波动率因子 + 逐只 MACD 金叉）**永远锁 raw**：隔离变量，
+    # 让 raw/hfq 双跑的差异纯粹来自 NAV 口径，否则无法归因。
+    _, raw_closes_full = load_closes(hfq=False)
+    vol_lookup = build_vol_lookup(raw_closes_full)
+    # NAV 侧按 PRICE_MODE 切换
+    if PRICE_MODE == "hfq":
+        _, closes_full = load_closes(hfq=True)
+    else:
+        closes_full = raw_closes_full
+    if int(args.end) > CLOSES_MAX_DATE:
+        print(f"\n[错误] 回测终点 {args.end} 超出收盘矩阵缓存上限 {CLOSES_MAX_DATE}。"
+              f"\n       超区间价格全为 NaN → 持仓估值静默归零（曾跑出 -92.90% 的假结果）。"
+              f"\n       如需更长区间，先扩大 load_closes() 的查询范围并删除 "
+              f"{os.path.basename(CLOSES_CACHE)} / {os.path.basename(CLOSES_CACHE_HFQ)} 重建缓存。")
+        sys.exit(2)
     closes = closes_full.loc[(closes_full.index >= int(args.start)) & (closes_full.index <= int(args.end))]
     closes_ff = closes.ffill()
+    # 二次防御：末日若整行无有效价，说明区间与数据错位，宁可报错也不要输出假净值
+    if closes.shape[0] and closes.iloc[-1].notna().sum() == 0:
+        print(f"\n[错误] 回测末日 {closes.index[-1]} 无任何有效收盘价，区间与数据错位。")
+        sys.exit(2)
 
     # 沪深300 MACD 信号（对齐交易日）
     hs = load_index_close(SIG, args.start, args.end)
@@ -392,9 +468,21 @@ def main():
 
     sel_fn = lambda pd_, tn, vl: select_div_low_vol(pd_, tn, vl, verbose=False)
 
-    # 基准指数
+    # 基准指数（口径自动跟随 NAV：raw→价格指数 / hfq→全收益）
+    # 两端必须同含或同不含分红，否则超额系统性失真（中证800 约 2.2%/年、沪深300 约 3.0%/年）。
     bench = {}
+    _bmeta = None
     for code, nm in [('000906.SH', '中证800'), ('000300.SH', '沪深300')]:
+        if PRICE_MODE == 'hfq':
+            import bench_index as bi
+            df_b, meta = bi.load_benchmark(code, args.start, args.end,
+                                           nav_price_mode='hfq')
+            if df_b is not None and len(df_b) >= 2:
+                bench[nm] = pd.Series(
+                    (df_b['close'] / float(df_b['close'].iloc[0])).values,
+                    index=df_b['trade_date'])
+                _bmeta = meta
+                continue
         b = M.load_base_index(code, args.start, args.end)
         if b is not None:
             bench[nm] = b

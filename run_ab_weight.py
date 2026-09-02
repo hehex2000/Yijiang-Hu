@@ -26,13 +26,34 @@ from run_monthly_rebalance import get_trade_dates, get_conn
 START, END = '20150101', '20251231'
 TOPN, CAP = 5, 1_000_000
 
+# ── NAV 计价口径（2026-09-01 新增；2026-09-02 起默认 hfq，raw 变 opt-in）──
+# raw = 不复权（不含分红、不处理送转）；hfq = 后复权（总回报，须配全收益基准）
+# 用法：python run_ab_weight.py                    → hfq（默认，推荐）
+#       python run_ab_weight.py --price-mode raw   → 旧口径，仅用于复现历史结论
+PRICE_MODE = 'hfq'
+if '--price-mode' in sys.argv:
+    _i = sys.argv.index('--price-mode')
+    if _i + 1 < len(sys.argv):
+        PRICE_MODE = sys.argv[_i + 1]
+if PRICE_MODE not in ('raw', 'hfq'):
+    print(f"[错误] --price-mode 只能是 raw/hfq，收到 {PRICE_MODE}")
+    sys.exit(1)
+_PM_TAG = '_hfq' if PRICE_MODE == 'hfq' else ''
+
 # ── 数据：load_closes 返回全历史(2010-2025) ──
-_, full_cf = D.load_closes()
+# 信号侧（波动率 + 逐只 MACD 金叉）**恒定锁 raw**：隔离变量，
+# 让 raw/hfq 双跑的差异纯粹来自 NAV 口径，否则无法归因。
+_, raw_full_cf = D.load_closes(hfq=False)
+# NAV 侧按 PRICE_MODE 切换
+if PRICE_MODE == 'hfq':
+    _, full_cf = D.load_closes(hfq=True)
+else:
+    full_cf = raw_full_cf
 closes = full_cf.loc[(full_cf.index >= int(START)) & (full_cf.index <= int(END))]
 closes_ff = closes.ffill()
 
 # 波动率查表（window=120，与 M1 / config 对齐）—— 必须基于全历史
-vol_lookup = D.build_vol_lookup(full_cf, window=120)
+vol_lookup = D.build_vol_lookup(raw_full_cf, window=120)
 _vol_dict = {c: vol_lookup[c].dropna().to_dict() for c in vol_lookup.columns}
 
 def _fast_calvol(code, actual_date, window=None):
@@ -46,8 +67,8 @@ def _fast_calvol(code, actual_date, window=None):
 
 def _fast_macd_state(ts_code, trade_date, is_index_signal=False, regime_code=None,
                      regime_is_index=False, mode="golden"):
-    """基于【全历史】closes 计算逐只 MACD 金叉状态。"""
-    s = full_cf.get(str(ts_code))
+    """基于【全历史】closes 计算逐只 MACD 金叉状态（信号侧，恒定 raw）。"""
+    s = raw_full_cf.get(str(ts_code))
     if s is None:
         return "death"
     c = s[s.index <= int(trade_date)].dropna()
@@ -138,6 +159,9 @@ def run_one(sel_fn, tag, weight_mode='equal'):
 
 print("=" * 100, flush=True)
 print(f"A/B 加权归因 {START}~{END} | N={TOPN} | 月度首日调仓 | 无择时 | 本金{CAP:,} | equal vs div(dv_ttm)", flush=True)
+print(f"【NAV 计价口径】{PRICE_MODE}"
+      + ("（后复权·总回报，须与全收益基准比）" if PRICE_MODE == 'hfq' else "（不复权·不含分红，须与价格指数比）"),
+      flush=True)
 print("=" * 100, flush=True)
 
 res = {}
@@ -148,9 +172,29 @@ res['OLD_H_div']= run_one(old_hs_nofilter_div,  "OLD-H(hs300,无MACD)", 'div')
 res['OLD_HF_eq']= run_one(old_hs_filter_div,    "OLD-H-F(hs300,含MACD)")
 res['OLD_HF_div']=run_one(old_hs_filter_div,    "OLD-H-F(hs300,含MACD)", 'div')
 
-# 基准
-b800 = M.load_base_index('000906.SH', START, END)
-b300 = M.load_base_index('000300.SH', START, END)
+# 基准（口径必须跟随 NAV：raw→价格指数 / hfq→全收益，两端同含或同不含分红）
+# 否则 hfq NAV 对比价格基准会把"策略多吃到的股息"误算成选股 alpha。
+import bench_index as bi
+b800, b300 = None, None
+_bmeta = None
+for _code, _nm in [('000906.SH', '800'), ('000300.SH', '300')]:
+    if PRICE_MODE == 'hfq':
+        _df, _meta = bi.load_benchmark(_code, START, END, nav_price_mode='hfq')
+        if _df is not None and len(_df) >= 2:
+            _s = pd.Series((_df['close'] / float(_df['close'].iloc[0])).values,
+                           index=_df['trade_date'])
+            if _nm == '800':
+                b800, _bmeta = _s, _meta
+            else:
+                b300 = _s
+            continue
+    _s = M.load_base_index(_code, START, END)
+    if _nm == '800':
+        b800 = _s
+    else:
+        b300 = _s
+if _bmeta:
+    print(f"  基准口径：{bi.benchmark_meta_label(_bmeta)}（NAV 口径：{PRICE_MODE}）", flush=True)
 rb8, ab8, md8, _ = M.metrics(b800)
 rb3, ab3, md3, _ = M.metrics(b300)
 print(f"基准中证800: 总收={rb8*100:7.2f}% 年化={ab8*100:6.2f}% MDD={md8*100:7.2f}%", flush=True)
@@ -162,7 +206,7 @@ out = pd.DataFrame({'trade_date': trade_dates,
                     'nav_old_hs_f_eq': res['OLD_HF_eq'], 'nav_old_hs_f_div': res['OLD_HF_div'],
                     'nav_zz800': b800.values, 'nav_hs300': b300.values})
 os.makedirs('data/results/daily20_divlow', exist_ok=True)
-out.to_csv('data/results/daily20_divlow/ab_weight_20150101_20251231.csv',
+out.to_csv(f'data/results/daily20_divlow/ab_weight{_PM_TAG}_20150101_20251231.csv',
            index=False, encoding='utf-8-sig')
-print("\nNAV → data/results/daily20_divlow/ab_weight_20150101_20251231.csv", flush=True)
+print(f"\nNAV → data/results/daily20_divlow/ab_weight{_PM_TAG}_20150101_20251231.csv", flush=True)
 print("DONE", flush=True)

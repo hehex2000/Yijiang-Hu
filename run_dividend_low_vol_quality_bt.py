@@ -356,6 +356,17 @@ def _patched_macd(self, ts_code, trade_date, is_index=False):
 # (本会话曾出现 GLOBAL 被改成 20140301/20260727 导致窗口错乱、基准算崩)。
 START = "20200101"
 END = "20260723"
+
+# ── 计价口径开关（2026-09-01 新增）────────────────────────────────────────
+# raw = daily.close 未复权（历史行为）：除息日价格下跌被当作真实亏损，
+#       且分红从不计入 NAV → 对红利策略系统性低估收益，不可与全收益基准比较。
+# hfq = close * adj_factor 后复权（含分红再投）：与 index_tr_official 全收益基准可比。
+# adj_factor 取「当日」值，与平台 run_monthly_rebalance 同口径（无前视）。
+# ✅ 2026-09-02 起默认 hfq（raw 变 opt-in）：hfq 才是与全收益基准可比的真实总回报口径。
+#    本策略 raw→hfq 年化差 +3.67pp（实测）；用 raw 配全收益基准会误判成"跑输"（见报告 §8/§12.17）。
+#    要复现 2026-09-02 之前的历史数字请用 --price-mode raw。
+PRICE_MODE = "hfq"
+EXEC_PMAP = {}          # hfq 模式下的成交价表 {ts_code: {trade_date: open*adj}}，与估值同价格空间
 STOCK_POOL = config.GLOBAL.get("stock_pool", "hs300")
 TOP_N = config.GLOBAL.get("top_n", 5)
 INIT_CAPITAL = float(config.BACKTEST.get("monthly_rebalance_capital", 100000))
@@ -446,20 +457,75 @@ def select_targets(mode: str):
 
 
 def bulk_close_prices(codes, start, end):
-    """批量加载收盘价 {ts_code: {trade_date: close}}，含前向填充用最近值。"""
+    """批量加载收盘价 {ts_code: {trade_date: close}}，含前向填充用最近值。
+
+    PRICE_MODE='hfq' 时返回后复权价 = close * adj_factor（含分红再投），
+    与 index_tr_official 全收益基准可比；adj_factor 取当日值，无前视。
+    PRICE_MODE='raw'（默认）返回未复权收盘价，保持历史行为以便复现旧结果。
+    """
     conn = get_conn()
     ph = ",".join("?" for _ in codes)
-    df = pd.read_sql_query(
-        f"SELECT ts_code, trade_date, close FROM daily "
-        f"WHERE ts_code IN ({ph}) AND trade_date BETWEEN ? AND ? "
-        f"ORDER BY trade_date",
-        conn, params=(*codes, start, end))
+    if PRICE_MODE == "hfq":
+        sql = (f"SELECT d.ts_code, d.trade_date, d.close AS px, a.adj_factor AS adj "
+               f"FROM daily d "
+               f"LEFT JOIN adj_factor a "
+               f"       ON a.ts_code = d.ts_code AND a.trade_date = d.trade_date "
+               f"WHERE d.ts_code IN ({ph}) AND d.trade_date BETWEEN ? AND ? "
+               f"ORDER BY d.trade_date")
+    else:
+        sql = (f"SELECT ts_code, trade_date, close AS px FROM daily "
+               f"WHERE ts_code IN ({ph}) AND trade_date BETWEEN ? AND ? "
+               f"ORDER BY trade_date")
+    df = pd.read_sql_query(sql, conn, params=(*codes, start, end))
     conn.close()
     out = {}
     for c in codes:
         out[c] = {}
+    if PRICE_MODE != "hfq" or df.empty:
+        for _, r in df.iterrows():
+            out[str(r["ts_code"])][str(r["trade_date"])] = float(r["px"])
+        return out
+    df = df.sort_values(["ts_code", "trade_date"])
+    df["adj"] = df.groupby("ts_code")["adj"].ffill().fillna(1.0)
+    ref = {c: (float(g["adj"].iloc[0]) or 1.0) for c, g in df.groupby("ts_code")}
     for _, r in df.iterrows():
-        out[str(r["ts_code"])][str(r["trade_date"])] = float(r["close"])
+        c = str(r["ts_code"])
+        out[c][str(r["trade_date"])] = float(r["px"]) * float(r["adj"]) / ref[c]
+    return out
+
+
+def bulk_open_prices(codes, start, end):
+    """批量加载后复权开盘价 {ts_code: {trade_date: open*adj/adj_ref}}，用于 hfq 成交价。
+
+    必须与 bulk_close_prices(hfq) 处在同一价格空间，否则会出现
+    「按 raw 价买入、按 hfq 价估值」的虚增（实测可放大 30 倍）。
+    """
+    conn = get_conn()
+    ph = ",".join("?" for _ in codes)
+    sql = (f"SELECT d.ts_code, d.trade_date, d.open AS px, a.adj_factor AS adj "
+           f"FROM daily d "
+           f"LEFT JOIN adj_factor a "
+           f"       ON a.ts_code = d.ts_code AND a.trade_date = d.trade_date "
+           f"WHERE d.ts_code IN ({ph}) AND d.trade_date BETWEEN ? AND ? "
+           f"ORDER BY d.trade_date")
+    df = pd.read_sql_query(sql, conn, params=(*codes, start, end))
+    conn.close()
+    out = {c: {} for c in codes}
+    if df.empty:
+        return out
+    # adj_factor 表存在「整交易日缺行」（2020-2026 共 132 天，全市场同缺），
+    # 但 adj_factor 是阶跃函数（仅除权除息日变化），故前向填充在数学上是精确的，不丢信息。
+    # 切忌 fillna(1.0)——那会让缺失日价格掉回 raw、次日跳回 hfq，制造巨额假跳空。
+    df = df.sort_values(["ts_code", "trade_date"])
+    df["adj"] = df.groupby("ts_code")["adj"].ffill().fillna(1.0)
+    # 归一化基准：各股在窗口内首个交易日的因子。
+    # 目的——hfq 绝对价位会被累计因子放大到几十~上百倍（如格力 raw 67.9 → hfq 10589），
+    # 而回测按整股下单 int(per // px)，放大会导致买不进整股、资金全趴现金的伪现金拖累。
+    # 归一化后价格量级≈raw，同时保留分红带来的相对增长。
+    ref = {c: (float(g["adj"].iloc[0]) or 1.0) for c, g in df.groupby("ts_code")}
+    for _, r in df.iterrows():
+        c = str(r["ts_code"])
+        out[c][str(r["trade_date"])] = float(r["px"]) * float(r["adj"]) / ref[c]
     return out
 
 
@@ -493,6 +559,8 @@ def run_nav(targets, price_map, all_dates, coef_fn=None):
         if rb_target is not None:
             # 计算组合市值（用当日可执行开盘价；2026-07-06后为收盘价）
             def exec_px(code):
+                if PRICE_MODE == "hfq":
+                    return ffill_price(EXEC_PMAP, code, d, all_dates, idx)
                 return get_open_price(code, d)
             # 市值
             mv = cash
@@ -504,7 +572,9 @@ def run_nav(targets, price_map, all_dates, coef_fn=None):
             k = coef_fn(_sel_date_of(all_dates, idx)) if coef_fn else 1.0
             n_tgt = max(len(rb_target), 1)
             per = mv * k / n_tgt
-            all_codes = set(positions.keys()) | set(rb_target)
+            # 必须排序：买入受 `cost <= cash` 现金约束，集合迭代顺序（受 PYTHONHASHSEED
+            # 随机化）会改变成交顺序进而改变组合 —— 这是回测非确定性的根因（同 livermore v2）。
+            all_codes = sorted(set(positions.keys()) | set(rb_target))
             for code in all_codes:
                 px = exec_px(code)
                 if px is None:
@@ -570,18 +640,32 @@ def yearly_returns(dates, vals):
     return out
 
 
+_LAST_BENCH_META = {}   # index_code -> bench_index meta（供报告打印口径标签）
+
+
 def benchmark_nav(all_dates, index_code="000985.SH"):
     """指数买入持有 NAV。返回 (nav_list, first_valid_idx)。
     - 以该指数第一个有数据的收盘点位为基准归一（避免数据缺口把点位当倍数）；
     - 数据开始前 NAV 平值(=INIT_CAPITAL)，视为无法投资；
-    - 数据中间缺口前向填充最近有效点位。"""
+    - 数据中间缺口前向填充最近有效点位。
+
+    ⚠️ 2026-09-01 改：**基准口径必须跟随 PRICE_MODE**（两端同含或同不含分红）。
+      旧实现直连 `index_daily`（价格指数），hfq 那跑会出现
+      「NAV 含分红 vs 基准不含分红」→ 超额被**系统性高估约 2.5%/年**。
+      现改走 `bench_index` 统一真相源：raw→价格指数，hfq→全收益（官方/自建）。
+    """
+    import bench_index as bi
     conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT trade_date, close FROM index_daily WHERE ts_code=? "
-        "AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
-        conn, params=(index_code, all_dates[0], all_dates[-1]))
+    df, _bmeta = bi.load_benchmark(index_code, all_dates[0], all_dates[-1],
+                                   conn=conn, nav_price_mode=PRICE_MODE)
     conn.close()
-    bmap = dict(zip(df["trade_date"].astype(str), df["close"].astype(float)))
+    # 口径错配告警（如中证全指暂无全收益而回退价格指数时，会在此显式提示）
+    _warn = bi.check_consistency(PRICE_MODE, _bmeta)
+    if _warn:
+        print(f"  ⚠️ 基准 {index_code}: {_warn}")
+    _LAST_BENCH_META[index_code] = _bmeta      # 供报告打印口径标签
+    bmap = ({} if df is None or df.empty else
+            dict(zip(df["trade_date"].astype(str), df["close"].astype(float))))
     levels = [bmap.get(d) for d in all_dates]
     first_valid = next((i for i, v in enumerate(levels) if v is not None), None)
     if first_valid is None:
@@ -622,6 +706,8 @@ def run_legacy_comparison():
     t_old, log_old = select_targets("old")
     codes_old = sorted({c for _, cs in t_old for c in cs})
     pmap_old = bulk_close_prices(codes_old, START, END)
+    if PRICE_MODE == "hfq":
+        EXEC_PMAP.clear(); EXEC_PMAP.update(bulk_open_prices(codes_old, START, END))
     nav_old, tr_old = run_nav(t_old, pmap_old, all_dates)
 
     # ── NEW（六维质量门禁·硬）──
@@ -629,6 +715,8 @@ def run_legacy_comparison():
     t_new, log_new = select_targets("new")
     codes_new = sorted({c for _, cs in t_new for c in cs})
     pmap_new = bulk_close_prices(codes_new, START, END)
+    if PRICE_MODE == "hfq":
+        EXEC_PMAP.clear(); EXEC_PMAP.update(bulk_open_prices(codes_new, START, END))
     nav_new, tr_new = run_nav(t_new, pmap_new, all_dates)
 
     # ── SOFT（六维质量·软打分）──
@@ -636,6 +724,8 @@ def run_legacy_comparison():
     t_soft, log_soft = select_targets("soft")
     codes_soft = sorted({c for _, cs in t_soft for c in cs})
     pmap_soft = bulk_close_prices(codes_soft, START, END)
+    if PRICE_MODE == "hfq":
+        EXEC_PMAP.clear(); EXEC_PMAP.update(bulk_open_prices(codes_soft, START, END))
     nav_soft, tr_soft = run_nav(t_soft, pmap_soft, all_dates)
 
     # ── 基准：全局股票池对应指数 ──
@@ -644,6 +734,12 @@ def run_legacy_comparison():
         _bidx = "000985.SH"   # 全A 用中证全指
     _bname = INDEX_DISPLAY_NAME.get(_bidx, _bidx)
     nav_bench, _ = benchmark_nav(all_dates, _bidx)
+    # 基准口径标签（透明标注：告诉读者这列数字含不含分红）
+    _bmeta = _LAST_BENCH_META.get(_bidx) or {}
+    _blabel = (_bmeta.get("note") or "?")
+    print(f"  NAV 口径：{PRICE_MODE}"
+          f"{'（含分红再投）' if PRICE_MODE == 'hfq' else '（不含分红）'}"
+          f" | 基准 {_bname} [{_blabel}]")
 
     m_old = compute_metrics(nav_old, all_dates)
     m_new = compute_metrics(nav_new, all_dates)
@@ -737,6 +833,8 @@ def run_nav_weighted(targets, weights_map, price_map, all_dates, coef_fn=None):
         rb_target = rebal_set.get(d)
         if rb_target is not None:
             def exec_px(code):
+                if PRICE_MODE == "hfq":
+                    return ffill_price(EXEC_PMAP, code, d, all_dates, idx)
                 return get_open_price(code, d)
             mv = cash
             for code, sh in positions.items():
@@ -745,7 +843,9 @@ def run_nav_weighted(targets, weights_map, price_map, all_dates, coef_fn=None):
                     mv += sh * px
             k = coef_fn(_sel_date_of(all_dates, idx)) if coef_fn else 1.0
             wmap = weights_map.get(str(d), {})
-            all_codes = set(positions.keys()) | set(rb_target)
+            # 必须排序：买入受 `cost <= cash` 现金约束，集合迭代顺序（受 PYTHONHASHSEED
+            # 随机化）会改变成交顺序进而改变组合 —— 这是回测非确定性的根因（同 livermore v2）。
+            all_codes = sorted(set(positions.keys()) | set(rb_target))
             for code in all_codes:
                 px = exec_px(code)
                 if px is None:
@@ -915,12 +1015,27 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     all_codes = sorted({c for _, cs in targets for c in cs})
     print(f"涉及股票数: {len(all_codes)}")
     pmap = bulk_close_prices(all_codes, START, END)
+    if PRICE_MODE == "hfq":
+        EXEC_PMAP.clear()
+        EXEC_PMAP.update(bulk_open_prices(all_codes, START, END))
     all_dates = get_trade_dates(START, END)
     nav = (run_nav_weighted(targets, weights_map, pmap, all_dates, coef_fn)
            if spec["weight"] == "dividend" else run_nav(targets, pmap, all_dates, coef_fn))
 
     nav_b, _ = benchmark_nav(all_dates, bidx)          # 主基准：股票池对应指数
     nav_922, f922 = benchmark_nav(all_dates, "000922.SH")  # 同赛道参考
+    # 口径透明标注：告诉读者这两列数字含不含分红（与 NAV 同口径才可比）
+    import bench_index as _bi
+    _mb = _LAST_BENCH_META.get(bidx) or {}
+    _m922 = _LAST_BENCH_META.get("000922.SH") or {}
+    print(f"  NAV 口径：{PRICE_MODE}"
+          f"{'（含分红再投）' if PRICE_MODE == 'hfq' else '（不含分红）'}"
+          f" | 基准 {INDEX_DISPLAY_NAME.get(bidx, bidx)} [{_mb.get('note', '?')}]"
+          f" | 参考 中证红利低波 [{_m922.get('note', '?')}]")
+    for _ic, _m_ in ((bidx, _mb), ("000922.SH", _m922)):
+        _w = _bi.check_consistency(PRICE_MODE, _m_)
+        if _w:
+            print(f"    ⚠️ 基准 {INDEX_DISPLAY_NAME.get(_ic, _ic)}: {_w}")
 
     m = compute_metrics(nav, all_dates)
     m_b = compute_metrics(nav_b, all_dates)
@@ -954,7 +1069,9 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
 
     # 落盘：NAV 曲线
     rows = [(d, nav_map.get(d), nav_b_map.get(d), nav_922_map.get(d)) for d in all_dates]
-    nav_out = os.path.join(RES_DIR, f"bt_quality_nav_{START}_{END}_{mode}_{pool}_{top_n}.csv")
+    # hfq 结果加 _hfq 后缀，raw 保持原文件名（compare_tr_benchmark.py 依赖该路径，勿改）
+    _pmtag = "_hfq" if PRICE_MODE == "hfq" else ""
+    nav_out = os.path.join(RES_DIR, f"bt_quality_nav_{START}_{END}_{mode}_{pool}_{top_n}{_pmtag}.csv")
     pd.DataFrame(rows, columns=["trade_date", f"nav_{mode}", f"nav_{bidx}", "nav_922"]).to_csv(
         nav_out, index=False, encoding="utf-8-sig")
     # 落盘：选股明细
@@ -1058,11 +1175,19 @@ def main():
                         help="通道顶(最贵)时的仓位系数，默认0.5（即最多减至半仓）")
     parser.add_argument("--k-max", type=float, default=1.0,
                         help="通道底(最便宜)时的仓位系数，默认1.0（满仓）")
+    # ── 计价口径（2026-09-01 新增，用于与全收益基准做同口径比较）──
+    parser.add_argument("--price-mode", default="hfq", choices=["raw", "hfq"],
+                        help="NAV 计价口径：hfq=后复权(默认,close*adj_factor,含分红再投,与全收益基准可比)；"
+                             "raw=未复权(旧口径,不含分红,仅供复现 2026-09-02 前的历史结果)")
     parser.add_argument("--live", action="store_true",
-                        help="回测结束后打印最近一期调仓的可执行买列表（k缩放权重+现金%），供实盘部署参考")
+                        help="回测结束后打印最近一期调仓的可执行买列表（k缩放权重+现金%%），供实盘部署参考")
     parser.add_argument("--live-forward", action="store_true",
                         help="以库里最新交易日为选股日重跑 selector，打印真正『今天该买什么』的前瞻买列表（独立于历史回测）")
     args = parser.parse_args()
+    global PRICE_MODE
+    PRICE_MODE = args.price_mode
+    if PRICE_MODE == "hfq":
+        print("[计价口径] hfq = close * adj_factor（含分红再投），可与全收益基准比较")
     if args.mode in ("old", "new", "soft"):
         run_legacy_comparison()
     else:

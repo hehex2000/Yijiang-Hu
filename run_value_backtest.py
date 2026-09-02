@@ -27,7 +27,7 @@ class ValueStrategyBacktest:
     def __init__(self, initial_cash=50000, db_path="D:/tu-shareData/astock_daily.db",
                  freq="monthly", size_neutral=False, value_pct=None, top_n=5,
                  stock_pool="zz800", value_mode="pobreak", downside_filter=False,
-                 price_mode="raw"):
+                 price_mode="hfq"):
         """
         初始化回测
 
@@ -432,14 +432,14 @@ def main():
     ap.add_argument("--size-neutral", action="store_true",
                     help="市值中性化：对BM回归掉市值取残差作纯价值得分")
     ap.add_argument("--value-pct", type=float, default=None,
-                    help="BM分位筛选，如0.3=全市场BM前30%（Fama-French前20-30%口径）")
+                    help="BM分位筛选，如0.3=全市场BM前30%%（Fama-French前20-30%%口径）")
     ap.add_argument("--mode", default="pobreak", choices=["pobreak", "pure_bm"],
-                    help="pobreak=破净价值(PB<1+ROE质量) | pure_bm=放宽破净·全市场BM前N%门槛")
+                    help="pobreak=破净价值(PB<1+ROE质量) | pure_bm=放宽破净·全市场BM前N%%门槛")
     ap.add_argument("--downside-filter", action="store_true",
                     help="下跌通道风控筛：剔除仍处下跌通道(贴lows/在MA下/量未缩)的候选，降波动不增收益")
-    ap.add_argument("--price-mode", default="raw", choices=["raw", "hfq"],
-                    help="NAV 计价口径: raw=原始价(不含分红) | hfq=后复权(逐持仓 buy_factor 归一化, 含分红+送转). "
-                         "默认 raw，历史结论零漂移")
+    ap.add_argument("--price-mode", default="hfq", choices=["raw", "hfq"],
+                    help="NAV 计价口径: hfq=后复权(默认,逐持仓 buy_factor 归一化,含分红+送转,真实总回报) | "
+                         "raw=原始价(旧口径,不含分红;送转致持仓市值凭空蒸发,见审计报告 §10). raw 仅供复现历史结论")
     ap.add_argument("--portfolio-layer", default=None,
                     help="组合层分散: 权重 equity,bond,gold 逗号分隔(如 0.7,0.15,0.15), "
                          "把本策略日频NAV与国债511260+黄金518880做月度再平衡。默认None=不开启")
