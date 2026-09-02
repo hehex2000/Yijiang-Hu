@@ -27,7 +27,8 @@ class ValueStrategyBacktest:
     def __init__(self, initial_cash=50000, db_path="D:/tu-shareData/astock_daily.db",
                  freq="monthly", size_neutral=False, value_pct=None, top_n=5,
                  stock_pool="zz800", value_mode="pobreak", downside_filter=False,
-                 price_mode="hfq"):
+                 price_mode="hfq", pb_gate="off", pb_gate_lo=30.0, pb_gate_hi=70.0,
+                 pb_gate_lag=1, pb_gate_universe="all"):
         """
         初始化回测
 
@@ -42,6 +43,10 @@ class ValueStrategyBacktest:
             value_mode: 选股模式 pobreak(破净价值) / pure_bm(放宽破净·BM分位门槛)
             price_mode: NAV 计价口径 raw(原始价，不含分红) / hfq(后复权，逐持仓 buy_factor 归一化，
                         含分红+送转；买价与整手判定恒为 raw)
+            pb_gate: 破净率 overlay 开关 off=不加(默认,现有行为) / pct=滚动分位 / abs=绝对破净率
+            pb_gate_lo / pb_gate_hi: 阈值。pct 模式为分位(0-100)，abs 模式为百分比(如 10.0 = 10%%)
+            pb_gate_lag: 信号滞后交易日数（默认1=用调仓日前一交易日的破净率，避免"当日收盘价已知"质疑）
+            pb_gate_universe: 破净率口径 all=全A / nobj=剔北交所 / clean=再剔ST
         """
         self.initial_cash = initial_cash
         self.db_path = db_path
@@ -53,6 +58,15 @@ class ValueStrategyBacktest:
         self.value_mode = value_mode
         self.downside_filter = downside_filter
         self.price_mode = price_mode
+        # ---- 破净率 overlay（opt-in，默认 off = 完全保持现有行为）
+        self.pb_gate = pb_gate
+        self.pb_gate_lo = pb_gate_lo
+        self.pb_gate_hi = pb_gate_hi
+        self.pb_gate_lag = int(pb_gate_lag)
+        self.pb_gate_universe = pb_gate_universe
+        self._nb_series = None      # {trade_date: rate}，懒加载
+        self._nb_pct = None         # {trade_date: 750日滚动分位}
+        self._px_cache = {}         # (ts_code, trade_date) -> close，减少重复查询
         self.data_fetcher = DataFetcher()
 
         # 读取配置
@@ -139,19 +153,24 @@ class ValueStrategyBacktest:
         Returns:
             float: 收盘价，如果不存在返回None
         """
+        # overlay 双账模式下同一 (code, date) 会被查两遍，加缓存避免翻倍
+        key = (ts_code, trade_date)
+        if key in self._px_cache:
+            return self._px_cache[key]
+
         conn = sqlite3.connect(self.db_path)
         query = f"""
-            SELECT close 
-            FROM daily 
-            WHERE ts_code = '{ts_code}' 
+            SELECT close
+            FROM daily
+            WHERE ts_code = '{ts_code}'
               AND trade_date = '{trade_date}'
         """
         df = pd.read_sql_query(query, conn)
         conn.close()
-        
-        if len(df) > 0:
-            return df['close'].iloc[0]
-        return None
+
+        price = df['close'].iloc[0] if len(df) > 0 else None
+        self._px_cache[key] = price
+        return price
 
     def _adj_factor(self, ts_code, trade_date):
         """查某股票截至某交易日的**最近一个** adj_factor（自带 as-of 语义，天然 ffill）。
@@ -168,6 +187,122 @@ class ValueStrategyBacktest:
         if len(df) > 0 and df['adj_factor'].iloc[0]:
             return float(df['adj_factor'].iloc[0])
         return None
+
+    # ------------------------------------------------- 破净率 overlay（opt-in）
+    def _load_net_break(self):
+        """懒加载全市场破净率日序列。
+
+        优先读 `net_break_rate.py` 的缓存 CSV；没有则现场构建。
+        🔴 按项目约定，数据缺失**不静默降级**，直接 raise 让调用方补全。
+        """
+        if self._nb_series is not None:
+            return
+        import os
+        import bisect
+        cache = os.path.join("data", "results", "net_break", "market_net_break.csv")
+        if os.path.exists(cache):
+            df = pd.read_csv(cache, dtype={"trade_date": str})
+        else:
+            import net_break_rate
+            df = net_break_rate.build_series()
+        col = {"all": "rate_all", "nobj": "rate_nobj",
+               "clean": "rate_clean"}[self.pb_gate_universe]
+        df = df[["trade_date", col]].dropna().sort_values("trade_date").reset_index(drop=True)
+        df["pct"] = df[col].rolling(750, min_periods=250).apply(
+            lambda w: (w[-1] >= w[:-1]).mean() * 100, raw=True)
+        self._nb_series = dict(zip(df["trade_date"], df[col]))
+        self._nb_pct = dict(zip(df["trade_date"], df["pct"]))
+        self._nb_keys = sorted(self._nb_series.keys())
+        self._bisect = bisect
+        print(f"[破净率] 载入 {len(self._nb_series)} 个交易日，口径={col}，lag={self.pb_gate_lag}")
+
+    def _nb_value(self, trade_date):
+        """取（调仓日 − lag）的破净率及其分位，as-of 语义天然 ffill。"""
+        if self._nb_series is None:
+            self._load_net_break()
+        keys = self._nb_keys
+        i = self._bisect.bisect_right(keys, str(trade_date)) - 1 - self.pb_gate_lag
+        if i < 0:
+            return None, None
+        d = keys[i]
+        return self._nb_series[d], self._nb_pct[d]
+
+    def _gate_exposure(self, trade_date):
+        """破净率 → 目标仓位（1.0 满仓 / 0.5 半仓 / 0.0 空仓）。
+
+        方向：破净率**高** = 市场便宜 = 该满仓（与"PB 分位低→满仓"是同一逻辑的镜像）。
+        信号缺失（数据不足或窗口不够）→ **回退满仓**，绝不擅自降仓。
+        """
+        if self.pb_gate == "off":
+            return 1.0, None
+        rate, pct = self._nb_value(trade_date)
+        if rate is None:
+            return 1.0, None
+        if self.pb_gate == "abs":
+            v = rate * 100.0
+        else:
+            if pct != pct:
+                return 1.0, None
+            v = pct
+        if v >= self.pb_gate_hi:
+            return 1.0, v
+        if v <= self.pb_gate_lo:
+            return 0.0, v
+        return 0.5, v
+
+    # --- 以下三个是 overlay 双账模式的共用原子操作 ---
+    # 设计要点：选股**只做一次**，两本账买同一个篮子，唯一差别是仓位缩放。
+    # 这样 A/B 对照把"选股"这个最慢也最容易引入差异的环节完全共享，
+    # 隔离出的变量只有 exposure 本身（同 --ic-mode 那样单变量对照的思路）。
+    def _sell_all(self, positions, trade_date, cash, tag=""):
+        t = f"[{tag}] " if tag else ""
+        for pos in positions:
+            price = self.get_stock_price(pos['ts_code'], trade_date)
+            if price:
+                sell_px = price * self._hfq_ratio(pos, trade_date)
+                sell_amount = pos['shares'] * sell_px
+                cash += sell_amount
+                print(f"    ✓ {t}{pos['ts_code']} ({pos['name']}) 卖出 "
+                      f"{pos['shares']}股 @ {sell_px:.2f} = {sell_amount:,.0f}元")
+            else:
+                print(f"    ⚠️ {t}{pos['ts_code']} 无数据，无法卖出")
+        return cash
+
+    def _buy_all(self, cash, selected_stocks, trade_date, exposure, tag=""):
+        deploy = cash * exposure
+        cps = deploy / len(selected_stocks) if selected_stocks else 0.0
+        t = f"[{tag}] " if tag else ""
+        print(f"\n  买入新持仓 {t}(可部署 {deploy:,.0f} 元 / 每只 {cps:,.0f} 元):")
+        positions = []
+        if cps <= 0 or not selected_stocks:
+            return cash, positions
+        for stock in selected_stocks:
+            max_shares = int(cps / (stock['price'] * 100)) * 100
+            if max_shares > 0:
+                actual_shares = min(stock['shares'], max_shares)
+                cost = actual_shares * stock['price']
+                cash -= cost
+                positions.append({
+                    'ts_code': stock['ts_code'],
+                    'name': stock['name'],
+                    'shares': actual_shares,
+                    'cost_price': stock['price'],
+                    'cost_amount': cost,
+                    # hfq 归一化基准因子（买入日 as-of）；raw 模式下不用
+                    'buy_factor': (self._adj_factor(stock['ts_code'], trade_date)
+                                   if self.price_mode == "hfq" else 1.0),
+                })
+                print(f"    ✓ {t}{stock['ts_code']} ({stock['name']}) 买入 "
+                      f"{actual_shares}股 @ {stock['price']:.2f} = {cost:,.0f}元")
+        return cash, positions
+
+    def _mark(self, cash, positions, trade_date):
+        v = cash
+        for pos in positions:
+            price = self.get_stock_price(pos['ts_code'], trade_date)
+            if price:
+                v += pos['shares'] * price * self._hfq_ratio(pos, trade_date)
+        return v
 
     def _hfq_ratio(self, pos, trade_date):
         """hfq 估值比率 = f(今) / f(买入)。raw 模式恒为 1.0。
@@ -317,78 +452,67 @@ class ValueStrategyBacktest:
         cash = self.initial_cash
         positions = []  # [{ts_code, name, shares, cost_price, cost_amount}]
         portfolio_values = []  # 记录每日组合价值
-        
+
+        # overlay 双账：账 G 受 gate 控制，账 F 恒满仓做对照
+        dual = self.pb_gate != "off"
+        cash_f, positions_f, exp = self.initial_cash, [], 1.0
+
         # 逐日模拟
         print(f"\n开始模拟交易...")
-        
+
         for i, trade_date in enumerate(trading_days):
             # 检查是否需要调仓
             if trade_date in rebalance_days:
                 print(f"\n{'='*60}")
                 print(f"🔄 调仓日: {trade_date}")
-                
+
+                if dual:
+                    exp, sig_v = self._gate_exposure(trade_date)
+                    desc = {1.0: "满仓", 0.5: "半仓", 0.0: "空仓"}[exp]
+                    sv = "无(回退满仓)" if sig_v is None else f"{sig_v:.2f}"
+                    print(f"  🚦 破净率 overlay ({self.pb_gate}): 信号={sv} → "
+                          f"仓位 {exp*100:.0f}%（{desc}）")
+
                 # 卖出当前持仓
                 if len(positions) > 0:
                     print(f"  卖出当前持仓:")
-                    for pos in positions:
-                        price = self.get_stock_price(pos['ts_code'], trade_date)
-                        if price:
-                            sell_px = price * self._hfq_ratio(pos, trade_date)
-                            sell_amount = pos['shares'] * sell_px
-                            cash += sell_amount
-                            print(f"    ✓ {pos['ts_code']} ({pos['name']}) 卖出 {pos['shares']}股 @ {sell_px:.2f} = {sell_amount:,.0f}元")
-                        else:
-                            print(f"    ⚠️ {pos['ts_code']} 无数据，无法卖出")
-                
+                    cash = self._sell_all(positions, trade_date, cash,
+                                          tag="gate" if dual else "")
+                if dual and len(positions_f) > 0:
+                    cash_f = self._sell_all(positions_f, trade_date, cash_f, tag="对照")
+
                 # 清空持仓
                 positions = []
-                
-                # 选股
+                positions_f = []
+
+                # 选股（双账共享同一篮子）
                 selected_stocks = self.select_stocks_for_month(trade_date)
-                
+
                 # 买入新股票
                 if len(selected_stocks) > 0:
-                    cash_per_stock = cash / len(selected_stocks)
-                    print(f"\n  买入新持仓 (每只 {cash_per_stock:,.0f} 元):")
-                    
-                    for stock in selected_stocks:
-                        # 实际买入金额
-                        max_shares = int(cash_per_stock / (stock['price'] * 100)) * 100
-                        if max_shares > 0:
-                            actual_shares = min(stock['shares'], max_shares)
-                            cost = actual_shares * stock['price']
-                            cash -= cost
-                            
-                            positions.append({
-                                'ts_code': stock['ts_code'],
-                                'name': stock['name'],
-                                'shares': actual_shares,
-                                'cost_price': stock['price'],
-                                'cost_amount': cost,
-                                # hfq 归一化基准因子（买入日 as-of）；raw 模式下不用
-                                'buy_factor': (self._adj_factor(stock['ts_code'], trade_date)
-                                               if self.price_mode == "hfq" else 1.0),
-                            })
-                            
-                            print(f"    ✓ {stock['ts_code']} ({stock['name']}) 买入 {actual_shares}股 @ {stock['price']:.2f} = {cost:,.0f}元")
-            
+                    cash, positions = self._buy_all(cash, selected_stocks, trade_date,
+                                                    exp, tag="gate" if dual else "")
+                    if dual:
+                        cash_f, positions_f = self._buy_all(
+                            cash_f, selected_stocks, trade_date, 1.0, tag="对照")
+
             # 计算当日组合价值
-            portfolio_value = cash
-            for pos in positions:
-                price = self.get_stock_price(pos['ts_code'], trade_date)
-                if price:
-                    portfolio_value += pos['shares'] * price * self._hfq_ratio(pos, trade_date)
-            
-            portfolio_values.append({
+            portfolio_value = self._mark(cash, positions, trade_date)
+
+            row = {
                 'trade_date': trade_date,
                 'portfolio_value': portfolio_value,
                 'cash': cash
-            })
+            }
+            if dual:
+                row['portfolio_value_full'] = self._mark(cash_f, positions_f, trade_date)
+                row['exposure'] = exp
+            portfolio_values.append(row)
         
         # 回测结束，计算收益
         final_value = portfolio_values[-1]['portfolio_value']
         total_return = (final_value - self.initial_cash) / self.initial_cash
-        
+
         print("\n" + "=" * 80)
         print("回测结果")
         print("=" * 80)
@@ -398,6 +522,48 @@ class ValueStrategyBacktest:
         print(f"收益率: {total_return:.2%}")
         print(f"年化收益: {total_return / 2 * 100:.2f}% (2年)")
         print("=" * 80)
+
+        # overlay 双账对照（同选股、同路径，唯一变量 = 仓位）
+        if dual:
+            dfv = pd.DataFrame(portfolio_values)
+            stat = {}
+            for col, lab in [("portfolio_value", "gate(破净率择时)"),
+                             ("portfolio_value_full", "对照(恒满仓)")]:
+                s = dfv[col].astype(float)
+                yrs = len(s) / 244.0
+                tot = s.iloc[-1] / s.iloc[0] - 1
+                ann = (s.iloc[-1] / s.iloc[0]) ** (1 / yrs) - 1 if yrs > 0 else np.nan
+                mdd = (s / s.cummax() - 1).min()
+                r = s.pct_change().dropna()
+                shp = r.mean() / r.std() * np.sqrt(244) if r.std() > 0 else np.nan
+                stat[lab] = {"总收益%": round(tot * 100, 2), "年化%": round(ann * 100, 2),
+                             "最大回撤%": round(mdd * 100, 2), "夏普": round(shp, 2)}
+            cmp_df = pd.DataFrame(stat).T
+            print("\n" + "=" * 80)
+            print(f"破净率 overlay 对照（{self.pb_gate} lo={self.pb_gate_lo} "
+                  f"hi={self.pb_gate_hi} lag={self.pb_gate_lag}）")
+            print("=" * 80)
+            print(cmp_df.to_string())
+            d_ann = stat["gate(破净率择时)"]["年化%"] - stat["对照(恒满仓)"]["年化%"]
+            d_mdd = stat["gate(破净率择时)"]["最大回撤%"] - stat["对照(恒满仓)"]["最大回撤%"]
+            print(f"\n年化差(gate − 满仓) = {d_ann:+.2f}pp   回撤差 = {d_mdd:+.2f}pp")
+            print(f"平均仓位 = {dfv['exposure'].mean()*100:.1f}%   "
+                  f"空仓天数占比 = {(dfv['exposure']==0).mean()*100:.1f}%   "
+                  f"满仓天数占比 = {(dfv['exposure']==1).mean()*100:.1f}%")
+
+            # 逐年
+            dfv["year"] = dfv["trade_date"].str[:4]
+            yr = []
+            for y, s in dfv.groupby("year"):
+                a = s["portfolio_value"].iloc[-1] / s["portfolio_value"].iloc[0] - 1
+                b = s["portfolio_value_full"].iloc[-1] / s["portfolio_value_full"].iloc[0] - 1
+                yr.append({"year": y, "gate%": round(a * 100, 2),
+                           "满仓%": round(b * 100, 2), "差%": round((a - b) * 100, 2)})
+            ydf = pd.DataFrame(yr)
+            print("\n--- 逐年 ---")
+            print(ydf.to_string(index=False))
+            win = (ydf["差%"] > 0).sum()
+            print(f"\ngate 跑赢满仓年份 {win}/{len(ydf)}")
         
         # 保存结果
         result_df = pd.DataFrame(portfolio_values)
@@ -440,6 +606,17 @@ def main():
     ap.add_argument("--price-mode", default="hfq", choices=["raw", "hfq"],
                     help="NAV 计价口径: hfq=后复权(默认,逐持仓 buy_factor 归一化,含分红+送转,真实总回报) | "
                          "raw=原始价(旧口径,不含分红;送转致持仓市值凭空蒸发,见审计报告 §10). raw 仅供复现历史结论")
+    # ---- 破净率 overlay（opt-in；默认 off = 完全保持现有行为，被 import 复用也不会变）
+    ap.add_argument("--pb-gate", default="off", choices=["off", "pct", "abs"],
+                    help="全市场破净率择时 overlay: off=不加(默认) | pct=滚动分位 | abs=绝对破净率")
+    ap.add_argument("--pb-gate-lo", type=float, default=30.0,
+                    help="下阈值: pct 模式为分位(默认30) = 低于此值空仓; abs 模式为百分比(如 5.0 = 5%%)")
+    ap.add_argument("--pb-gate-hi", type=float, default=70.0,
+                    help="上阈值: pct 模式为分位(默认70) = 高于此值满仓; abs 模式为百分比(如 10.0 = 10%%)")
+    ap.add_argument("--pb-gate-lag", type=int, default=1,
+                    help="信号滞后交易日数(默认1): 用调仓日前一交易日的破净率, 避免当日收盘价已知才可得的质疑")
+    ap.add_argument("--pb-gate-universe", default="all", choices=["all", "nobj", "clean"],
+                    help="破净率口径: all=全A | nobj=剔北交所 | clean=再剔ST")
     ap.add_argument("--portfolio-layer", default=None,
                     help="组合层分散: 权重 equity,bond,gold 逗号分隔(如 0.7,0.15,0.15), "
                          "把本策略日频NAV与国债511260+黄金518880做月度再平衡。默认None=不开启")
@@ -458,6 +635,11 @@ def main():
         value_mode=args.mode,
         downside_filter=args.downside_filter,
         price_mode=args.price_mode,
+        pb_gate=args.pb_gate,
+        pb_gate_lo=args.pb_gate_lo,
+        pb_gate_hi=args.pb_gate_hi,
+        pb_gate_lag=args.pb_gate_lag,
+        pb_gate_universe=args.pb_gate_universe,
     )
 
     result = backtest.run_backtest(start_date=args.start, end_date=args.end)
