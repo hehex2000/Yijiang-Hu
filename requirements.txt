@@ -1,8 +1,24 @@
-# 数据处理
+# ============================================================
+# multi_factor_selection 依赖清单
+# ------------------------------------------------------------
+# 分两组:
+#   [核心] 回测平台主体(选股/回测/归因)必需, 缺任意一个都会 ImportError
+#   [可选] 仅个别模块用到; 不装不影响主流程, 跑那个模块时才需要
+#
+# 本机环境: venv_ml (Python 3.12), 全部[核心]已装;
+#          [可选]里 quantstats 已装, 其余(xgboost/statsmodels/plotly/streamlit)未装。
+# 实测版本(2026-09-02): pandas 3.0.3 / numpy 2.4.6 / talib 0.6.8 /
+#   matplotlib 3.10.9 / scipy 1.17.1 / dateutil 2.9.0 / sklearn 1.8.0 /
+#   tushare 1.4.29 / akshare 1.18.64 / quantstats 0.0.81
+# 下界刻意写得比实测版本保守, 避免新机器被锁死在高版本。
+# ============================================================
+
+# ---------- [核心] 数据处理 ----------
 pandas>=1.5.0
 numpy>=1.21.0
 
-# 技术指标计算（TA-Lib C 语言实现，性能提升 10-100 倍）
+# ---------- [核心] 技术指标计算 ----------
+# TA-Lib C 语言实现，性能提升 10-100 倍
 # 安装说明：
 #   Windows: 先下载 https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
 #           安装对应 Python 版本的 .whl 文件
@@ -10,12 +26,28 @@ numpy>=1.21.0
 #   Mac:     brew install ta-lib && pip install TA-Lib
 talib>=0.6.0
 
-# 数据源
+# ---------- [核心] 数据源 ----------
 akshare>=1.18.0
 tushare>=1.2.0
 
-# 进度条
-tqdm>=4.60.0
+# ---------- [核心] 基础工具 ----------
+tqdm>=4.60.0            # 进度条
+loguru>=0.6.0           # 日志
+python-dateutil>=2.8.0  # 日期解析, 被 run_monthly_rebalance 共享引擎直接 import
 
-# 日志
-loguru>=0.6.0
+# ---------- [核心] 科学计算与绘图 ----------
+# 2026-09-02 补: 原先漏了这两项, 新机器按旧清单装完会 ImportError
+scipy>=1.9.0            # vp_core / 统计检验 / 插值
+matplotlib>=3.5.0       # 净值曲线、归因图
+
+# ---------- [核心] 机器学习 ----------
+scikit-learn>=1.2.0     # ml_stock_selector_v4 等
+
+# ============================================================
+# 以下为 [可选], 不装不影响主流程
+# ============================================================
+# quantstats>=0.0.62     # src/factor_calculator.py 绩效报告
+# statsmodels>=0.13.0    # src/factor_processor.py 时序检验
+# xgboost>=1.7.0         # ml_stock_selector_v4.py
+# plotly>=5.0.0          # vp_dashboard.py
+# streamlit>=1.20.0      # vp_dashboard.py (VP 看板)

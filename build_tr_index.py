@@ -32,9 +32,11 @@
 import sqlite3, argparse, os, sys
 import numpy as np
 import pandas as pd
+from config import DATA
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DB = r"D:\tu-shareData\astock_daily.db"
+# 走 config 而非硬编码盘符，保证 macOS / 换机可跑（与同目录 download_tr_index.py 一致）
+DB = DATA.get("local_db_path", r"D:\tu-shareData\astock_daily.db")
 OUT_DIR = os.path.join(BASE, "data", "results", "tr_index")
 FFILL_LIMIT = 60   # 停牌/缺失价格前推上限(交易日)
 
