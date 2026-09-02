@@ -50,10 +50,18 @@ def load_nav(path, col):
     return df
 
 
-def build_signal(df, mode, universe, lag, gate_rebal):
-    """给每条 NAV 记录挂上 (signal, exposure_key)。gate_rebal=每几个交易日允许改一次仓位。"""
-    nb = pd.read_csv(NB, dtype={"trade_date": str})
-    ucol = {"all": "rate_all", "nobj": "rate_nobj", "clean": "rate_clean"}[universe]
+def build_signal(df, mode, universe, lag, gate_rebal,
+                 signal_csv=None, signal_col=None, abs_scale=100.0):
+    """给每条 NAV 记录挂上 signal。gate_rebal=每几个交易日允许改一次仓位。
+
+    通用化：signal_csv / signal_col 可指向**任意**日频信号序列
+    （破净率、换手率、波动率……），本脚本因此成为通用 gate 叠加器。
+    """
+    nb = pd.read_csv(signal_csv or NB, dtype={"trade_date": str})
+    ucol = signal_col or {"all": "rate_all", "nobj": "rate_nobj",
+                          "clean": "rate_clean"}[universe]
+    if ucol not in nb.columns:
+        raise SystemExit(f"信号列 {ucol} 不存在于 {signal_csv or NB}，可用：{list(nb.columns)}")
     nb = nb[["trade_date", ucol]].dropna()
     nb["pct"] = nb[ucol].rolling(750, min_periods=250).apply(
         lambda w: (w[-1] >= w[:-1]).mean() * 100, raw=True)
@@ -61,26 +69,36 @@ def build_signal(df, mode, universe, lag, gate_rebal):
     m = df.merge(nb, on="trade_date", how="left")
     m["rate"] = m["rate"].ffill()
     m["pct"] = m["pct"].ffill()
-    m["sig"] = m["rate"] * 100.0 if mode == "abs" else m["pct"]
+    # abs 模式下：破净率是小数(0~0.16)需 ×100 变百分比；换手率已是百分比，scale=1.0
+    m["sig"] = m["rate"] * abs_scale if mode == "abs" else m["pct"]
     m["sig"] = m["sig"].shift(lag)          # 信号滞后，避免当日收盘价已知
     return m
 
 
-def exposure(sig, lo, hi):
-    """破净率高 = 便宜 = 满仓。信号缺失 → 满仓（不擅自降仓）。"""
+def exposure(sig, lo, hi, invert=True):
+    """三档仓位映射。信号缺失 → 满仓（项目红线：不擅自降仓）。
+
+    invert=True  (破净率)：信号高 = 便宜 = 满仓
+    invert=False (换手率)：信号低 = 地量 = 满仓，信号高 = 过热 = 空仓
+    """
     out = np.full(len(sig), 1.0)
     s = np.asarray(sig, dtype=float)
-    out[s >= hi] = 1.0
-    out[(s > lo) & (s < hi)] = 0.5
-    out[s <= lo] = 0.0
+    if invert:
+        out[s >= hi] = 1.0
+        out[(s > lo) & (s < hi)] = 0.5
+        out[s <= lo] = 0.0
+    else:
+        out[s <= lo] = 1.0
+        out[(s > lo) & (s < hi)] = 0.5
+        out[s >= hi] = 0.0
     out[~np.isfinite(s)] = 1.0
     return out
 
 
-def apply_gate(ret, sig, lo, hi, gate_rebal=1):
+def apply_gate(ret, sig, lo, hi, gate_rebal=1, invert=True):
     """逐日叠加仓位；只有每 gate_rebal 日才允许换仓（中间仓位不变、净值随涨跌漂移）。"""
     n = len(ret)
-    w_full = exposure(sig, lo, hi)
+    w_full = exposure(sig, lo, hi, invert)
     nav = np.ones(n)
     w_act = np.zeros(n)
     cur = 0.0
@@ -124,7 +142,8 @@ def yearly(nav, dates, base_nav):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="在已有策略 NAV 上叠加破净率 gate")
+    ap = argparse.ArgumentParser(
+        description="【通用 gate 叠加器】在已有策略 NAV 上叠加任意日频信号的仓位 gate")
     ap.add_argument("--nav", required=True, help="策略日频 NAV CSV（需含 trade_date）")
     ap.add_argument("--col", default="portfolio_value", help="NAV 列名")
     ap.add_argument("--mode", default="pct", choices=["pct", "abs"])
@@ -138,28 +157,58 @@ def main():
     ap.add_argument("--wf-split", default=None,
                     help="walk-forward 分割日(YYYYMMDD): 在此之前选参数, 在此之后做样本外检验。"
                          "全样本网格选出的最优阈值自带选择偏差, 必须有样本外这一刀")
+    # ---- 通用化：信号源 + 方向 + 量纲 ----
+    ap.add_argument("--signal-csv", default=None,
+                    help="信号序列 CSV（默认破净率）。需含 trade_date 与信号列")
+    ap.add_argument("--signal-col", default=None,
+                    help="信号列名（默认按 --universe 取 rate_all/nobj/clean）")
+    ap.add_argument("--invert", dest="invert", action="store_true", default=True,
+                    help="信号高→满仓（破净率，默认）")
+    ap.add_argument("--no-invert", dest="invert", action="store_false",
+                    help="信号低→满仓（换手率/波动率：低=地量=满仓，高=过热=空仓）")
+    ap.add_argument("--abs-scale", type=float, default=100.0,
+                    help="abs 模式下信号值的缩放系数：破净率是小数用 100，"
+                         "换手率已是百分比用 1")
+    ap.add_argument("--grid-los", default=None,
+                    help="网格 lo 取值，逗号分隔（默认按模式内定）")
+    ap.add_argument("--grid-his", default=None,
+                    help="网格 hi 取值，逗号分隔（默认按模式内定）")
     a = ap.parse_args()
 
     df = load_nav(a.nav, a.col)
-    m = build_signal(df, a.mode, a.universe, a.lag, a.gate_rebal)
+    m = build_signal(df, a.mode, a.universe, a.lag, a.gate_rebal,
+                     signal_csv=a.signal_csv, signal_col=a.signal_col,
+                     abs_scale=a.abs_scale)
     ret = m["ret"].fillna(0.0).values
     dates = m["trade_date"].values
     base_nav = np.cumprod(1 + ret)
 
+    def _grid_vals():
+        if a.grid_los:
+            los = [float(x) for x in a.grid_los.split(",")]
+        else:
+            los = (5.0, 7.0, 10.0, 12.0) if a.mode == "abs" else (20.0, 30.0, 40.0)
+        if a.grid_his:
+            his = [float(x) for x in a.grid_his.split(",")]
+        else:
+            his = (12.0, 15.0, 20.0) if a.mode == "abs" else (60.0, 70.0, 80.0)
+        return los, his
+
     print(f"NAV: {a.nav}  列={a.col}  {len(m)} 日  {dates[0]} ~ {dates[-1]}")
-    print(f"模式={a.mode}  口径={a.universe}  lag={a.lag}  gate换仓间隔={a.gate_rebal}日")
+    print(f"模式={a.mode}  信号={a.signal_col or a.universe}  源={a.signal_csv or NB}")
+    print(f"方向={'信号高→满仓' if a.invert else '信号低→满仓'}  lag={a.lag}  "
+          f"gate换仓间隔={a.gate_rebal}日")
     base = stats_of(base_nav, "满仓(对照)")
     print("对照：" + " | ".join(f"{k}={v}" for k, v in base.items() if k != "label"))
 
     if a.grid:
-        los = (5.0, 7.0, 10.0, 12.0) if a.mode == "abs" else (20.0, 30.0, 40.0)
-        his = (12.0, 15.0, 20.0) if a.mode == "abs" else (60.0, 70.0, 80.0)
+        los, his = _grid_vals()
         rows = []
         for lo in los:
             for hi in his:
                 if lo >= hi:
                     continue
-                nav, w = apply_gate(ret, m["sig"].values, lo, hi, a.gate_rebal)
+                nav, w = apply_gate(ret, m["sig"].values, lo, hi, a.gate_rebal, a.invert)
                 s = stats_of(nav, f"{a.mode} lo{lo}/hi{hi}")
                 s["lo"], s["hi"] = lo, hi
                 s["平均仓位%"] = round(w.mean() * 100, 1)
@@ -170,7 +219,7 @@ def main():
         print("\n=== 阈值网格 ===")
         print(g.to_string(index=False))
     else:
-        nav, w = apply_gate(ret, m["sig"].values, a.lo, a.hi, a.gate_rebal)
+        nav, w = apply_gate(ret, m["sig"].values, a.lo, a.hi, a.gate_rebal, a.invert)
         g = pd.DataFrame([base, stats_of(nav, f"{a.mode} lo{a.lo}/hi{a.hi}")])
         print("\n=== 单组结果 ===")
         print(g.to_string(index=False))
@@ -185,7 +234,7 @@ def main():
         print(f"[逐年采用网格最优组 lo={lo}/hi={hi}]")
     else:
         lo, hi = a.lo, a.hi
-    nav, w = apply_gate(ret, m["sig"].values, lo, hi, a.gate_rebal)
+    nav, w = apply_gate(ret, m["sig"].values, lo, hi, a.gate_rebal, a.invert)
     y = yearly(nav, dates, base_nav)
     print(f"\n=== 逐年（{a.mode} lo{lo}/hi{hi}）===")
     print(y.to_string(index=False))
@@ -199,14 +248,13 @@ def main():
         if tr.sum() < 250 or te.sum() < 250:
             print(f"\n[walk-forward] 分割日 {sp} 导致某侧样本不足 250 日，跳过")
             return
-        los = (5.0, 7.0, 10.0, 12.0) if a.mode == "abs" else (20.0, 30.0, 40.0)
-        his = (12.0, 15.0, 20.0) if a.mode == "abs" else (60.0, 70.0, 80.0)
+        los, his = _grid_vals()
         rows = []
         for lo2 in los:
             for hi2 in his:
                 if lo2 >= hi2:
                     continue
-                n2, _ = apply_gate(ret[tr], m["sig"].values[tr], lo2, hi2, a.gate_rebal)
+                n2, _ = apply_gate(ret[tr], m["sig"].values[tr], lo2, hi2, a.gate_rebal, a.invert)
                 s = stats_of(n2, f"lo{lo2}/hi{hi2}")
                 s["lo"], s["hi"] = lo2, hi2
                 rows.append(s)
@@ -217,7 +265,7 @@ def main():
         print(f"Walk-forward：{sp} 之前选参（{tr.sum()} 日）→ {sp} 之后样本外（{te.sum()} 日）")
         print("=" * 78)
         print(f"  训练期最优阈值：lo={blo} / hi={bhi}（训练期年化 {b['年化%']}%）")
-        nte, wte = apply_gate(ret[te], m["sig"].values[te], blo, bhi, a.gate_rebal)
+        nte, wte = apply_gate(ret[te], m["sig"].values[te], blo, bhi, a.gate_rebal, a.invert)
         ste = stats_of(nte, "样本外 gate")
         bte = stats_of(np.cumprod(1 + ret[te]), "样本外 满仓")
         print(pd.DataFrame([bte, ste]).to_string(index=False))
@@ -229,7 +277,7 @@ def main():
         outs = []
         for _, r in gtr.iterrows():
             n3, _ = apply_gate(ret[te], m["sig"].values[te],
-                               float(r["lo"]), float(r["hi"]), a.gate_rebal)
+                               float(r["lo"]), float(r["hi"]), a.gate_rebal, a.invert)
             outs.append(stats_of(n3)["年化%"])
         outs = np.array(outs, dtype=float)
         print(f"  样本外年化跨阈值区间：{outs.min():.2f}% ~ {outs.max():.2f}%"
