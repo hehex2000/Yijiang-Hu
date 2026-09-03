@@ -816,10 +816,47 @@ def run_legacy_comparison():
 # ═══════════════════════════════════════════════════════════════════
 #  官方编制法实战三档（全A 池）
 # ═══════════════════════════════════════════════════════════════════
+def get_periodic_5th_trading_days(all_dates, months):
+    """仅保留 months 集合内月份的第5交易日（返回有序 list，跨进程可复现）。"""
+    monthly = get_monthly_5th_trading_days(all_dates)
+    return [d for d in monthly if int(str(d)[4:6]) in months]
+
+
 def get_quarterly_5th_trading_days(all_dates):
     """仅保留 1/4/7/10 月第5交易日，实现季度调仓。"""
-    monthly = get_monthly_5th_trading_days(all_dates)
-    return [d for d in monthly if int(str(d)[4:6]) in (1, 4, 7, 10)]
+    return get_periodic_5th_trading_days(all_dates, (1, 4, 7, 10))
+
+
+def get_official_annual_rebal_days(all_dates):
+    """中证红利低波(H30269)官方年度调仓日 = 每年 12 月第二个星期五的**下一交易日**。
+
+    ⚠️ 与季度/半年度用的"第5交易日"口径不同：第5交易日约在 12/5~12/7，
+    官方口径约在 12/11~12/17（晚 1~2 周）。照抄官方年度调仓时须用本函数，
+    不要用 get_periodic_5th_trading_days(all_dates, (12,))，否则口径对不上官方。
+    """
+    s = pd.to_datetime(pd.Series([str(d) for d in all_dates]))
+    df = pd.DataFrame({"trade_date": [str(d) for d in all_dates], "dt": s})
+    out = []
+    for ym, g in df.groupby(s.dt.strftime("%Y%m"), sort=True):
+        if not str(ym).endswith("12"):
+            continue
+        fris = sorted(d for d in g["dt"] if d.weekday() == 4)
+        if len(fris) < 2:
+            continue                      # 该年 12 月不足两个周五（数据起点被截断）→ 跳过
+        after = g[g["dt"] > fris[1]]
+        if len(after):
+            out.append(after.iloc[0]["trade_date"])
+    return out
+
+
+# rebal 取值 → (调仓日生成函数参数, 显示名)
+REBAL_SPECS = {
+    "month":   (None,            "月度"),
+    "quarter": ((1, 4, 7, 10),   "季度"),
+    "half":    ((6, 12),         "半年度"),
+    # 年度走官方口径（12月第二个周五后一交易日），不是"12月第5交易日"
+    "year":    (None,            "年度(官方12月二周五后)"),
+}
 
 
 def run_nav_weighted(targets, weights_map, price_map, all_dates, coef_fn=None):
@@ -876,10 +913,45 @@ def run_nav_weighted(targets, weights_map, price_map, all_dates, coef_fn=None):
     return nav
 
 
-def select_targets_official(mode, pool=None, top_n=None):
+def _ensure_ind_map(sel_inst):
+    """确保 sel_inst._ind_map 已载入（B7 缓冲递补时的行业上限要用）。
+
+    🔴 不能靠 _cap_industry(df, 0) 触发载入：_cap_industry 在 cap<=0 时直接早退，
+       不会建立 _ind_map（曾导致 buffer_k>0 全部报错）。必须显式载入。"""
+    if not getattr(sel_inst, "_ind_map", None):
+        conn = sel_inst._get_conn()
+        im = pd.read_sql_query("SELECT ts_code, industry FROM stock_basic", conn)
+        conn.close()
+        sel_inst._ind_map = {
+            str(r["ts_code"]): (str(r["industry"]) if pd.notna(r["industry"]) else "其他")
+            for _, r in im.iterrows()
+        }
+    return sel_inst._ind_map
+
+
+def select_targets_official(mode, pool=None, top_n=None, buffer_k=0, turnover_cap=0.0):
     """官方编制法选股，股票池/持仓数走系统全局配置（pool/top_n 缺省即取 config.GLOBAL）。
-    支持 月/季调仓 + 等权/股息率加权 + 单行业上限。
-    返回 (targets, weights_map, sel_log)，并写 partial 以支持断点续跑（按 pool+top_n 分文件）。"""
+    支持 月/季/半年/年调仓 + 等权/股息率加权 + 单行业上限。
+    buffer_k>0 时启用「指数编制法缓冲规则(B7)」：上期持仓若仍排进前 top_n+buffer_k 名
+    （候选 rank 序，行业 cap 前口径）则保留不动，空出的位置按排名递补（递补时执行行业上限）。
+    这是指数复制降换手的正统手段；buffer_k=0 保持原行为（纯重排名，无缓冲）。
+
+    turnover_cap>0 时启用「B7' 官方同款调整比例硬上限」（与 buffer_k **互斥**，同时给则
+    本开关优先、buffer_k 被忽略）。以**上期持仓**为起点，在「新进只数 ≤ max_change」的
+    预算内把组合往本期最优改进，而不是"先重排再砍"：
+      ① 老持仓（仍在本期候选池内）按 rank 保留，受行业上限约束；
+      ② 老持仓坐不满 → **强制**递补（被动换仓，无法避免）；
+      ③ 剩余预算内做改善型替换：最好的候补 ↔ 应被踢出者
+         （目标行业已满 → 踢同行业最差，否则踢全局最差），换不出改善即停；
+      ④ 恒真：持仓 = top_n、行业 ≤ ind_cap；每笔替换严格降低 rank 之和 → 必然收敛。
+    依据：中证红利低波动指数(H30269)「每次调整的样本数量一般不超过样本总数的 20%」。
+    🔴 官方的低换手**不是靠"一年调一次"实现的**，靠的就是这道硬上限。
+    🔴 已自证判死的两种错法（勿回退）：
+       (a) "全量重排→砍新进者→回补老持仓"：回补被 ind_cap 挡住 → 组合塌缩（12→5 只）；
+       (b) 用 select_stocks 的 score 序当 rank：裸档最终按 **fwd_yield** 排序（见
+           _cap_industry），口径对不上 → 首期就选出完全不同的 12 只。
+    返回 (targets, weights_map, sel_log)，并写 partial 以支持断点续跑
+    （按 pool+top_n+buffer_k+turnover_cap+rebal 分文件）。"""
     spec = MODE_SPECS.get(mode, MODE_SPECS["official_compact"])
     pool = pool or config.GLOBAL.get("stock_pool", "hs300")
     if top_n is None:
@@ -888,12 +960,37 @@ def select_targets_official(mode, pool=None, top_n=None):
         top_n = int(top_n)
     buffer_n = max(top_n * 4, top_n + 8)      # 候选缓冲（供行业 cap 后取前 top_n）
     all_dates = get_trade_dates(START, END)
-    if spec["rebal"] == "quarter":
-        rebal_dates = get_quarterly_5th_trading_days(all_dates)
-    else:
+    # rebal: month / quarter / half / year（half=6·12月第5交易日；year=官方12月二周五后一交易日）
+    # CLI 可用 --rebal 覆盖 MODE_SPECS 的设定（opt-in，默认不变）
+    _rb = spec["rebal"]
+    if _rb not in REBAL_SPECS:
+        raise ValueError(f"未知 rebal={_rb!r}，可选 {list(REBAL_SPECS)}")
+    if _rb == "year":
+        rebal_dates = get_official_annual_rebal_days(all_dates)
+    elif _rb == "month":
         rebal_dates = get_monthly_5th_trading_days(all_dates)
+    else:
+        rebal_dates = get_periodic_5th_trading_days(all_dates, REBAL_SPECS[_rb][0])
+    # 🔴 低频档（half/year）首个调仓日可能距回测起点 5~11 个月 → 前段**空仓**，
+    # 年化被系统性低估，与季度档不可比。统一插入一次"期初建仓日"（第5个交易日，
+    # 与其它档同口径）。季度/月度档 rebal_dates[0] 距起点仅数日，gap<=20 不触发（行为不变）。
+    if rebal_dates:
+        _gap = all_dates.index(rebal_dates[0]) if rebal_dates[0] in all_dates else 10 ** 6
+        if _gap > 20:
+            _bd = all_dates[4]                 # 第 5 个交易日（与月度/季度档同口径）
+            rebal_dates = [_bd] + rebal_dates
+            print(f"[rebal] 🔴 低频档首个调仓日距起点 {_gap} 个交易日（前段会空仓、年化被低估）"
+                  f" → 插入期初建仓日 {_bd}")
+    _cap_on = bool(turnover_cap and turnover_cap > 0)
+    if _cap_on and buffer_k:
+        print(f"[warn] 同时给了 buffer_k={buffer_k} 与 turnover_cap={turnover_cap} → "
+              f"二者互斥，本次以 turnover_cap 为准（buffer_k 被忽略）")
     print(f"[rebal] {mode} 调仓点: {len(rebal_dates)} 个 "
-          f"({'季度' if spec['rebal']=='quarter' else '月度'})  pool={pool} 持仓={top_n}")
+          f"({REBAL_SPECS[_rb][1]})  pool={pool} 持仓={top_n}"
+          f"  buffer_k={buffer_k}{'(缓冲规则开: 保留带=top_n+%d)' % buffer_k if buffer_k > 0 else '(关: 纯重排名)'}")
+    if _cap_on:
+        print(f"[B7'] 调整比例硬上限 = {turnover_cap:.0%} → 每次最多新进 "
+              f"max(1, int({top_n}×{turnover_cap})) = {max(1, int(top_n * turnover_cap))} 只")
 
     cfg = build_cfg(mode)
     cfg["stock_pool"] = pool                  # ★ 走系统设置的股票池（不再写死 allA）
@@ -906,8 +1003,13 @@ def select_targets_official(mode, pool=None, top_n=None):
     sel_log = []
     weights_map = {}
     done_set = set()
-    # 按 pool+top_n+窗口 区分 partial，避免不同池/数量之间串档
-    partial_path = os.path.join(RES_DIR, f"_official_{mode}_{pool}_{top_n}_{START}_{END}_partial.csv")
+    # 按 pool+top_n+buffer_k+窗口 区分 partial，避免不同参数之间串档
+    # 🔴 频率也进文件名：--rebal half/year 与默认 quarter 会互相静默覆盖（第 7 次同类坑）
+    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "quarter" else ""
+    # 🔴 换手硬上限也进文件名（第 9 次同类坑）：cap 档与裸档会静默互相覆盖
+    _tctag = f"_tc{int(round(turnover_cap * 100))}" if _cap_on else ""
+    partial_path = os.path.join(RES_DIR, f"_official_{mode}_{pool}_{top_n}"
+                                         f"_bk{buffer_k}{_tctag}{_rbtag}_{START}_{END}_partial.csv")
     if os.path.exists(partial_path):
         p = pd.read_csv(partial_path, encoding="utf-8-sig")
         for _, r in p.iterrows():
@@ -921,6 +1023,14 @@ def select_targets_official(mode, pool=None, top_n=None):
             weights_map.setdefault(rb, {})[str(r["ts_code"])] = w
         print(f"[resume] partial 已含 {len(done_set)} 期, sel_log={len(sel_log)} 行")
 
+    # 缓冲规则需要上一期持仓：含 partial 续跑（weights_map 里已有历史各期）
+    picks_by_rb = {rb: set(w.keys()) for rb, w in weights_map.items()}
+    ind_map = None
+    if buffer_k > 0 or _cap_on:
+        # 行业上限在递补时执行，需要行业映射（惰性载入一次）
+        ind_map = _ensure_ind_map(sel_inst)
+        ind_cap = spec["ind_cap"]
+
     for i, rb in enumerate(rebal_dates):
         if str(rb) in done_set:
             continue
@@ -932,10 +1042,137 @@ def select_targets_official(mode, pool=None, top_n=None):
         if sel is None or len(sel) == 0:
             print(f"[select] {i+1}/{len(rebal_dates)} {rb} 空")
             continue
-        if spec["ind_cap"] > 0:
-            sel = sel_inst._cap_industry(sel, spec["ind_cap"])
-        picks_df = sel.head(top_n)              # 最终持仓 = 全局选股数（可实操）
-        picks = picks_df["ts_code"].tolist()
+        _extra = ""
+        if _cap_on:
+            # ── B7' 官方同款「每次调整比例 ≤ turnover_cap」硬上限 ──
+            # 🔴 第一版写法（全量重排→砍新进者→回补老持仓）已自证**判死**：
+            #    砍完要回补的老持仓大量是银行股，被 ind_cap=2 挡住 → 组合从 12 只
+            #    **塌缩到 5 只**（2023 冒烟实测 12→11→5→6）。故改为「以老持仓为起点」：
+            #   ① 老持仓（仍在本期候选池内）按 rank 保留，受行业上限约束；
+            #   ② 老持仓坐不满 → **强制**递补（被动换仓，无法避免，计入新进但不占预算判断）；
+            #   ③ 剩余预算内做改善型替换：最好的候补 ↔ 应被踢出者
+            #      （目标行业已满 → 踢同行业最差；否则踢全局最差），换不出改善即停。
+            #   恒真：持仓 = top_n、行业 ≤ ind_cap；每笔替换都严格降低 rank 之和 → 必然收敛。
+            prev_picks = picks_by_rb.get(str(rebal_dates[i - 1]), set()) if i > 0 else set()
+            # 🔴 rank 序必须与裸档**完全一致**：裸档走 `_cap_industry(sel, ind_cap).head(top_n)`，
+            #    而 **_cap_industry 内部按 fwd_yield 降序重排**（不是 select_stocks 的 score 序！）
+            #    再按行业取前 cap。若这里拿 score 序当 rank，连首期（无老持仓）都会选出
+            #    完全不同的 12 只（2023 冒烟实测：仅 4 只重合）→ cap 档无法与裸档对齐。
+            # 🔴 候选池用**行业上限前**的全量（48 只）、上限只约束最终组合：
+            #    _cap_industry 会把池子砍到 26 只，老持仓大量掉出池外 → 被动换仓激增，
+            #    硬上限形同虚设。两者在首期等价（贪心按 fwd_yield 取前 top_n 且行业≤cap）。
+            _sr = sel.copy()
+            _sr["ts_code"] = _sr["ts_code"].astype(str)
+            _sr = _sr.sort_values("fwd_yield", ascending=False).reset_index(drop=True)
+            cand = [str(c) for c in _sr["ts_code"]]
+            rank = {c: j for j, c in enumerate(cand)}        # rank = fwd_yield 序（裸档口径）
+            prev_avail = {c for c in cand if c in prev_picks}   # 老持仓中仍合格的
+            max_change = max(1, int(top_n * turnover_cap))
+
+            def _ic(c):
+                return ind_map.get(str(c), "其他")
+
+            cur, ind_cnt = [], {}
+            # ① 老持仓按 rank 保留（上期组合已满足 ind_cap → 正常情况全部保住）
+            for c in cand:
+                if len(cur) >= top_n:
+                    break
+                if c not in prev_avail:
+                    continue
+                _k = _ic(c)
+                if ind_cap > 0 and ind_cnt.get(_k, 0) >= ind_cap:
+                    continue
+                ind_cnt[_k] = ind_cnt.get(_k, 0) + 1
+                cur.append(c)
+            # ② 强制递补到坐满（老持仓不足 / 被行业上限挤掉）
+            cur_set = set(cur)
+            for c in cand:
+                if len(cur) >= top_n:
+                    break
+                if c in cur_set:
+                    continue
+                _k = _ic(c)
+                if ind_cap > 0 and ind_cnt.get(_k, 0) >= ind_cap:
+                    continue
+                ind_cnt[_k] = ind_cnt.get(_k, 0) + 1
+                cur.append(c)
+                cur_set.add(c)
+            # ③ 预算内改善型替换（每轮取全局最优候补，rank 和严格下降 → 收敛）
+            while True:
+                swapped = False
+                for best in cand:
+                    if best in cur_set:
+                        continue
+                    _kb = _ic(best)
+                    pool = [c for c in cur if _ic(c) == _kb] \
+                        if (ind_cap > 0 and ind_cnt.get(_kb, 0) >= ind_cap) else list(cur)
+                    if not pool:
+                        continue
+                    v = max(pool, key=lambda c: rank[c])       # rank 大 = 差
+                    if rank[best] >= rank[v]:
+                        continue                               # 换不出改善
+                    trial = [c for c in cur if c != v] + [best]
+                    if i > 0 and len([c for c in trial if c not in prev_picks]) > max_change:
+                        continue                               # 预算用完（但可能还有老持仓可换回）
+                    cur.remove(v)
+                    cur_set.discard(v)
+                    ind_cnt[_ic(v)] -= 1
+                    cur.append(best)
+                    cur_set.add(best)
+                    ind_cnt[_kb] = ind_cnt.get(_kb, 0) + 1
+                    swapped = True
+                if not swapped:
+                    break
+            final_codes = sorted(cur, key=lambda c: rank[c])   # 按 rank 复原（下游依赖 rank 序）
+            sel_r = _sr
+            picks_df = sel_r[sel_r["ts_code"].isin(final_codes)].drop_duplicates("ts_code", keep="first")
+            picks_df = picks_df.set_index("ts_code").loc[final_codes].reset_index()
+            picks = picks_df["ts_code"].tolist()
+            n_kept = None
+            n_new = len([c for c in final_codes if c not in prev_picks]) if i > 0 else len(final_codes)
+            _over = " ⚠超预算(强制)" if (i > 0 and n_new > max_change) else ""
+            _extra = f" 新进={n_new}/{max_change}{_over}"
+        elif buffer_k > 0:
+            # ── B7 指数编制法缓冲规则 ──
+            prev_picks = picks_by_rb.get(str(rebal_dates[i - 1]), set()) if i > 0 else set()
+            prev_picks = {c for c in prev_picks if c in set(sel["ts_code"])}
+            sel_r = sel.reset_index(drop=True)   # rank 序 = select_stocks 输出序（score 降序）
+            keep_band = top_n + buffer_k
+            kept = sel_r[sel_r["ts_code"].isin(prev_picks)].head(max(0, keep_band)) \
+                if keep_band > 0 else sel_r.iloc[0:0]
+            kept = kept[kept.index < keep_band]  # 上期持仓仍排进 keep_band 内才保留
+            kept_codes = kept["ts_code"].tolist()
+            kept_set = set(kept_codes)
+            # 递补：按 rank 序遍历非保留候选，行业计数 = 已保留 + 已递补
+            ind_cnt = {}
+            if ind_cap > 0:
+                for c in kept_codes:
+                    _ic = ind_map.get(str(c), "其他")
+                    ind_cnt[_ic] = ind_cnt.get(_ic, 0) + 1
+            fill = []
+            for _, r in sel_r.iterrows():
+                if len(kept_codes) + len(fill) >= top_n:
+                    break
+                c = str(r["ts_code"])
+                if c in kept_set:
+                    continue
+                if ind_cap > 0:
+                    _ic = ind_map.get(c, "其他")
+                    if ind_cnt.get(_ic, 0) >= ind_cap:
+                        continue
+                    ind_cnt[_ic] = ind_cnt.get(_ic, 0) + 1
+                fill.append(c)
+            final_codes = kept_codes + fill
+            picks_df = sel_r[sel_r["ts_code"].isin(final_codes)].drop_duplicates("ts_code", keep="first")
+            picks_df = picks_df.set_index("ts_code").loc[final_codes].reset_index()
+            picks = picks_df["ts_code"].tolist()
+            n_kept = len(kept_codes)
+        else:
+            if spec["ind_cap"] > 0:
+                sel = sel_inst._cap_industry(sel, spec["ind_cap"])
+            picks_df = sel.head(top_n)              # 最终持仓 = 全局选股数（可实操）
+            picks = picks_df["ts_code"].tolist()
+            n_kept = None
         # 加权
         if spec["weight"] == "dividend":
             yld = picks_df["fwd_yield"].fillna(picks_df["dv_ttm"] / 100.0)
@@ -945,6 +1182,7 @@ def select_targets_official(mode, pool=None, top_n=None):
         else:
             w = {c: 1.0 / len(picks) for c in picks}
         weights_map[str(rb)] = w
+        picks_by_rb[str(rb)] = set(picks)       # 缓冲规则：下一期沿用本期持仓
         for _, r in picks_df.iterrows():
             sel_log.append((rb, sel_date, str(r["ts_code"]), str(r.get("name", "")),
                             round(float(r.get("dv_ttm", 0) or 0), 2),
@@ -956,7 +1194,9 @@ def select_targets_official(mode, pool=None, top_n=None):
             partial_path, index=False, encoding="utf-8-sig")
         n_ind = (picks_df["ts_code"].map(lambda c: getattr(sel_inst, "_ind_map", {}).get(c, "其他")).nunique()
                  if getattr(sel_inst, "_ind_map", None) else "-")
-        print(f"[select] {i+1}/{len(rebal_dates)} {rb} 候选={len(sel)} 行业数={n_ind} 持仓={len(picks)}: {picks}")
+        _kb = f" 保留={n_kept}" if n_kept is not None else ""
+        print(f"[select] {i+1}/{len(rebal_dates)} {rb} 候选={len(sel)} 行业数={n_ind} "
+              f"持仓={len(picks)}{_kb}{_extra}: {picks}")
 
     by_rb, by_rb_w = {}, {}
     for rec in sel_log:
@@ -969,7 +1209,7 @@ def select_targets_official(mode, pool=None, top_n=None):
 def run_official_backtest(mode="official_compact", pool=None, top_n=None, capital=None,
                           overlay=True, channel_mode="rolling", channel_window=756,
                           channel_bottom=None, channel_top=None, k_min=0.5, k_max=1.0,
-                          live=False, live_forward=False):
+                          live=False, live_forward=False, buffer_k=0, turnover_cap=0.0):
     """跑官方编制法某档。股票池/持仓数/初始资金=系统全局配置；基准=该股票池对应指数；
     输出 NAV + 选股明细 + 逐年盈亏（策略 vs 基准 vs 同赛道 000922）。
 
@@ -996,7 +1236,7 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     print("=" * 70)
     print(f"红利低波质量复合 实战回测 [{mode}]  {START}~{END}")
     print(f"股票池={pool}({pool_name})  持仓={top_n}只(=全局选股数)  "
-          f"调仓={'季度' if spec['rebal']=='quarter' else '月度'}  "
+          f"调仓={REBAL_SPECS.get(spec['rebal'], (None, spec['rebal']))[1]}  "
           f"加权={'股息率' if spec['weight']=='dividend' else '等权'}  行业上限={spec['ind_cap']}")
     print(f"基准指数：{bname}({bidx})  ｜ 同赛道参考：中证红利低波(000922.SH)")
     if overlay:
@@ -1011,7 +1251,8 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     coef_fn = _make_coef_fn(overlay, channel_mode, channel_window,
                             channel_bottom, channel_top, k_min, k_max)
     _preload_pool_prices(pool)
-    targets, weights_map, sel_log = select_targets_official(mode, pool=pool, top_n=top_n)
+    targets, weights_map, sel_log = select_targets_official(
+        mode, pool=pool, top_n=top_n, buffer_k=buffer_k, turnover_cap=turnover_cap)
     all_codes = sorted({c for _, cs in targets for c in cs})
     print(f"涉及股票数: {len(all_codes)}")
     pmap = bulk_close_prices(all_codes, START, END)
@@ -1070,12 +1311,19 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     # 落盘：NAV 曲线
     rows = [(d, nav_map.get(d), nav_b_map.get(d), nav_922_map.get(d)) for d in all_dates]
     # hfq 结果加 _hfq 后缀，raw 保持原文件名（compare_tr_benchmark.py 依赖该路径，勿改）
+    # 🔴 缓冲档必须进文件名：buffer_k>0 时若沿用原名，各档会静默互相覆盖（第 6 次同类坑）。
     _pmtag = "_hfq" if PRICE_MODE == "hfq" else ""
-    nav_out = os.path.join(RES_DIR, f"bt_quality_nav_{START}_{END}_{mode}_{pool}_{top_n}{_pmtag}.csv")
+    _bktag = f"_bk{buffer_k}" if buffer_k else ""
+    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "quarter" else ""
+    # 🔴 换手硬上限也进文件名（第 9 次同类坑）：cap 档与裸档会静默互相覆盖
+    _tctag = f"_tc{int(round(turnover_cap * 100))}" if (turnover_cap and turnover_cap > 0) else ""
+    nav_out = os.path.join(RES_DIR, f"bt_quality_nav_{START}_{END}_{mode}_{pool}_{top_n}"
+                                    f"{_bktag}{_tctag}{_rbtag}{_pmtag}.csv")
     pd.DataFrame(rows, columns=["trade_date", f"nav_{mode}", f"nav_{bidx}", "nav_922"]).to_csv(
         nav_out, index=False, encoding="utf-8-sig")
     # 落盘：选股明细
-    sel_out = os.path.join(RES_DIR, f"bt_quality_sel_OFFICIAL_{mode.upper()}_{pool}_{top_n}_{START}_{END}.csv")
+    sel_out = os.path.join(RES_DIR, f"bt_quality_sel_OFFICIAL_{mode.upper()}_{pool}_{top_n}"
+                                    f"{_bktag}{_tctag}{_rbtag}_{START}_{END}.csv")
     pd.DataFrame(sel_log, columns=["rebal_date", "sel_date", "ts_code", "name",
                                     "dv_ttm", "volatility", "score", "weight"]).to_csv(
         sel_out, index=False, encoding="utf-8-sig")
@@ -1128,7 +1376,10 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
         "excess_vs_bench_pct": excess_list,
         "div_low_vol_922_pct": dl922_list,
     })
-    yr_out = os.path.join(RES_DIR, f"bt_quality_yearly_{START}_{END}_{mode}_{pool}_{top_n}.csv")
+    # 🔴 缓冲档与调仓频率都必须进文件名（第 8 次同类坑）：bk>0 或 --rebal half/year
+    #    若沿用裸名，各档逐年收益会静默互相覆盖，对照表直接作废。
+    yr_out = os.path.join(RES_DIR, f"bt_quality_yearly_{START}_{END}_{mode}_{pool}_{top_n}"
+                                   f"{_bktag}{_tctag}{_rbtag}{_pmtag}.csv")
     yr_df.to_csv(yr_out, index=False, encoding="utf-8-sig")
 
     print(f"\n集中度: 不同股票={distinct}  季/月均入选={avg_pick:.1f}")
@@ -1179,6 +1430,22 @@ def main():
     parser.add_argument("--price-mode", default="hfq", choices=["raw", "hfq"],
                         help="NAV 计价口径：hfq=后复权(默认,close*adj_factor,含分红再投,与全收益基准可比)；"
                              "raw=未复权(旧口径,不含分红,仅供复现 2026-09-02 前的历史结果)")
+    # ── B7 指数编制法缓冲规则（2026-09-02 新增，opt-in 降换手）──
+    parser.add_argument("--buffer-k", type=int, default=0,
+                        help="B7 缓冲规则保留带宽 k：上期持仓若仍排进前 top_n+k 名则保留，空位按排名递补"
+                             "（递补时执行行业上限）。0=关闭(默认,纯重排名=旧行为)。经验值 6~12")
+    # ── B7' 官方同款「每次调整比例硬上限」（2026-09-03 新增，opt-in 降换手）──
+    parser.add_argument("--turnover-cap", type=float, default=0.0,
+                        help="每次调仓最多新进的比例上限（官方 H30269 = 0.20）。"
+                             "做法：先与无约束档完全一致地全量重排名，再限制新进只数 ≤ int(top_n*cap)，"
+                             "超限则砍掉排名最差的新进者、回补排名最好的落选老持仓。"
+                             "0=关闭(默认,纯重排名=旧行为)。与 --buffer-k 互斥，同时给则以本开关为准")
+    # ── 调仓频率（2026-09-03 新增，opt-in；不传则沿用 MODE_SPECS 的设定）
+    parser.add_argument("--rebal", default=None, choices=list(REBAL_SPECS),
+                        help="调仓频率，覆盖该 mode 在 MODE_SPECS 里的默认值："
+                             "month=月度 / quarter=季度 / half=半年度(6·12月第5交易日) / "
+                             "year=年度(官方口径:12月第二个周五后一交易日)。"
+                             "🔴 降换手的第一杠杆是频率，不是缓冲带（详见 divlow_b7_demystify.md §3.3）")
     parser.add_argument("--live", action="store_true",
                         help="回测结束后打印最近一期调仓的可执行买列表（k缩放权重+现金%%），供实盘部署参考")
     parser.add_argument("--live-forward", action="store_true",
@@ -1188,6 +1455,11 @@ def main():
     PRICE_MODE = args.price_mode
     if PRICE_MODE == "hfq":
         print("[计价口径] hfq = close * adj_factor（含分红再投），可与全收益基准比较")
+    # 调仓频率覆盖（opt-in）。🔴 必须改 MODE_SPECS 本体：select_targets_official 内部
+    # 读的是 MODE_SPECS[mode]["rebal"]，只改局部副本不会生效（同 PRICE_MODE 那类坑）。
+    if args.rebal and args.mode in MODE_SPECS:
+        MODE_SPECS[args.mode]["rebal"] = args.rebal
+        print(f"[rebal] 覆盖 {args.mode} 的调仓频率 → {args.rebal}（{REBAL_SPECS[args.rebal][1]}）")
     if args.mode in ("old", "new", "soft"):
         run_legacy_comparison()
     else:
@@ -1195,7 +1467,8 @@ def main():
                               overlay=not args.no_div_channel_overlay, channel_mode=args.div_channel_mode,
                               channel_window=args.div_channel_window, channel_bottom=args.div_channel_bottom,
                               channel_top=args.div_channel_top, k_min=args.k_min, k_max=args.k_max,
-                              live=args.live, live_forward=args.live_forward)
+                              live=args.live, live_forward=args.live_forward,
+                              buffer_k=args.buffer_k, turnover_cap=args.turnover_cap)
 
 
 if __name__ == "__main__":
