@@ -39,7 +39,12 @@ Tushare `index_weight` 接口提供**月度成分权重快照**，实测 399006.
   - 与 download_index_weight.py 的区别：那个脚本只为「权重集中度」展示，
     默认从 2023 年起；本脚本面向回测股票池，默认回溯到 2010 年，并且
     **额外同步一份到 index_constituent**（回测实际读的是这张表）。
-  - 已知无 index_weight 数据的指数：932000.SH(中证2000)、000985.SH(中证全指)。
+  - 已知无 index_weight 数据的指数：932000.SH(中证2000)。
+  - ⚠️ **000985.SH(中证全指) 曾在此被误列为"无数据"，已于 2026-09-01 证伪**：
+    真实原因是**后缀**——`000985.SH` → 0 行，但 **`000985.CSI` → 3400~5200 行**（2019→2026 全可用）。
+    与 000922.SH / 930955.SH 是同一个坑（红利类指数在 index_weight 接口必须用 .CSI）。
+    已用 `backfill_dividend_constituents.py --only 000985.SH` 补全，可据此自建其全收益指数。
+    **判定"Tushare 无数据"前，必须先试 .SH / .SZ / .CSI 三种后缀变体。**
 依赖: tushare, config.DATA.tushare_token / local_db_path
 """
 import sys

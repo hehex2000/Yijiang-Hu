@@ -4491,6 +4491,9 @@ if __name__ == "__main__":
     parser.add_argument("--dlvq-mode", type=str, default="official_compact",
                         choices=["official", "official_improved", "official_compact"],
                         help="div_low_vol_quality 模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)")
+    parser.add_argument("--dlvq-rebal", type=str, default=None,
+                        choices=["month", "quarter", "half", "year"],
+                        help="div_low_vol_quality 调仓频率覆盖(默认 None=沿用模式默认=季度); --dlvq-rebal year 对齐官方 12 月二周五后, 年化单边换手 ~60%(长窗口)/~48%(2020起), 毛 alpha 不变")
     parser.add_argument("--select-only", action="store_true",
                         help="只选股，不回测")
     parser.add_argument("--lookback", type=int, default=6,
@@ -4686,9 +4689,12 @@ if __name__ == "__main__":
         dlq.START = args.start_date
         dlq.END = args.end_date
         _dlq_mode = args.dlvq_mode
-        print(f"红利低波质量复合【季度调仓】回测：{args.start_date} ~ {args.end_date}")
-        print(f"  模式: {_dlq_mode}（官方编制法930955口径·季频/股息率加权）")
-        dlq.run_official_backtest(_dlq_mode)
+        _freq_label = {"month": "月频", "quarter": "季频", "half": "半年频", "year": "年频(官方12月二周五后)"} \
+            .get(args.dlvq_rebal, "模式默认(季频)")
+        print(f"红利低波质量复合回测：{args.start_date} ~ {args.end_date}  调仓频率={_freq_label}")
+        print(f"  模式: {_dlq_mode}（官方编制法930955口径·全A池·股息率加权）")
+        # 🔴 必须显式 pool="all"：否则落到 config.GLOBAL 与入口 A 不一致（历史 bug）；rebal=None 沿用模式默认季度
+        dlq.run_official_backtest(_dlq_mode, pool="all", rebal=args.dlvq_rebal)
     else:
         print(f"回测周期：{args.start_date} ~ {args.end_date}")
         print(f"选股策略：{args.selection_method}")

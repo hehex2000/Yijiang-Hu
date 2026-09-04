@@ -31,6 +31,7 @@ from config import (
 
 # 印花税率：复用共享引擎的「分段口径」（2023-08-28 起千1→千0.5），保证全平台一致
 from run_monthly_rebalance import stamp_duty_rate
+import bench_index as bi
 
 # 凯利公式控仓（总持仓封顶）：让内置回测函数与插件策略共用同一套 kelly_sizer 框架
 from backtest.base_strategy import BaseStrategy
@@ -301,14 +302,21 @@ def load_stock_prices(code, start, end, conn, lookback_days=250):
     return df
 
 
-def load_benchmark(code, start, end, conn):
-    """加载基准指数"""
-    df = pd.read_sql_query(
-        "SELECT trade_date, close FROM index_daily WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
-        conn, params=(code, start, end))
-    if df.empty or len(df) < 2:
-        return None
-    df["close"] = df["close"].astype(float)
+_last_bench_meta = {}
+
+def load_benchmark(code, start, end, conn, mode=None):
+    """加载基准指数（委托 bench_index，优先全收益口径）。
+    返回 DataFrame[trade_date, close]；实际使用的口径记录到 _last_bench_meta[code] 供报告标注。"""
+    global _last_bench_meta
+    # 本引擎 NAV 口径由 --price-mode 决定（dual/hfq/raw）：
+    #   hfq  → 含分红，基准应对齐到全收益
+    #   raw  → 不含分红，基准应对齐到价格指数
+    #   dual → 同时出两套净值，基准按全收益（与 hfq 轨可比）
+    _pm = globals().get("PRICE_MODE")
+    _nav_mode = {"hfq": "hfq", "raw": "raw"}.get(str(_pm).lower()) if _pm else None
+    df, meta = bi.load_benchmark(code, start, end, conn=conn, mode=mode,
+                                 nav_price_mode=_nav_mode)
+    _last_bench_meta[code] = meta
     return df
 
 
@@ -1789,7 +1797,7 @@ def run_backtest(stocks):
 
     enabled = [(k, v) for k, v in STRATEGIES.items() if v.get("enabled")]
     print(f"\n{'='*100}")
-    print(f"  回测阶段 — {start} → {end} | 基准{benchmark}: {idx_ret:+.2f}% | 总资金{_total_capital/10000:.0f}万 ÷ {_top_n}只 = 每支{capital/10000:.0f}万")
+    print(f"  回测阶段 — {start} → {end} | 基准{benchmark}{bi.benchmark_meta_label(_last_bench_meta.get(benchmark))}: {idx_ret:+.2f}% | 总资金{_total_capital/10000:.0f}万 ÷ {_top_n}只 = 每支{capital/10000:.0f}万")
     print(f"  启用策略: {', '.join([s['name'] for _, s in enabled])}")
     print(f"{'='*100}")
 
@@ -1934,7 +1942,10 @@ def run_backtest(stocks):
     bh_mean = np.mean(list(bh_results.values()))
     print(f"  {'─'*90}")
     print(f"  {'买入持有(等权)':<16} {bh_mean:>+7.2f}%")
-    print(f"  {benchmark_name + '基准':<16} {idx_ret:>+7.2f}%")
+    print(f"  {benchmark_name + '基准':<16} {idx_ret:>+7.2f}%  {bi.benchmark_meta_label(_last_bench_meta.get(benchmark))}")
+    _w = bi.check_consistency(globals().get("PRICE_MODE"), _last_bench_meta.get(benchmark))
+    if _w:
+        print(f"  {_w}")
     print(f"{'='*100}\n")
 
     # ── 保存结果 ──

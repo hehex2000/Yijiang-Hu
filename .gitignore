@@ -33,12 +33,22 @@ data/models_v5/
 # 数据库文件
 *.db
 *.sqlite
+# WAL 附属文件：*.db 被忽略但 -wal/-shm 不匹配该规则，会漏进 git status
+# （data/tu-sharedata/ 下有 7.5GB 的库副本，其 -wal 可能很大）
+*.db-wal
+*.db-shm
 
 # 临时文件
 *.bak
+# 带时间戳/标签的备份：*.bak 匹配不到 xxx.py.bak_rb0_20260903_100822 这种后缀
+*.bak_*
 *.tmp
 *_old/
 *_backup/
+
+# 价格缓存（每个 ~60MB，可由 fetch_closes_bulk 重建，绝不入库）
+_closes_cache*.pkl
+*.pkl
 
 # 测试文件
 test_*.py

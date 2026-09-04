@@ -37,7 +37,29 @@ POOL_INDEX = '000906.SH'   # 股票池（中证800 时点成分）
 CLOSES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_closes_cache.pkl')
 CLOSES_CACHE_HFQ = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '_closes_cache_hfq.pkl')
-CLOSES_MAX_DATE = 20251231   # load_closes 的查询上限；超出则价格为 NaN（main 中有硬校验）
+CLOSES_MAX_DATE = 20251231   # 兜底值，仅缓存缺失时提示用；运行时以库里 daily 最新交易日为准
+
+_DB_MAX_DATE = None
+
+
+def db_max_trade_date():
+    """库里 daily 表的最新交易日（进程内缓存一次）。
+
+    为什么不再硬编码：早期把查询上界写死成 20251231，缓存一旦建好就再也不动，
+    于是 2026 年的回测区间全部取不到价 → 持仓估值静默归零（曾跑出 -92.90% 的
+    假结果），只能靠 main() 里的硬校验拦住。库里其实早就有数据（实测 daily
+    已到 20260831，2026 年 158 个交易日），**缺的是把缓存建到新区间，不是策略
+    不能跑**。改成现查后：补数 → 删缓存 → 重跑，自动跟上，不会再有人为上限。
+    """
+    global _DB_MAX_DATE
+    if _DB_MAX_DATE is None:
+        conn = get_conn()
+        try:
+            _DB_MAX_DATE = int(conn.execute(
+                "SELECT MAX(trade_date) FROM daily").fetchone()[0])
+        finally:
+            conn.close()
+    return _DB_MAX_DATE
 
 # ════════════════════════════════════════════════════════════════
 #  NAV 计价口径（2026-09-01 新增；2026-09-02 起默认 hfq，raw 变 opt-in）
@@ -155,9 +177,10 @@ def load_closes(hfq=False):
         codes, df = pd.read_pickle(cache)
         return codes, df
     conn = get_conn()
+    end_date = db_max_trade_date()   # 随库内数据自动延伸，不再写死 20251231
     codes = [r[0] for r in conn.execute(
         "SELECT DISTINCT ts_code FROM index_constituent WHERE index_code='000906.SH'")]
-    print(f"[load] zz800 历史成分 {len(codes)} 只，bulk 日线"
+    print(f"[load] zz800 历史成分 {len(codes)} 只，bulk 日线 20100101~{end_date}"
           f"{'(后复权)' if hfq else '(不复权)'}...", flush=True)
     frames = []
     for i in range(0, len(codes), 400):
@@ -170,12 +193,12 @@ def load_closes(hfq=False):
                 f"LEFT JOIN adj_factor a ON t.ts_code=a.ts_code AND t.trade_date=a.trade_date "
                 f"WHERE t.ts_code IN ({ph}) "
                 f"AND t.trade_date>=? AND t.trade_date<=? ORDER BY t.ts_code,t.trade_date",
-                conn, params=b + [20100101, 20251231])
+                conn, params=b + [20100101, end_date])
         else:
             d = pd.read_sql_query(
                 f"SELECT ts_code,trade_date,close FROM daily WHERE ts_code IN ({ph}) "
                 f"AND trade_date>=? AND trade_date<=? ORDER BY ts_code,trade_date",
-                conn, params=b + [20100101, 20251231])
+                conn, params=b + [20100101, end_date])
         if len(d):
             frames.append(d)
     conn.close()
@@ -197,6 +220,30 @@ def load_closes(hfq=False):
 
 
 # ───────────────────────── 模拟 ─────────────────────────
+def _fit_budget(px, sh, cash, td, max_iter=5):
+    """把买入股数缩放到「现金装得下」的最大值，而不是整只跳过。
+
+    为什么要这个：等权切分时每只的目标额 = 总权益 × w，但**费用会挤占名义
+    额度**，于是最后一只需要 target+fee 而现金只剩 target → 旧实现直接
+    ``if cost <= cash:`` 跳过，等于悄悄把篮子砍掉一只（实测旧版 top20 只
+    成交 19 只，4.88% 资金闲置）。
+
+    这里改为按比例缩放（费用近似线性，2~3 次迭代收敛），保证篮子成员不被
+    静默剔除。返回 (sh, fee)；实在装不下返回 (0.0, 0.0)。
+    """
+    if not np.isfinite(px) or px <= 0 or sh <= 0 or cash <= 0:
+        return 0.0, 0.0
+    for _ in range(max_iter):
+        fee = calc_fee('buy', px, sh, trade_date=td)
+        cost = sh * px + fee
+        if cost <= cash:
+            return sh, fee
+        sh *= (cash / cost) * 0.999
+        if sh * px < 1e-6:
+            break
+    return 0.0, 0.0
+
+
 def _rebalance_to(td, raw, val, codes, cash, positions, tot_fee, turn_over,
                   trades, reason, weights=None):
     """把仓位调整到目标篮子 codes 的目标权重。
@@ -240,6 +287,12 @@ def _rebalance_to(td, raw, val, codes, cash, positions, tot_fee, turn_over,
                 cash += sell_sh * px - fee
                 positions[c] -= sell_sh
                 turn_over += sell_sh * px
+                # 必须记流水：早期版本此处只改 positions/cash 却不 append，
+                # 导致减仓量在 trades 里凭空消失，后续 SELL-liquidate 记录的
+                # 股数与流水里的买入量对不上（重建 NAV 会出现负持仓）。
+                trades.append({"date": td, "action": "SELL-rebal", "code": c,
+                               "shares": sell_sh, "price": px, "fee": fee,
+                               "reason": reason})
                 if positions[c] <= 1e-9:
                     del positions[c]
     # 4) 买齐目标（含新进 + 现有补到目标）
@@ -250,14 +303,21 @@ def _rebalance_to(td, raw, val, codes, cash, positions, tot_fee, turn_over,
         cur = positions.get(c, 0) * px
         delta = _tgt(c) - cur
         if delta > 0.5:
-            buy_sh = delta / px
-            fee = calc_fee('buy', px, buy_sh, trade_date=td)
+            # 费用挤占 → 按比例缩放，不整只跳过（见 _fit_budget 文档）
+            buy_sh, fee = _fit_budget(px, delta / px, cash, td)
+            if buy_sh <= 0:
+                continue
             tot_fee += fee
-            cost = buy_sh * px + fee
-            if cost <= cash:
-                cash -= cost
-                positions[c] = positions.get(c, 0) + buy_sh
-                turn_over += buy_sh * px
+            cash -= buy_sh * px + fee
+            positions[c] = positions.get(c, 0) + buy_sh
+            turn_over += buy_sh * px
+            # 必须记流水（同步骤3）：早期版本此处补仓/新进改了 positions 与
+            # cash 却不 append，持仓在流水外增长，导致 SELL-liquidate 的
+            # 股数系统性大于流水里的买入量（实测 601288.SH 75 轮累计
+            # -6.76 万股），trades CSV 无法用于重建 NAV / 计算活跃税。
+            trades.append({"date": td, "action": "BUY-rebal", "code": c,
+                           "shares": buy_sh, "price": px, "fee": fee,
+                           "reason": reason})
     return cash, positions, tot_fee, turn_over
 
 
@@ -277,6 +337,7 @@ def run_sim(trade_dates, dates_i, golden, closes, closes_ff, top_n, capital,
     turn_over = 0.0
     n_empty_reentry = 0
     n_reselect = 0
+    n_cash_short = 0      # 现金不足导致整只买不进的次数（正常应为 0）
     tot_fee = 0.0
 
     for i, td in enumerate(trade_dates):
@@ -325,22 +386,31 @@ def run_sim(trade_dates, dates_i, golden, closes, closes_ff, top_n, capital,
                 if not codes:
                     n_empty_reentry += 1
                 else:
+                    # 🔴 目标市值必须以「建仓前的总权益」为基准，在循环外一次算好。
+                    # 早期实现写成 ``per = cash * w`` 且 cash 在循环内递减 →
+                    # 退化成等比数列：20 只等权(5%) 实际只部署 1-0.95^20 = 64%，
+                    # 36% 资金闲置到下次月度再平衡才补上（实测 20150107 建仓
+                    # 641,184 / 1,000,000，与 8/26 旧产物的 950,000 对不上，
+                    # 一度被误判为"数据/环境漂移"，实为本行回归）。
+                    # 进入本分支时 positions 必为空，故 eq0 == cash。
+                    eq0 = float(cash)
                     for c in codes:
                         px = raw[c] if (raw is not None and c in raw.index) else np.nan
                         if not np.isfinite(px) or px <= 0:
                             continue
-                        per = cash * weights.get(c, 1.0 / len(codes))
-                        sh = per / px
-                        fee = calc_fee('buy', px, sh, trade_date=td)
+                        per = eq0 * weights.get(c, 1.0 / len(codes))
+                        sh, fee = _fit_budget(px, per / px, cash, td)
+                        if sh <= 0:
+                            n_cash_short += 1
+                            continue
                         tot_fee += fee
                         cost = sh * px + fee
-                        if cost <= cash:
-                            cash -= cost
-                            positions[c] = sh
-                            turn_over += sh * px
-                            trades.append({"date": td, "action": "BUY-reentry",
-                                           "code": c, "shares": sh, "price": px,
-                                           "fee": fee, "reason": "golden_reentry"})
+                        cash -= cost
+                        positions[c] = sh
+                        turn_over += sh * px
+                        trades.append({"date": td, "action": "BUY-reentry",
+                                       "code": c, "shares": sh, "price": px,
+                                       "fee": fee, "reason": "golden_reentry"})
                     if verbose:
                         print(f"  [金叉 {td}] 重入 {len(positions)} 只")
             else:
@@ -394,6 +464,7 @@ def run_sim(trade_dates, dates_i, golden, closes, closes_ff, top_n, capital,
              "n_reentry": sum(1 for t in trades if t["action"] == "BUY-reentry"),
              "n_liquidate": sum(1 for t in trades if t["action"] == "SELL-liquidate"),
              "n_reselect": n_reselect,
+             "n_cash_short": n_cash_short,
              "total_fee": tot_fee,
              "n_empty_reentry": n_empty_reentry}
     return nav, trades, stats
@@ -445,10 +516,14 @@ def main():
         _, closes_full = load_closes(hfq=True)
     else:
         closes_full = raw_closes_full
-    if int(args.end) > CLOSES_MAX_DATE:
-        print(f"\n[错误] 回测终点 {args.end} 超出收盘矩阵缓存上限 {CLOSES_MAX_DATE}。"
+    # 用**缓存矩阵的真实末日**校验，而不是写死的常量：缓存是按建缓存时的库内
+    # 上限切的，补数后必须删缓存重建（提示里写明做法）。
+    data_max = int(closes_full.index.max())
+    if int(args.end) > data_max:
+        print(f"\n[错误] 回测终点 {args.end} 超出收盘矩阵上限 {data_max}"
+              f"（库里 daily 最新交易日 {db_max_trade_date()}）。"
               f"\n       超区间价格全为 NaN → 持仓估值静默归零（曾跑出 -92.90% 的假结果）。"
-              f"\n       如需更长区间，先扩大 load_closes() 的查询范围并删除 "
+              f"\n       缺的是缓存不是数据：先确认 daily/adj_factor 已补到该日期，再删除 "
               f"{os.path.basename(CLOSES_CACHE)} / {os.path.basename(CLOSES_CACHE_HFQ)} 重建缓存。")
         sys.exit(2)
     closes = closes_full.loc[(closes_full.index >= int(args.start)) & (closes_full.index <= int(args.end))]
@@ -550,7 +625,8 @@ def main():
                                ('+MACD', results[(tier, 'MACD')][0], results[(tier, 'MACD')][1])]:
             ann_to = st['turnover'] / max(years, 1e-9) / args.capital
             print(f"  {kind}·{tier:<10} 总费{st['total_fee']:>10,.0f}元 | 年化换手{ann_to*100:>5.0f}% | "
-                  f"重入{st['n_reentry']:>4} 清仓{st['n_liquidate']:>4} | 再平衡{st['rebal_days']:>4}天 重选{st['n_reselect']:>4}次")
+                  f"重入{st['n_reentry']:>4} 清仓{st['n_liquidate']:>4} | 再平衡{st['rebal_days']:>4}天 重选{st['n_reselect']:>4}次"
+                  f" | 买不进{st['n_cash_short']:>3}")
 
     # 分年表（仅对 +MACD vs 满仓 在各档内的 Δpp）
     def yearly(nav):

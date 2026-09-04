@@ -354,12 +354,23 @@ class DividendLowVolSelector:
         kept = bank_rows[:cap] + other_rows
         return pd.DataFrame(kept).reset_index(drop=True) if kept else df
 
-    def _cap_industry(self, df: pd.DataFrame, cap: int) -> pd.DataFrame:
-        """官方编制法可选：单行业最多保留 cap 只（按 fwd_yield 降序取前 cap），行业中性。
+    def _cap_industry(self, df: pd.DataFrame, cap: int, sort_key: str = "fwd_yield") -> pd.DataFrame:
+        """官方编制法可选：单行业最多保留 cap 只，行业中性。
         与 _cap_banks 互补：前者只限制银行，本方法对全行业生效（落地版用 cap=2 防银行/公用独大）。
-        行业取自 stock_basic.industry（首次调用缓存）。"""
+        行业取自 stock_basic.industry（首次调用缓存）。
+
+        sort_key（2026-09-03 新增，opt-in，默认 fwd_yield = 旧行为）：
+          "fwd_yield"  → 按股息率**降序**取前 cap（历史行为）
+          "volatility" → 按波动率**升序**取前 cap（🔴 官方 930955 口径）
+        🔴 为什么这很关键：官方 930955 的选样是「股息率前 300 → **波动率升序**取前 100」，
+           最后一段筛子的排序键是**波动率**（慢变量，年度间高度自相关 → 留存率高、换手低）；
+           我们原实现在波动率筛出的候选池上又按 **fwd_yield 重排**取前 top_n，
+           把排序键换成了股息率（快变量，随股价与分红剧烈变化）→ 每期大翻、换手高。
+        """
         if cap is None or cap <= 0 or len(df) == 0:
             return df
+        if sort_key not in ("fwd_yield", "volatility"):
+            raise ValueError(f"sort_key 只能是 fwd_yield / volatility，收到 {sort_key!r}")
         if not hasattr(self, "_ind_map") or self._ind_map is None:
             conn = self._get_conn()
             im = pd.read_sql_query("SELECT ts_code, industry FROM stock_basic", conn)
@@ -371,9 +382,9 @@ class DividendLowVolSelector:
         d = df.copy()
         d["ts_code"] = d["ts_code"].astype(str)
         d["_ind"] = d["ts_code"].map(self._ind_map).fillna("其他")
-        d = d.sort_values("fwd_yield", ascending=False)
+        d = d.sort_values(sort_key, ascending=(sort_key != "fwd_yield"))
         capped = [g.head(cap) for _, g in d.groupby("_ind")]
-        out = pd.concat(capped).sort_values("fwd_yield", ascending=False) if capped else d
+        out = pd.concat(capped).sort_values(sort_key, ascending=(sort_key != "fwd_yield")) if capped else d
         return out.reset_index(drop=True)
 
     # ------------------------------------------------------------------ #

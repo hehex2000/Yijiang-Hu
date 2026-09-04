@@ -97,7 +97,10 @@ def main():
     elif args.scan:
         files = sorted(glob.glob(os.path.join(args.scan, "**", args.glob),
                                  recursive=True))
-        for f in files[: args.max]:
+        if args.max and len(files) > args.max:
+            print(f"⚠️ 共 {len(files)} 个文件，--max {args.max} 只处理前 {args.max} 个，"
+                  f"漏掉 {len(files) - args.max} 个（按路径排序）→ --max 0 不限")
+        for f in (files[: args.max] if args.max else files):
             try:
                 r = compare_one(f, maker_slip=args.maker_slip)
             except Exception as e:
