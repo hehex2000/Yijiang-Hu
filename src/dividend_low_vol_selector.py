@@ -699,7 +699,7 @@ class DividendLowVolSelector:
         df["name"] = df["ts_code"].map(name_map)
 
         # ---- 第八步：排序 + 截取 TOP N ----
-        df = df.sort_values("score", ascending=False).head(self.top_n)
+        df = df.sort_values(["score", "ts_code"], ascending=[False, True]).head(self.top_n)
         df["code"] = df["ts_code"].str.extract(r"(\d{6})", expand=False)
 
         # 格式化输出：代码 + 名称

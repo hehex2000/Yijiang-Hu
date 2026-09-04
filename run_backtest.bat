@@ -518,7 +518,7 @@ echo   ----------------
 echo   [1] 价值选股[PB破净+ROE质量]
 echo   [2] 红利低波选股[高股息+低波动]
 echo   [3] 动量效应追涨[动量选股]
-echo   [4] 红利低波质量复合[季度调仓]
+echo   [4] 红利低波质量复合[年度调仓·低换手]
 echo   [5] MACD择时[逐股DIF^>DEA·无KDJ·跟随全局股票池]
 echo   [6] 高股息+基本面成长[股息率前10%%+PE/PEG/ROE/增长五关·月调仓·涨停跑路]
 echo   [7] 价值选股+组合层分散[70%%权益+15%%国债+15%%黄金·月度再平衡]
@@ -563,15 +563,15 @@ goto :mr_after
 :mr_divq
 set MR_ARG=--selection-method div_low_vol_quality --dlvq-mode official_compact
 echo.
-echo   调仓频率:
+echo   调仓频率（落地默认=年度·低换手）:
 echo   ----------------
-echo   [1] 季度档[默认·沿用官方编制法]
-echo   [2] 年度档[12月官方调整日·降换手·60.3%% vs 季度160.7%%]
+echo   [1] 年度档[默认·低换手·一年调一次]
+echo   [2] 季度档[高换手对照·沿用官方编制法]
 echo.
-set MR_RB_TXT=季度档
-set /p MR_RB=请选择 (1-2, 回车=1季度档):
-if "%MR_RB%"=="2" set MR_ARG=%MR_ARG% --dlvq-rebal year
-if "%MR_RB%"=="2" set MR_RB_TXT=年度档[降换手]
+set MR_RB_TXT=年度档[低换手]
+set /p MR_RB=请选择 (1-2, 回车=1年度档):
+if "%MR_RB%"=="2" set MR_ARG=%MR_ARG% --dlvq-rebal quarter
+if "%MR_RB%"=="2" set MR_RB_TXT=季度档[高换手对照]
 echo.
 echo   已选择: 红利低波质量复合[%MR_RB_TXT%]
 echo.

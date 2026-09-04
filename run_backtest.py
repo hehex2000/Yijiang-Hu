@@ -2067,7 +2067,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dlvq-rebal", type=str, default=None,
         choices=["month", "quarter", "half", "year"],
-        help="div_low_vol_quality 调仓频率覆盖(默认None=沿用模式默认季度); 传 year/half 可降频压换手(详见divlow_b7_demystify.md §3.3/§5.6); month/quarter 显式指定"
+        help="div_low_vol_quality 调仓频率覆盖(默认None=沿用模式默认年频); 传 quarter 可切换高换手对照; month/half 亦可(详见divlow_b7_demystify.md)"
     )
     parser.add_argument(
         "--div-channel-overlay", action="store_true",
@@ -2564,7 +2564,7 @@ if __name__ == "__main__":
             dlq.START = BACKTEST["start_date"]
             dlq.END = BACKTEST["end_date"]
             _dlq_mode = args.dlvq_mode
-            _dlq_rebal = args.dlvq_rebal or "quarter"
+            _dlq_rebal = args.dlvq_rebal or "year"
             _freq_cn = {"month": "月频", "quarter": "季频", "half": "半年频", "year": "年频"}.get(_dlq_rebal, _dlq_rebal)
             print(f"  {'='*60}")
             print(f"  ※ 本策略调仓频率:【{_freq_cn}】(rebal={_dlq_rebal})：官方编制法(中证红利低波930955口径)，"
@@ -2575,7 +2575,7 @@ if __name__ == "__main__":
             print(f"  ※ 股票池: 全A(all·锁定) — 本策略候选宇宙需全市场，zz800会饿死候选导致失真")
             dlq.run_official_backtest(
                 _dlq_mode,
-                rebal=args.dlvq_rebal,  # None=沿用模式默认(季度); year/half 降频压换手
+                rebal=args.dlvq_rebal,  # None=沿用模式默认(年频); quarter 显式指定高换手对照
                 pool="all",  # 本策略锁定全A池（zz800候选被饿死、质量复合失真；验证基线均在 all 池）
                 capital=args.capital,
                 overlay=not args.no_div_channel_overlay,

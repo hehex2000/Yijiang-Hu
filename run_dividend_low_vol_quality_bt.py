@@ -366,6 +366,9 @@ END = "20260723"
 #    本策略 raw→hfq 年化差 +3.67pp（实测）；用 raw 配全收益基准会误判成"跑输"（见报告 §8/§12.17）。
 #    要复现 2026-09-02 之前的历史数字请用 --price-mode raw。
 PRICE_MODE = "hfq"
+# 🔴 B9 opt-in：行业计数上限覆盖（None=沿用 MODE_SPECS；非 None=打标签并覆盖）。
+#    仅覆盖时打 _ictag，默认文件名不变（保护 compare_tr_benchmark.py 依赖路径）。
+IND_CAP_OVERRIDE = None
 EXEC_PMAP = {}          # hfq 模式下的成交价表 {ts_code: {trade_date: open*adj}}，与估值同价格空间
 STOCK_POOL = config.GLOBAL.get("stock_pool", "hs300")
 TOP_N = config.GLOBAL.get("top_n", 5)
@@ -379,7 +382,7 @@ INIT_CAPITAL = float(config.BACKTEST.get("monthly_rebalance_capital", 100000))
 MODE_SPECS = {
     "official":          dict(top_n=5,  rebal="month",   weight="eq",       ind_cap=0),
     "official_improved": dict(top_n=25, rebal="quarter", weight="dividend", ind_cap=0),
-    "official_compact":  dict(top_n=12, rebal="quarter", weight="dividend", ind_cap=2),
+    "official_compact":  dict(top_n=12, rebal="year", weight="dividend", ind_cap=2),
 }
 # 官方编制法基础配置（沿用 930955 口径）
 _OFFICIAL_BASE = dict(
@@ -1022,13 +1025,15 @@ def select_targets_official(mode, pool=None, top_n=None, buffer_k=0, turnover_ca
     done_set = set()
     # 按 pool+top_n+buffer_k+窗口 区分 partial，避免不同参数之间串档
     # 🔴 频率也进文件名：--rebal half/year 与默认 quarter 会互相静默覆盖（第 7 次同类坑）
-    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "quarter" else ""
+    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "year" else ""
     # 🔴 换手硬上限也进文件名（第 9 次同类坑）：cap 档与裸档会静默互相覆盖
     _tctag = f"_tc{int(round(turnover_cap * 100))}" if _cap_on else ""
     # 🔴 串档坑第 10 次：最后一段排序键也必须进文件名，否则 vol 档会覆盖 yield 档产物
     _fktag = "_kv" if final_key == "volatility" else ""
+    # 🔴 B9 行业计数上限也进文件名（第 11 次同类坑）：取消上限(0)与默认(2)会静默互相覆盖
+    _ictag = f"_ic{IND_CAP_OVERRIDE}" if IND_CAP_OVERRIDE is not None else ""
     partial_path = os.path.join(RES_DIR, f"_official_{mode}_{pool}_{top_n}"
-                                         f"_bk{buffer_k}{_tctag}{_fktag}{_rbtag}_{START}_{END}_partial.csv")
+                                         f"_bk{buffer_k}{_ictag}{_tctag}{_fktag}{_rbtag}_{START}_{END}_partial.csv")
     if os.path.exists(partial_path):
         p = pd.read_csv(partial_path, encoding="utf-8-sig")
         for _, r in p.iterrows():
@@ -1190,6 +1195,15 @@ def select_targets_official(mode, pool=None, top_n=None, buffer_k=0, turnover_ca
         else:
             if spec["ind_cap"] > 0:
                 sel = sel_inst._cap_industry(sel, spec["ind_cap"], sort_key=final_key)
+            elif IND_CAP_OVERRIDE is not None:
+                # 🔴 B9 修复（2026-09-04）：_cap_industry 在 cap<=0 时**直接 return df（不重排）**，
+                #    而 select_stocks 的原始序是 score 降序（score = −volatility → 即波动率升序）。
+                #    若 --ind-cap 0 时不补重排，head(top_n) 选出的是「**最低波动的 12 只**」，
+                #    与 B9 要测的「**股息率最高的 12 只、仅取消行业上限**」根本不是一回事。
+                #    实测踩坑：错误版 20230109 选出 12 只全银行、波动 9.28%、换手反升到 134.0%。
+                # ⚠️ 只在**显式 --ind-cap 覆盖**时生效：official 模式原生 ind_cap=0，行为不得改变。
+                sel = sel.sort_values([final_key, "ts_code"],
+                                      ascending=[(final_key != "fwd_yield"), True]).reset_index(drop=True)
             picks_df = sel.head(top_n)              # 最终持仓 = 全局选股数（可实操）
             picks = picks_df["ts_code"].tolist()
             n_kept = None
@@ -1349,18 +1363,20 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     # 🔴 缓冲档必须进文件名：buffer_k>0 时若沿用原名，各档会静默互相覆盖（第 6 次同类坑）。
     _pmtag = "_hfq" if PRICE_MODE == "hfq" else ""
     _bktag = f"_bk{buffer_k}" if buffer_k else ""
-    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "quarter" else ""
+    _rbtag = f"_rb{spec['rebal']}" if spec["rebal"] != "year" else ""
     # 🔴 换手硬上限也进文件名（第 9 次同类坑）：cap 档与裸档会静默互相覆盖
     _tctag = f"_tc{int(round(turnover_cap * 100))}" if (turnover_cap and turnover_cap > 0) else ""
     # 🔴 串档坑第 10 次：最后一段排序键（yield/vol）也必须进落盘名
     _fktag = "_kv" if final_key == "volatility" else ""
+    # 🔴 B9 行业计数上限也进文件名（第 11 次同类坑）：取消上限(0)与默认(2)会静默互相覆盖
+    _ictag = f"_ic{IND_CAP_OVERRIDE}" if IND_CAP_OVERRIDE is not None else ""
     nav_out = os.path.join(RES_DIR, f"bt_quality_nav_{START}_{END}_{mode}_{pool}_{top_n}"
-                                    f"{_bktag}{_tctag}{_fktag}{_rbtag}{_pmtag}.csv")
+                                    f"{_bktag}{_ictag}{_tctag}{_fktag}{_rbtag}{_pmtag}.csv")
     pd.DataFrame(rows, columns=["trade_date", f"nav_{mode}", f"nav_{bidx}", "nav_922"]).to_csv(
         nav_out, index=False, encoding="utf-8-sig")
     # 落盘：选股明细
     sel_out = os.path.join(RES_DIR, f"bt_quality_sel_OFFICIAL_{mode.upper()}_{pool}_{top_n}"
-                                    f"{_bktag}{_tctag}{_fktag}{_rbtag}_{START}_{END}.csv")
+                                    f"{_bktag}{_ictag}{_tctag}{_fktag}{_rbtag}_{START}_{END}.csv")
     pd.DataFrame(sel_log, columns=["rebal_date", "sel_date", "ts_code", "name",
                                     "dv_ttm", "volatility", "score", "weight"]).to_csv(
         sel_out, index=False, encoding="utf-8-sig")
@@ -1416,7 +1432,7 @@ def run_official_backtest(mode="official_compact", pool=None, top_n=None, capita
     # 🔴 缓冲档与调仓频率都必须进文件名（第 8 次同类坑）：bk>0 或 --rebal half/year
     #    若沿用裸名，各档逐年收益会静默互相覆盖，对照表直接作废。
     yr_out = os.path.join(RES_DIR, f"bt_quality_yearly_{START}_{END}_{mode}_{pool}_{top_n}"
-                                   f"{_bktag}{_tctag}{_fktag}{_rbtag}{_pmtag}.csv")
+                                   f"{_bktag}{_ictag}{_tctag}{_fktag}{_rbtag}{_pmtag}.csv")
     yr_df.to_csv(yr_out, index=False, encoding="utf-8-sig")
 
     print(f"\n集中度: 不同股票={distinct}  季/月均入选={avg_pick:.1f}")
@@ -1446,6 +1462,11 @@ def main():
                         help="持仓数量（默认=config.GLOBAL 选股数；不传则官方档用各自默认）")
     parser.add_argument("--capital", type=float, default=None,
                         help="初始资金（默认=config.BACKTEST.monthly_rebalance_capital，与其它月度策略一致）")
+    # ── 回测窗口（2026-09-04 新增，opt-in；不传则沿用模块全局 START/END）
+    parser.add_argument("--start", default=None,
+                        help="回测起点 YYYYMMDD（覆盖全局 START；默认 20200101）")
+    parser.add_argument("--end", default=None,
+                        help="回测终点 YYYYMMDD（覆盖全局 END；默认 20260723）")
     # ── 红利通道仓位 overlay（P0 实验）──
     parser.add_argument("--div-channel-overlay", action="store_true",
                         help="开启红利通道仓位 overlay（现已默认开启，此开关可省略）；按000922通道位置缩放权益仓位")
@@ -1477,6 +1498,11 @@ def main():
                              "fwd_yield=股息率降序(默认,旧行为)；"
                              "volatility=波动率升序(官方 930955 口径：股息率前300→波动率升序取前100)。"
                              "🔴 波动率是慢变量 → 换键预计大幅提高留存率、压低换手")
+    # ── B9 行业计数上限（2026-09-04 新增，opt-in；不传则沿用 MODE_SPECS 的 ind_cap）
+    parser.add_argument("--ind-cap", type=int, default=None,
+                        help="B9：每行业最多 N 只（行业计数上限），覆盖该 mode 在 MODE_SPECS 的 ind_cap。"
+                             "0=取消行业计数上限（对齐官方 930955 用行业权重≤20%软约束、不踢股票，仅调权重）；"
+                             "默认 None=沿用 mode 设定（official_compact=2）。🔴 只改落盘标签与选股，不改其它默认行为")
     parser.add_argument("--turnover-cap", type=float, default=0.0,
                         help="每次调仓最多新进的比例上限（官方 H30269 = 0.20）。"
                              "做法：先与无约束档完全一致地全量重排名，再限制新进只数 ≤ int(top_n*cap)，"
@@ -1493,15 +1519,29 @@ def main():
     parser.add_argument("--live-forward", action="store_true",
                         help="以库里最新交易日为选股日重跑 selector，打印真正『今天该买什么』的前瞻买列表（独立于历史回测）")
     args = parser.parse_args()
-    global PRICE_MODE
+    global PRICE_MODE, START, END
     PRICE_MODE = args.price_mode
     if PRICE_MODE == "hfq":
         print("[计价口径] hfq = close * adj_factor（含分红再投），可与全收益基准比较")
+    # 回测窗口覆盖（opt-in）。🔴 START/END 是模块全局，select_targets_official 内 get_trade_dates(START, END)
+    # 直接读全局，故须改全局本体（同 PRICE_MODE 那类坑）。
+    if args.start:
+        START = args.start
+        print(f"[窗口] 起点覆盖 → {START}")
+    if args.end:
+        END = args.end
+        print(f"[窗口] 终点覆盖 → {END}")
     # 调仓频率覆盖（opt-in）。🔴 必须改 MODE_SPECS 本体：select_targets_official 内部
     # 读的是 MODE_SPECS[mode]["rebal"]，只改局部副本不会生效（同 PRICE_MODE 那类坑）。
     if args.rebal and args.mode in MODE_SPECS:
         MODE_SPECS[args.mode]["rebal"] = args.rebal
         print(f"[rebal] 覆盖 {args.mode} 的调仓频率 → {args.rebal}（{REBAL_SPECS[args.rebal][1]}）")
+    # 🔴 B9：行业计数上限覆盖（与 --rebal 同全局覆盖模式，仅覆盖时打 _ictag）
+    if args.ind_cap is not None and args.mode in MODE_SPECS:
+        global IND_CAP_OVERRIDE
+        IND_CAP_OVERRIDE = args.ind_cap
+        MODE_SPECS[args.mode]["ind_cap"] = args.ind_cap
+        print(f"[ind-cap] 覆盖 {args.mode} 的行业计数上限 → {args.ind_cap}")
     if args.mode in ("old", "new", "soft"):
         run_legacy_comparison()
     else:
