@@ -563,7 +563,17 @@ goto :mr_after
 :mr_divq
 set MR_ARG=--selection-method div_low_vol_quality --dlvq-mode official_compact
 echo.
-echo   已选择: 红利低波质量复合[季度调仓]
+echo   调仓频率:
+echo   ----------------
+echo   [1] 季度档[默认·沿用官方编制法]
+echo   [2] 年度档[降换手·实测年化单边换手60.3%% vs 季度160.7%%，毛alpha不变]
+echo.
+set MR_RB_TXT=季度档
+set /p MR_RB=请选择 (1-2, 回车=1季度档):
+if "%MR_RB%"=="2" set MR_ARG=%MR_ARG% --dlvq-rebal year
+if "%MR_RB%"=="2" set MR_RB_TXT=年度档[降换手]
+echo.
+echo   已选择: 红利低波质量复合[%MR_RB_TXT%]
 echo.
 echo   红利通道仓位 overlay（000922通道位置→权益仓位，贵减仓/便宜满仓·已验证正向）:
 echo   [1] 平衡档[默认·rolling w756/k0.5·开启]
