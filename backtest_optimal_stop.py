@@ -183,7 +183,7 @@ def _fit_buy(px, target, cash, td):
 
 def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
              exit_rule, r, capital, mu_mode, div_yield, collect_thr=False,
-             freq='monthly', rebal_mode='overlap'):
+             freq='monthly', rebal_mode='overlap', trim_keep=0.5):
     """单一退出规则的回测。返回 (nav, stats, thr_samples)。
 
     rebal_mode 见模块 docstring：full / overlap / drift。
@@ -196,7 +196,7 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
     nav = np.zeros(n)
     ms = rebal_date_set(trade_dates, freq)
 
-    n_buy = n_sell_rebal = n_sell_exit = 0
+    n_buy = n_sell_rebal = n_sell_exit = n_trim = 0
     tot_fee = 0.0
     turnover = 0.0
     exit_pnl = []
@@ -283,8 +283,12 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
                 eq = float(cash) + _mv()
 
                 # 等权再平衡：先把留在篮子里的超额部分 trim 掉（减仓不改 K）
+                # 已触发过「高浮盈减仓」的票：保持半仓，不再补回等权，
+                # 否则减仓效果会被下一次调仓立刻撤销、只剩白付的成本。
                 if rebal_mode == 'overlap':
                     for c in list(pos):
+                        if pos[c].get('trimmed'):
+                            continue
                         px = row[col_idx[c]]
                         if not np.isfinite(px) or px <= 0:
                             continue
@@ -301,6 +305,8 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
 
                 # 补买 / 新进
                 for c in codes:
+                    if pos.get(c, {}).get('trimmed'):
+                        continue          # 减过仓的票不再补回
                     px = row[col_idx[c]]
                     if not np.isfinite(px) or px <= 0:
                         continue
@@ -323,6 +329,12 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
                     mult = 1.20
                     thr = k * mult
                 elif exit_rule == 'fixed30':
+                    mult = 1.30
+                    thr = k * mult
+                elif exit_rule == 'trim20':
+                    mult = 1.20
+                    thr = k * mult
+                elif exit_rule == 'trim30':
                     mult = 1.30
                     thr = k * mult
                 elif exit_rule == 'optimal':
@@ -364,6 +376,28 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
                         del top_gain[10:]
                 if px >= thr:
                     n_ge += 1
+                    if exit_rule in ('trim20', 'trim30'):
+                        # 高浮盈减仓：只卖出 (1-trim_keep) 比例，保留底仓。
+                        # 标记 trimmed，避免同一票反复触发；K 保持不变。
+                        if pos[c].get('trimmed'):
+                            n_ge -= 1
+                            continue
+                        sell_sh = pos[c]['sh'] * (1.0 - trim_keep)
+                        if sell_sh <= 0:
+                            n_ge -= 1
+                            continue
+                        fee = calc_fee('sell', px, sell_sh, trade_date=td)
+                        tot_fee += fee
+                        cash += sell_sh * px - fee
+                        turnover += sell_sh * px
+                        exit_pnl.append(px / k - 1.0)
+                        n_sell_exit += 1
+                        n_trim += 1
+                        pos[c]['sh'] -= sell_sh
+                        pos[c]['trimmed'] = True
+                        if pos[c]['sh'] <= 1e-9:
+                            del pos[c]
+                        continue
                     sh = pos[c]['sh']
                     fee = calc_fee('sell', px, sh, trade_date=td)
                     tot_fee += fee
@@ -389,7 +423,7 @@ def simulate(trade_dates, closes_mat, col_idx, sigma_mat, mu_mat, basket_map,
 
     yrs = n / TRADING_DAYS
     stats = {'n_buy': n_buy, 'n_sell_rebal': n_sell_rebal,
-             'n_sell_exit': n_sell_exit, 'total_fee': tot_fee,
+             'n_sell_exit': n_sell_exit, 'n_trim': n_trim, 'total_fee': tot_fee,
              'turnover': turnover,
              'turnover_ann': turnover / yrs / float(capital) if yrs > 0 else np.nan,
              'fee_ann': tot_fee / yrs / float(capital) if yrs > 0 else np.nan,
@@ -482,13 +516,15 @@ def mode_backtest(args):
                 trade_dates, closes_mat, col_idx, sigma_mat, mu_mat,
                 basket_map, ex, args.r, args.capital, args.mu_mode,
                 args.div_yield, collect_thr=(ex == 'optimal'),
-                freq=args.rebal_freq, rebal_mode=args.rebal_mode)
+                freq=args.rebal_freq, rebal_mode=args.rebal_mode,
+                trim_keep=args.trim_keep)
             m = metrics(nav)
             if not m:
                 continue
             row = {'exit': ex, 'sigma_win': sw, **m,
                    'trades': st['n_buy'] + st['n_sell_rebal'] + st['n_sell_exit'],
                    'exit_sells': st['n_sell_exit'],
+                   'n_trim': st['n_trim'],
                    'fee': st['total_fee'],
                    'turn_ann': st['turnover_ann'],
                    'fee_ann': st['fee_ann'],
@@ -555,6 +591,8 @@ def main():
     ap.add_argument('--top-n', type=int, default=20)
     ap.add_argument('--capital', type=float, default=1_000_000)
     ap.add_argument('--exits', default='hold,fixed20,fixed30,optimal')
+    ap.add_argument('--trim-keep', type=float, default=0.5,
+                    help='trim20/trim30 触发后保留的仓位比例（0.5=减半仓）')
     ap.add_argument('--sigma-window', default='250')
     ap.add_argument('--r', type=float, default=0.03)
     ap.add_argument('--mu-mode', default='zero', choices=['zero', 'realized', 'neutral'])
