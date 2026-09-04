@@ -425,17 +425,30 @@ def metrics(nav):
 
 # ───────────────────────── 回测模式 ─────────────────────────
 def mode_backtest(args):
-    codes, closes_full = load_closes(hfq=(args.price_mode == 'hfq'))
-    print(f"[load] 收盘矩阵 {closes_full.shape}")
+    # ⚠️ 口径分离（run_daily20_macd.load_closes 文档硬要求）：
+    #   选股信号（build_vol_lookup → select_div_low_vol）**永远用 raw**，
+    #   NAV 估值与成交才按 --price-mode 切换。两处共用同一矩阵会把
+    #   「改复权口径」与「改选股」两个变量耦合，双跑结论不可归因。
+    codes, closes_sig = load_closes(hfq=False)
+    if args.price_mode == 'hfq':
+        _, closes_px = load_closes(hfq=True)
+        # hfq 与 raw 的票集应一致；按 raw 的列序对齐，避免列错位
+        closes_px = closes_px.reindex(columns=closes_sig.columns)
+        print(f"[load] 选股矩阵(raw) {closes_sig.shape} / "
+              f"成交矩阵(hfq) {closes_px.shape}")
+    else:
+        closes_px = closes_sig
+        print(f"[load] 收盘矩阵(raw) {closes_sig.shape}")
 
-    all_dates = [int(d) for d in closes_full.index]
+    all_dates = [int(d) for d in closes_sig.index]
     trade_dates = [d for d in all_dates if args.start <= d <= args.end]
     if not trade_dates:
         print(f"[error] 区间 {args.start}~{args.end} 无交易日")
         sys.exit(2)
     print(f"[区间] {trade_dates[0]} ~ {trade_dates[-1]}，共 {len(trade_dates)} 个交易日")
 
-    vol_lookup = build_vol_lookup(closes_full, window=120)
+    # 选股永远走 raw 矩阵（隔离变量）
+    vol_lookup = build_vol_lookup(closes_sig, window=120)
     ms = rebal_date_set(trade_dates, args.rebal_freq)
 
     basket_map = {}
@@ -448,19 +461,21 @@ def mode_backtest(args):
     n_ok = sum(1 for v in basket_map.values() if v)
     print(f"[选股] 完成：{n_ok}/{len(ms)} 个调仓日有非空篮子")
 
-    cols = list(closes_full.columns)
+    cols = list(closes_sig.columns)
     col_idx = {c: j for j, c in enumerate(cols)}
-    closes_mat = closes_full.loc[trade_dates].values
+    # 成交/估值/σ-μ 一律走 closes_px（raw 或 hfq）
+    closes_mat = closes_px.loc[trade_dates].values
 
     exits = [e.strip() for e in args.exits.split(',') if e.strip()]
     results = []
     thr_all = {}
 
     for sw in [int(x) for x in args.sigma_window.split(',')]:
-        sigma, mu = build_param_matrices(closes_full, trade_dates, sw)
+        # σ/μ 是退出规则的定价输入，应与 NAV 同口径（GBM 描述的是含分红的总收益过程）
+        sigma, mu = build_param_matrices(closes_px, trade_dates, sw)
         sigma_mat = sigma.loc[trade_dates].values
         mu_mat = mu.loc[trade_dates].values
-        print(f"\n[参数] 调仓={args.rebal_freq}/{args.rebal_mode} "
+        print(f"\n[参数] 调仓={args.rebal_freq}/{args.rebal_mode}/{args.price_mode} "
               f"σ窗口={sw}日 r={args.r} μ模式={args.mu_mode}")
         for ex in exits:
             nav, st, thr = simulate(
@@ -527,7 +542,7 @@ def mode_backtest(args):
     out = os.path.join(
         OUT_DIR,
         f"optimal_stop_{args.start}_{args.end}_{args.rebal_freq}_"
-        f"{args.rebal_mode}_{args.mu_mode}.csv")
+        f"{args.rebal_mode}_{args.mu_mode}_{args.price_mode}.csv")
     df.to_csv(out, index=False, encoding='utf-8-sig')
     print(f"\n[输出] {out}")
 
