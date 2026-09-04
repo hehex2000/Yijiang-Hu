@@ -2065,6 +2065,11 @@ if __name__ == "__main__":
         help="div_low_vol_quality 的模式: official(月频/等权/TOP5) / official_improved(季频/股息率加权/TOP25) / official_compact(季频/股息率加权/TOP12/行业≤2·落地版)"
     )
     parser.add_argument(
+        "--dlvq-rebal", type=str, default=None,
+        choices=["month", "quarter", "half", "year"],
+        help="div_low_vol_quality 调仓频率覆盖(默认None=沿用模式默认季度); 传 year/half 可降频压换手(详见divlow_b7_demystify.md §3.3/§5.6); month/quarter 显式指定"
+    )
+    parser.add_argument(
         "--div-channel-overlay", action="store_true",
         help="红利通道仓位 overlay（000922通道位置→权益仓位系数，贵减仓/便宜满仓；已验证正向）。默认即开启，此 flag 仅显式打开"
     )
@@ -2559,15 +2564,18 @@ if __name__ == "__main__":
             dlq.START = BACKTEST["start_date"]
             dlq.END = BACKTEST["end_date"]
             _dlq_mode = args.dlvq_mode
+            _dlq_rebal = args.dlvq_rebal or "quarter"
+            _freq_cn = {"month": "月频", "quarter": "季频", "half": "半年频", "year": "年频"}.get(_dlq_rebal, _dlq_rebal)
             print(f"  {'='*60}")
-            print(f"  ※ 本策略为【季度调仓】：官方编制法(中证红利低波930955口径)，"
-                  f"季频 / 股息率加权；模式={_dlq_mode}")
+            print(f"  ※ 本策略调仓频率:【{_freq_cn}】(rebal={_dlq_rebal})：官方编制法(中证红利低波930955口径)，"
+                  f"{_freq_cn} / 股息率加权；模式={_dlq_mode}")
             print(f"  ※ 红利通道仓位 overlay: "
                   f"{'关闭(满仓基线)' if args.no_div_channel_overlay else '开启'}"
                   f"{'' if args.no_div_channel_overlay else f' · {args.div_channel_mode}/w{args.div_channel_window}/k{args.k_min}'}")
             print(f"  ※ 股票池: 全A(all·锁定) — 本策略候选宇宙需全市场，zz800会饿死候选导致失真")
             dlq.run_official_backtest(
                 _dlq_mode,
+                rebal=args.dlvq_rebal,  # None=沿用模式默认(季度); year/half 降频压换手
                 pool="all",  # 本策略锁定全A池（zz800候选被饿死、质量复合失真；验证基线均在 all 池）
                 capital=args.capital,
                 overlay=not args.no_div_channel_overlay,
