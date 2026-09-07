@@ -118,8 +118,51 @@ def turnover(seq_w, per_year=4):
     return m, m * per_year, per
 
 
+def verify_repro(pools, ind_map, sel_path, top_n=12, ind_cap=2):
+    """🔴 复现率自检：池子选出的持仓 vs **引擎真实持仓**（sel CSV）逐期对拍。
+
+    2026-09-04 事故：本脚本以 **4.41/12** 的复现率输出了「取消行业上限 −34.3pp」的结论，
+    全盘作废（引擎真实口径是 volatility 键，而脚本默认按 fwd_yield 建模"现状"）。
+    → **任何离线实验室都必须先自证"我选的股票就是引擎选的股票"，才准引用它的数字。**
+
+    返回 {排序键: (平均交集, 完全一致期数, 总期数)}；调用方应只信任复现率最高的键。
+    """
+    if not sel_path or not os.path.exists(sel_path):
+        print("⚠️ 未提供引擎 sel 文件 → **跳过复现率自检，以下数字可信度未知**。"
+              "建议加 --verify-sel <bt_quality_sel_*.csv>")
+        return {}
+    sel = pd.read_csv(sel_path, dtype={"rebal_date": str, "ts_code": str}, encoding="utf-8-sig")
+    eng = {str(rb): [str(c) for c in g["ts_code"]]
+           for rb, g in sel.groupby(sel["rebal_date"].astype(str))}
+    out = {}
+    for key in ("fwd_yield", "volatility"):
+        tot = []
+        for p in pools:
+            rb = str(p["rebal_date"].iloc[0])
+            if rb not in eng:
+                continue
+            d = p.sort_values(key, ascending=(key != "fwd_yield")).reset_index(drop=True)
+            pk = pick_by_rank(d, top_n, ind_cap, ind_map)
+            tot.append(len(set(pk) & set(eng[rb])))
+        if tot:
+            out[key] = (float(np.mean(tot)), sum(1 for x in tot if x == top_n), len(tot))
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="B9 候选池实验室（离线秒算换手对比）")
+    ap.add_argument("window", nargs="*", help="起始/结束日期，用于选 pool 目录后缀")
+    ap.add_argument("--verify-sel", default=None,
+                    help="引擎 bt_quality_sel_*.csv，用于**复现率自检**（强烈建议提供）")
+    ap.add_argument("--min-repro", type=float, default=11.0,
+                    help="复现率阈值（平均交集/持仓数），低于则**拒绝输出结论**（默认 11/12）")
+    args = ap.parse_args()
+
+    global POOL_DIR
+    if args.window:
+        POOL_DIR = POOL_DIR + "_" + "_".join(args.window)
     if not os.path.isdir(POOL_DIR):
         print(f"[err] 没有候选池目录 {POOL_DIR}，先跑 divlow_b8_key_smoke.py")
         return
@@ -145,6 +188,22 @@ def main():
     def srt(df, key):
         return df.sort_values(key, ascending=(key != "fwd_yield")).reset_index(drop=True)
 
+    # ── 🔴 复现率自检：先证明"我选的股票就是引擎选的股票"，否则拒绝出结论 ──
+    repro = verify_repro(pools, ind_map, args.verify_sel, top_n=12, ind_cap=2)
+    best_key = None
+    if repro:
+        print("\n【复现率自检】池子选出的持仓 vs 引擎真实持仓（同池同法，只换排序键）")
+        for k, (m, exact, n) in repro.items():
+            print(f"  {k:<12} 平均交集 {m:>5.2f}/12   完全一致 {exact}/{n} 期")
+        best_key = max(repro, key=lambda k: repro[k][0])
+        print(f"  → 引擎实际生效的排序键 = **{best_key}**（复现率最高）")
+        if repro[best_key][0] < args.min_repro:
+            print(f"\n🔴 复现率 {repro[best_key][0]:.2f}/12 < 阈值 {args.min_repro} → "
+                  f"**拒绝输出换手结论**：池子与引擎真实输入存在未定位偏差。\n"
+                  f"   （2026-09-04 事故：本脚本曾以 4.41/12 的复现率输出「−34.3pp」错误结论）")
+            return
+        print(f"  ✅ 复现率达标（≥{args.min_repro}），继续。")
+
     cases = [
         ("A 现状：yield键 + 每行业≤2", dict(key="fwd_yield", mode="cnt", ind_cap=2, top_n=12)),
         ("B B8：vol键 + 每行业≤2", dict(key="volatility", mode="cnt", ind_cap=2, top_n=12)),
@@ -157,6 +216,12 @@ def main():
         ("I vol键 + 权重≤20% + dy/vol加权", dict(key="volatility", mode="wcap", ind_cap=0,
                                               top_n=12, wmode="dy_vol")),
     ]
+
+    # 🔴 现状口径必须按"引擎实际生效的键"建模，否则"vs 现状"的差值全是假的
+    if best_key and cases[0][1]["key"] != best_key:
+        print(f"⚠️ case A「现状」的排序键 {cases[0][1]['key']} → 自动改为 {best_key}"
+              f"（否则'现状'不是引擎的现状，差值无意义）")
+        cases[0][1]["key"] = best_key
 
     print(f"\n{'口径':<26}{'持仓':>4}{'每期新进均值':>12}{'留存率':>9}"
           f"{'每期单边':>10}{'年化单边':>10}{'每期双边':>10}")
