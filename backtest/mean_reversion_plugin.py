@@ -170,7 +170,16 @@ class MeanReversionStrategyPlugin(BaseStrategy):
         """执行买入（半/全仓 + 凯利封顶 + ATR 初始化），供即时买入与 headfake 确认复用。"""
         if self.position > 0:
             return False
-        position_pct = 0.95 if self.position_mode == 'full' else 0.50
+        # ⚠️ 2026-09-07 修正：原为硬编码 0.95/0.50，无法配置。
+        #    更严重的是——多股分仓时真正决定单票仓位的就是这一行：
+        #    kelly_max_position 因封顶基准是【组合总资金】而永远不触发
+        #    （每票切片 1/N，意图金额远小于 20%×总资金，详见 config.py 注释）。
+        #    也就是说「想调仓位只能改这里」，而这里原先写死，无法改。→ 改为可配置。
+        _pct = self.cfg.get("position_pct", None)
+        if _pct is not None:
+            position_pct = float(_pct)
+        else:
+            position_pct = 0.95 if self.position_mode == 'full' else 0.50
         buy_amount = self.cash * position_pct
         shares = int(buy_amount / open_price / 100) * 100
         if shares <= 0:

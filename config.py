@@ -685,12 +685,33 @@ STRATEGIES = {
 
         "position_mode": "half",     # "half"=半仓,"full"=全仓
 
-        # ── 凯利公式仓位（总持仓封顶，经验预设非回测实测）──
+        # ── 单票实际仓位（★ 2026-09-07 实测：多股分仓时真正生效的是这一项）──
+        #   None ⇒ 回退 position_mode（half=0.50 / full=0.95），行为与历史完全一致。
+        #   设为数值则直接覆盖，如 0.50 表示「用该票分到资金的 50% 建仓」。
+        #   换算到组合口径：单票仓位 = position_pct / 股票只数（40 只 × 0.50 = 每票 1.25%）。
+        #  ⚠️ 实测结论（docs/position_sizing_experiment_plan.md §3.6）：
+        #     组合级共享池下最优单笔 ≈ 10%，而平台当前等效仅 1.25%（40 只均分半仓）
+        #     ⇒ 资金大量闲置，收益被系统性低估。调仓请改这里，不要改 kelly_*。
+        "position_pct": None,
+
+        # ── 凯利公式仓位（⚠️ 多股分仓下【不生效】，2026-09-07 实测确认）──
+        #  原因：cap_by_kelly 的封顶基准是【组合总资金】（run_backtest.py 注入
+        #        scfg["total_capital"] = _total_capital，注释称"避免高价股被禁仓"），
+        #        而每票只拿到总资金的 1/N。以 100 万 / 40 只为例：
+        #        夹子上限 = 20% × 100 万 = 20 万，单票现金仅 2.5 万、意图买入 1.25 万
+        #        ⇒ min(1.25万, 20万, 2.5万) = 1.25 万，夹子恒不触发。
+        #  实测：股价 5 / 20 / 100 元三档下 cap_by_kelly 均原样放行，确认从未生效。
+        #  ⚠️ 三个由此产生的坑，改动前必读：
+        #    1. 不要靠调 kelly_max_position 来控仓 —— 它在多股分仓下是死代码。
+        #    2. 不要把 use_kelly 改成 False —— 若某处未注入 total_capital，
+        #       cap_by_kelly 会退化为以【单票资金】为基准，夹子突然生效，行为突变。
+        #    3. 凯利自适应本身已证伪：正确凯利 f*≈326%~591%（恒 >100%），
+        #       KellySizer 输出恒被 kelly_max_position 夹住 ⇒ 与"固定上限"无区别。
         "use_kelly": True,
         "kelly_win_rate": 0.55,         # 均值回归类胜率保守估计
         "kelly_win_loss_ratio": 1.5,    # 盈亏比（赚1.5元亏1元）
         "kelly_fraction": 1.0,          # 半凯利
-        "kelly_max_position": 0.20,     # 最大仓位20%
+        "kelly_max_position": 0.20,     # 最大仓位20%（多股分仓下不生效，见上）
         "kelly_min_position": 0.05,     # 最小仓位5%
         "kelly_safety_discount": 1.0,   # 参数不确定性再打8折
 
