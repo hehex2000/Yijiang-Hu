@@ -1827,7 +1827,46 @@ def run_backtest(stocks):
         print(f"  {'─'*80}")
 
         results = []
+
+        # ── 组合级共享资金池（opt-in，★默认关闭★）───────────────────────────
+        # 逐票独立架构下单票仓位被锁死在 position_pct/N（40 只 × 0.50 = 1.25%），
+        # 组合总暴露仅 ~8.5%，91.5% 资金闲置（实测 CAGR 3.40% vs 共享池 13.96%）。
+        # 开启后改走 backtest/portfolio_engine.py：一个资金池 + 逐日盯市 +
+        # 单笔 = 当前权益 × portfolio_f。
+        # ⚠️ 口径与逐票不同，结果不可与历史逐票数字混用。
+        _pf_done = False
+        if skey in plugins and scfg.get("portfolio_shared_pool"):
+            try:
+                from backtest.portfolio_engine import run_portfolio_mode
+                _bh_mean = float(np.mean(list(bh_results.values()))) if bh_results else 0.0
+                _prow = run_portfolio_mode(stock_data, plugins[skey], scfg,
+                                           _total_capital, start, end,
+                                           idx_ret=idx_ret, bh_mean=_bh_mean)
+                if _prow:
+                    _m = _prow["metrics"]
+                    _pf_done = True
+                    print(f"  {'组合':<8} {_prow['name']:<8} {_prow['initial']:>9,.0f} "
+                          f"{_prow['final_val']:>9,.0f} {_prow['profit']:>+9,.0f} "
+                          f"{_prow['ret']:>+7.2f}% {_prow['exc']:>+7.2f}% {_prow['trades']:>6} "
+                          f"{_prow['max_dd']:>6.2f}% {_dd_period_str(_prow['dd_period']):<24} "
+                          f"{_prow['win_rate']:>6.1f}%")
+                    print(f"    └ 组合级口径: 单笔 f={_m['f']:.3f}｜暴露 {_m['exposure']*100:.1f}%｜"
+                          f"均并发 {_m['avg_conc']:.2f}｜成交 {_m['n_taken']}/{_m['n_signal_buy']}"
+                          f"（{_m['take_rate']*100:.1f}%）｜部署率 {_m['deploy']*100:.1f}%｜"
+                          f"均笔 {_m['avg_rt_pct']:+.3f}%")
+                    print(f"    └ 诊断: skip_cap={_m['skip_cap']} skip_cash={_m['skip_cash']} "
+                          f"skip_lot={_m['skip_lot']}"
+                          f"（skip_cash 大 ⇒ 资金约束在吞信号，可考虑降 f）")
+                    _prow["_pf_initial"] = _prow["initial"]
+                    results.append(_prow)
+            except Exception as _e:  # noqa: BLE001
+                print(f"  [ERR] 组合级引擎失败，回退逐票: {_e}")
+                import traceback
+                traceback.print_exc()
+
         for code, (name, df, start_idx) in stock_data.items():
+            if _pf_done:
+                break
             try:
                 # ── 优先使用插件（类方式，自动发现 backtest/*_plugin.py）───
                 if skey in plugins:
@@ -1918,11 +1957,13 @@ def run_backtest(stocks):
                 yr_desc = " ".join(f"{y}年({c})" for y, c in s["dd_year_counts"].items())
                 print(f"  最大回撤高发期: {yr_desc}")
             # 资金汇总
-            total_initial = capital * len(results)
+            total_initial = sum(r.get("_pf_initial", capital) for r in results)
             total_final = sum(r["final_val"] for r in results)
             total_profit = sum(r["profit"] for r in results)
             total_ret = (total_final / total_initial - 1) * 100 if total_initial > 0 else 0
-            print(f"  资金汇总: 总投入{total_initial:>9,.0f} (=每支{capital:,.0f}元 × {len(results)}只)  总资产{total_final:>9,.0f}  "
+            _pf_tag = ("组合共享池" if any("_pf_initial" in r for r in results)
+                       else f"每支{capital:,.0f}元 × {len(results)}只")
+            print(f"  资金汇总: 总投入{total_initial:>9,.0f} (={_pf_tag})  总资产{total_final:>9,.0f}  "
                   f"总盈亏{total_profit:>+9,.0f}  总收益率{total_ret:+.2f}%  年化收益率均值{s['annual_mean']:+.2f}%")
 
     # ══ 总表 ══
