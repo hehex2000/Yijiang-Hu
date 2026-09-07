@@ -320,7 +320,9 @@ def run_portfolio_mode(stock_data: dict, plugin_class, scfg: dict,
         "ann_ret": m["cagr_pct"],
         "exc": ret - idx_ret,
         "vs_bh": ret - bh_mean,
-        "trades": m["n_taken"],
+        # 口径对齐逐票：逐票 trades = 买卖双边总数，组合级若只报 n_taken（买入数）
+        # 会系统性少约一半。n_closed = 已平仓 round-trip 数（含期末强平，与逐票同口径）。
+        "trades": m["n_taken"] + m["n_closed"],
         "beat": ret > idx_ret,
         "max_dd": m["mdd_pct"],
         "dd_period": m["dd_period"],
