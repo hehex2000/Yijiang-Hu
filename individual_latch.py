@@ -86,8 +86,8 @@ def latch_mask(close_path, thr, golden=None):
 
 
 def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
-                            coef_fn, mask_cache, enabled=True):
-    """镜像 dlq.run_nav_weighted，叠加【逐股锁存掩码】。
+                            coef_fn, mask_cache, enabled=True, port_mask=None):
+    """镜像 dlq.run_nav_weighted，叠加【逐股锁存掩码】+【可选·组合层 A15 全局掩码】。
 
     与 individual_trail.run_nav_weighted_trail 的两处关键差别（为锁存语义所必需）：
       1. 再平衡日：掩码为 out 的目标股【不建仓】（记为 stopped），而不是"买了再立刻卖"。
@@ -97,6 +97,13 @@ def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
          导致自证（掩码恒 True 应 ≡ 基线）失败。
 
     ⚠️ 锁存跨再平衡持续：只在 MACD 金叉解锁（mask 转 in）后才重新建仓。
+
+    port_mask（组合层 A15，可选，None=不启用）：
+      长度 = len(all_dates) 的 bool 数组，True=允许持仓。False 日 → 全部清仓转现金并锁存，
+      转 True 后按本期目标权重回补。语义与组合层 decompose_trail_ab.locked_stop 一致
+      （全局清仓 + MACD 金叉解锁），差别只在作用层级（这里作用于个股持仓集合）。
+      ⚠️ 信号源固定为【影子基线净值】而非本方案自身净值（见 individual_port_ab.py），
+      以保证 S2/S3 两档的组合层信号逐位相同 → 交互项可干净分解（port_mask=None 时行为不变）。
     """
     from run_dividend_low_vol_quality_bt import (
         EXEC_PMAP, PRICE_MODE, INIT_CAPITAL, ffill_price, get_open_price, _sel_date_of,
@@ -104,12 +111,32 @@ def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
     cash = INIT_CAPITAL
     positions = {}
     stopped = set()          # 当前处于「锁存·未解锁」的个股
+    port_reentry = set()     # 组合层解锁后待回补的个股
+    port_stopped = False     # 组合层是否已触发全局清仓
     nav = []
     pos_cnt = []
     rebal_set = dict(targets)
     cur_rb = None
 
     for idx, d in enumerate(all_dates):
+        # ── 组合层 A15：先决定「今天能不能持仓」，再走个股层逻辑 ──
+        p_ok = True if port_mask is None else bool(port_mask[idx])
+        if not p_ok:
+            if positions:
+                for code in sorted(positions.keys()):   # sorted 保确定性
+                    px = ffill_price(price_map, code, d, all_dates, idx)
+                    if px is None:
+                        continue
+                    sh = positions[code]
+                    cash += px * sh - calc_fee("sell", px, sh)
+                    del positions[code]
+            port_stopped = True
+        elif port_stopped:
+            port_stopped = False
+            # 再平衡日由正常再平衡流程自然建仓；否则标记待回补（下方回场循环 sorted 买入）
+            if rebal_set.get(d) is None and cur_rb is not None:
+                port_reentry |= set(rebal_set.get(cur_rb, []))
+
         rb_target = rebal_set.get(d)
         if rb_target is not None:
             cur_rb = d
@@ -133,7 +160,9 @@ def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
                 if px is None:
                     continue
                 wt = wmap.get(code, 0.0)
-                if enabled and wt > 0 and not mask_cache[code][idx]:
+                if not p_ok:
+                    wt = 0.0            # 组合层 A15 触发 → 全局不建仓
+                elif enabled and wt > 0 and not mask_cache[code][idx]:
                     wt = 0.0            # 锁存未解 → 本期跳过建仓（不付无谓的双边费用）
                     stopped.add(code)
                 desired_val = mv * wt * k
@@ -176,10 +205,11 @@ def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
                         cash += proceeds
                         del positions[code]
                         stopped.add(code)
-                # 回场：仅限 stopped 集合（真被踢出去的），mask 转 in 且仍属本期目标
+                # 回场：仅限 stopped 集合（真被踢出去的）+ 组合层解锁待回补，
+                #       mask 转 in 且仍属本期目标
                 # 🔴 必须 sorted()：set 迭代顺序受 PYTHONHASHSEED 跨进程随机化影响，
                 #    现金不足以买回全部待回场个股时，"谁先买到"会随进程变化 → 同参不同结果。
-                for code in sorted(stopped):
+                for code in sorted(set(stopped) | port_reentry):
                     if mask_cache[code][idx] and code in rebal_set.get(cur_rb, []):
                         wmap = weights_map.get(str(cur_rb), {})
                         wt = wmap.get(code, 0.0)
@@ -199,10 +229,12 @@ def run_nav_weighted_masked(targets, weights_map, price_map, all_dates,
                                     cash -= cost
                                     positions[code] = desired
                                     stopped.discard(code)
+                                    port_reentry.discard(code)
                                     continue
                     # 已不在本期目标 → 移出跟踪
                     if code not in rebal_set.get(cur_rb, []):
                         stopped.discard(code)
+                        port_reentry.discard(code)
 
         mv = cash
         for code, sh in positions.items():
