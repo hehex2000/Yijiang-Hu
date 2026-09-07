@@ -163,7 +163,15 @@ def extract_signals(codes: list):
 # 组合级模拟
 # ─────────────────────────────────────────────────────────────
 def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = INIT_CAPITAL,
-             fixed_f: float = None, fixed_cap: int = None):
+             fixed_f: float = None, fixed_cap: int = None,
+             date_from: str = None, date_to: str = None,
+             keep_frac: float = 1.0, seed: int = 0):
+    """keep_frac < 1：随机丢弃 BUY 信号（归因实验用，见 run_attribution）。"""
+    # 区间切片（walk-forward 用）：先切 px，后续 codes/px_mat/calendar 自动跟随
+    if date_from or date_to:
+        keep = [d for d in px.index
+                if (not date_from or d >= date_from) and (not date_to or d <= date_to)]
+        px = px.loc[keep]
     codes = list(px.columns)
     ci = {c: i for i, c in enumerate(codes)}
     px_mat = px.values.astype(float)
@@ -176,16 +184,18 @@ def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = IN
             continue
         (buys if e["action"] == "BUY" else sells).setdefault(e["date"], []).append(e)
 
+    rng = np.random.default_rng(seed) if keep_frac < 1.0 else None
     cash = init_capital
     shares_vec = np.zeros(len(codes))
     cost_vec = np.zeros(len(codes))
     closed = []
     nav = np.zeros(ndays)
     inv = np.zeros(ndays)
+    pos_cnt = np.zeros(ndays)      # 每日实际同时持仓标的数
     last_equity = init_capital
 
     n_sig_buy = sum(len(v) for v in buys.values())
-    n_taken, skip_cap, skip_cash, skip_lot = 0, 0, 0, 0
+    n_taken, skip_cap, skip_cash, skip_lot, skip_rand = 0, 0, 0, 0, 0
     deploys, f_used = [], []
 
     for t, date in enumerate(calendar):
@@ -206,6 +216,9 @@ def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = IN
         for e in buys.get(date, []):
             j = ci[e["code"]]
             if shares_vec[j] > 0:
+                continue
+            if rng is not None and rng.random() > keep_frac:
+                skip_rand += 1
                 continue
             f = fixed_f if fixed_f is not None else compute_f(tier, closed)
             f_used.append(f)
@@ -243,6 +256,7 @@ def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = IN
         invested = float(np.dot(shares_vec, prices_t))
         equity = cash + invested
         nav[t], inv[t] = equity, invested
+        pos_cnt[t] = float((shares_vec > 0).sum())
         last_equity = equity
 
     # 期末强平（与插件「回测结束平仓」同口径，保证各档可比）
@@ -258,7 +272,8 @@ def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = IN
             shares_vec[j] = 0.0
     terminal = cash
 
-    years = (pd.Timestamp(END) - pd.Timestamp(START)).days / 365.25
+    span_days = (pd.Timestamp(calendar[-1]) - pd.Timestamp(calendar[0])).days
+    years = span_days / 365.25
     total_ret = terminal / init_capital - 1.0
     cagr = (terminal / init_capital) ** (1 / years) - 1.0 if terminal > 0 and years > 0 else -1.0
     rets = np.diff(nav) / np.where(nav[:-1] > 0, nav[:-1], np.nan)
@@ -279,9 +294,14 @@ def simulate(tier: str, events: list, px: pd.DataFrame, init_capital: float = IN
         "n_signal_buy": n_sig_buy,
         "n_taken": n_taken,
         "take_rate": n_taken / n_sig_buy if n_sig_buy else 0.0,
+        "avg_conc": float(np.mean(pos_cnt)),       # 实际平均同时持仓数（≠ 名义 cap）
+        "p90_conc": float(np.percentile(pos_cnt, 90)),
+        "max_conc": float(np.max(pos_cnt)),
+        "days_invested_pct": float((pos_cnt > 0).mean() * 100),
         "skip_cap": skip_cap,
         "skip_cash": skip_cash,
         "skip_lot": skip_lot,
+        "skip_rand": skip_rand,
         "deploy": float(np.mean(deploys)) if deploys else 0.0,
         "terminal": terminal,
         "total_ret_pct": total_ret * 100,
@@ -331,10 +351,211 @@ def run_grid(events: list, px: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
+# ─────────────────────────────────────────────────────────────
+# P2② · 并发上限 / 分散度
+# ─────────────────────────────────────────────────────────────
+def signal_capacity(events: list, px: pd.DataFrame) -> np.ndarray:
+    """若 cap=∞ 且现金无限，逐日同时持仓标的数 = **信号供给上限曲线**。
+
+    这是判定「提 cap 有没有用」的前置诊断：
+      若理论并发中位本来就只有 N，那把 cap 提到 ≫N 纯属空转，
+      真正瓶颈是**信号供给 / 股票池宽度**，而不是并发上限。
+    """
+    calendar = list(px.index)
+    codes = list(px.columns)
+    ci = {c: i for i, c in enumerate(codes)}
+    open_vec = np.zeros(len(codes), dtype=bool)
+    cnt = np.zeros(len(calendar))
+    buys, sells = {}, {}
+    for e in events:
+        if e["code"] not in ci:
+            continue
+        (buys if e["action"] == "BUY" else sells).setdefault(e["date"], []).append(e)
+    for t, date in enumerate(calendar):
+        for e in sells.get(date, []):          # 与 simulate 同序：先卖后买
+            open_vec[ci[e["code"]]] = False
+        for e in buys.get(date, []):
+            j = ci[e["code"]]
+            if open_vec[j]:
+                continue
+            open_vec[j] = True
+        cnt[t] = open_vec.sum()
+    return cnt
+
+
+P2B_EXPOSURES = [0.5, 0.8, 1.0]      # A 组：名义目标总暴露
+P2B_CAPS = [1, 2, 3, 5, 8, 12, 20, 30]
+P2B_FIXED_F = 0.20                    # B 组：平台默认单笔比例
+P2C_F_LIST = [0.50, 0.30, 0.25, 0.20, 0.167, 0.125, 0.10, 0.083, 0.05]
+
+
+def _print_row(tag, cap, f, m):
+    print(f"  {tag:<12}{cap:>4}{f:>7.3f}{m['n_taken']:>6}"
+          f"{m['avg_conc']:>7.2f}{m['p90_conc']:>6.0f}{m['max_conc']:>5.0f}"
+          f"{m['exposure']*100:>8.1f}{m['cagr_pct']:>8.2f}{m['sharpe']:>7.2f}"
+          f"{m['mdd_pct']:>9.2f}{m['avg_rt_pct']:>8.3f}")
+
+
+def _hdr(tag_w=12):
+    print(f"  {'组':<{tag_w}}{'cap':>4}{'f':>7}{'成交':>6}"
+          f"{'均并发':>7}{'P90':>6}{'max':>5}"
+          f"{'暴露%':>8}{'CAGR%':>8}{'Sharpe':>7}{'MDD%':>9}{'均笔%':>8}")
+    print("  " + "-" * 95)
+
+
+def run_capscan(events: list, px: pd.DataFrame):
+    """P2② · 并发上限（分散度）扫描。
+
+    P2① 已证：主导变量是 cap 而非仓位算法。但 P2① 里 cap 与 f 仍是「f×cap ≤ 1」的松散组合，
+    各档**实际暴露度差异很大**（39.9%~48.0%），无法区分「分散化红利」与「只是多买了点」。
+
+    本扫描把**名义总暴露钉死**：f = E / cap ⇒ f×cap = E 恒定。
+    这样跨 cap 比较时名义目标暴露一致，剩下的差异才真正来自「分散到几个标的」。
+    （实际暴露仍会因信号供给不足而低于 E，故同时报实际暴露与均并发做交叉校验。）
+
+    B 组（f 恒 0.20）作为对照：暴露随 cap 单调上升，观察「多吃信号」这条路径的边际收益。
+    """
+    cnt = signal_capacity(events, px)
+    print("\n[P2②-0] 信号供给上限诊断（cap=∞ + 现金无限时的理论并发）")
+    print(f"  均值 {cnt.mean():.2f}｜中位 {np.median(cnt):.0f}｜P75 {np.percentile(cnt,75):.0f}"
+          f"｜P90 {np.percentile(cnt,90):.0f}｜P99 {np.percentile(cnt,99):.0f}｜最大 {cnt.max():.0f}")
+    print(f"  空仓天数占比 {(cnt == 0).mean()*100:.1f}%｜≥5 只天数占比 {(cnt >= 5).mean()*100:.1f}%"
+          f"｜≥10 只 {(cnt >= 10).mean()*100:.1f}%｜≥20 只 {(cnt >= 20).mean()*100:.1f}%")
+    print("  → cap 超过 P90 之后基本是空转；若想再提并发，得先扩信号供给（加宽池子/放宽入场）")
+
+    rows = []
+    for E in P2B_EXPOSURES:
+        print(f"\n[P2②-A] 暴露归一化：f = {E:.1f}/cap（名义总暴露恒定 {E*100:.0f}%，只改分散度）")
+        _hdr()
+        for cap in P2B_CAPS:
+            f = E / cap
+            m, _ = simulate(f"E{E:.1f}", events, px, fixed_f=f, fixed_cap=cap)
+            m["group"] = f"A_E{E:.1f}"
+            m["target_exposure"] = E
+            rows.append(m)
+            _print_row(f"A_E{E:.1f}", cap, f, m)
+
+    print(f"\n[P2②-B] 对照：f 恒 {P2B_FIXED_F:.2f}（暴露随 cap 单调上升，观察多吃信号的边际收益）")
+    _hdr()
+    for cap in P2B_CAPS:
+        m, _ = simulate("B_fix20", events, px, fixed_f=P2B_FIXED_F, fixed_cap=cap)
+        m["group"] = "B_fix20"
+        m["target_exposure"] = P2B_FIXED_F * cap
+        rows.append(m)
+        _print_row("B_fix20", cap, P2B_FIXED_F, m)
+
+    print(f"\n[P2②-C] 平台真实口径：无硬 cap，每笔投 equity×f，靠现金自然饱和"
+          f"（这才是能直接映射到 config.position_pct 的曲线）")
+    _hdr()
+    for f in P2C_F_LIST:
+        m, _ = simulate("C_nocap", events, px, fixed_f=f, fixed_cap=99)
+        m["group"] = "C_nocap"
+        m["target_exposure"] = f * 99
+        rows.append(m)
+        _print_row("C_nocap", 99, f, m)
+
+    return pd.DataFrame(rows)
+
+
+WF_WINDOWS = [
+    # 3 个【不重叠】窗口（独立性最强，但每窗仅 2~2.5 年）
+    ("W1", "20190101", "20211231"),
+    ("W2", "20220101", "20231231"),
+    ("W3", "20240101", "20260731"),
+    # 5 个【滚动】窗口（3 年窗 1 年步长，满足 5/5 判据；相邻重叠故不独立，仅作稳健性补充）
+    ("R1", "20190101", "20211231"),
+    ("R2", "20200101", "20221231"),
+    ("R3", "20210101", "20231231"),
+    ("R4", "20220101", "20241231"),
+    ("R5", "20230101", "20260731"),
+]
+
+
+def run_walkforward(events: list, px: pd.DataFrame):
+    """P2③ · walk-forward 稳定性检验。
+
+    既然结论要动**默认参数**，单一样本路径的峰值 f 不足以支撑 —— 必须证明
+    「f 越小风险调整后越优 / CAGR 峰值位置」在**不重叠子区间**上稳定复现。
+    判据：各窗口的 Sharpe 单调性一致 + CAGR 峰值 f 不飘移到样本外相反的端点。
+    """
+    print("\n[P2③] walk-forward：3 个不重叠窗口 × C 组 f 扫描（平台真实口径，无硬 cap）")
+    rows = []
+    for tag, d0, d1 in WF_WINDOWS:
+        print(f"\n  ── {tag}  {d0}~{d1} ──")
+        _hdr(tag_w=6)
+        best_cagr, best_sharpe = None, None
+        for f in P2C_F_LIST:
+            m, _ = simulate("C_nocap", events, px, fixed_f=f, fixed_cap=99,
+                            date_from=d0, date_to=d1)
+            m["window"], m["f"] = tag, f
+            rows.append(m)
+            print(f"  {tag:<6}{99:>4}{f:>7.3f}{m['n_taken']:>6}"
+                  f"{m['avg_conc']:>7.2f}{m['p90_conc']:>6.0f}{m['max_conc']:>5.0f}"
+                  f"{m['exposure']*100:>8.1f}{m['cagr_pct']:>8.2f}{m['sharpe']:>7.2f}"
+                  f"{m['mdd_pct']:>9.2f}{m['avg_rt_pct']:>8.3f}")
+            if best_cagr is None or m["cagr_pct"] > best_cagr[1]:
+                best_cagr = (f, m["cagr_pct"])
+            if best_sharpe is None or m["sharpe"] > best_sharpe[1]:
+                best_sharpe = (f, m["sharpe"])
+        print(f"      └ {tag}: CAGR 峰值 f={best_cagr[0]:.3f} ({best_cagr[1]:.2f}%)  "
+              f"Sharpe 峰值 f={best_sharpe[0]:.3f} ({best_sharpe[1]:.2f})")
+    return pd.DataFrame(rows)
+
+
+ATTRIB_KEEPS = [1.0, 0.85, 0.75, 0.65, 0.55, 0.45]
+ATTRIB_SEEDS = 12
+
+
+def run_attribution(events: list, px: pd.DataFrame):
+    """P2④ · 归因：f=0.20→0.125 的改善，是「分散化」还是「多吃信号」？
+
+    C 组已证 f 越小越好，但 f 同时放松了现金约束 ⇒ 成交笔数从 291 涨到 374。
+    两者贡献必须拆开，因为指向的后续动作完全不同：
+      · 若是**分散化** → 降 f 本身就是解，且应继续加宽标的池
+      · 若是**多吃信号** → 真问题是资金约束，应改「按质量排序优先成交好信号」，
+                          而不是盲目降 f（f 再小就是资金闲置，C 组 f=0.05 已在 W1/W3 变差）
+
+    做法：固定 f=0.125，随机丢弃 BUY 信号把成交笔数压回 f=0.20 的水平（≈291），
+    多 seed 平均消除随机性。若此时 CAGR 仍显著高于 f=0.20 的 9.20% ⇒ 分散化红利真实存在。
+    """
+    print("\n[P2④] 归因：固定 f=0.125，随机丢弃 BUY 信号匹配 f=0.20 的成交笔数")
+    print(f"  基准 f=0.20 全信号：成交 291｜CAGR 9.20%｜Sharpe 0.63｜MDD -31.59%")
+    print(f"  对照 f=0.125 全信号：成交 374｜CAGR 14.20%｜Sharpe 1.01｜MDD -21.78%")
+    print(f"\n  {'keep':>6}{'成交':>7}{'均并发':>8}{'暴露%':>8}{'CAGR%':>9}{'(std)':>7}"
+          f"{'Sharpe':>8}{'MDD%':>9}{'均笔%':>8}")
+    print("  " + "-" * 72)
+    rows = []
+    for keep in ATTRIB_KEEPS:
+        cs, ss, ms, ns, es, aconc, arts = [], [], [], [], [], [], []
+        for sd in range(ATTRIB_SEEDS):
+            m, _ = simulate("attr", events, px, fixed_f=0.125, fixed_cap=99,
+                            keep_frac=keep, seed=sd)
+            ns.append(m["n_taken"]); cs.append(m["cagr_pct"]); ss.append(m["sharpe"])
+            ms.append(m["mdd_pct"]); es.append(m["exposure"] * 100)
+            aconc.append(m["avg_conc"]); arts.append(m["avg_rt_pct"])
+        row = {"keep": keep, "n_taken": float(np.mean(ns)), "avg_conc": float(np.mean(aconc)),
+               "exposure_pct": float(np.mean(es)), "cagr_pct": float(np.mean(cs)),
+               "cagr_std": float(np.std(cs)), "sharpe": float(np.mean(ss)),
+               "mdd_pct": float(np.mean(ms)), "avg_rt_pct": float(np.mean(arts))}
+        rows.append(row)
+        print(f"  {keep:>6.2f}{row['n_taken']:>7.0f}{row['avg_conc']:>8.2f}"
+              f"{row['exposure_pct']:>8.1f}{row['cagr_pct']:>9.2f}{row['cagr_std']:>7.2f}"
+              f"{row['sharpe']:>8.2f}{row['mdd_pct']:>9.2f}{row['avg_rt_pct']:>8.3f}")
+    print("\n  → 找到成交≈291 的那一行，与基准 CAGR 9.20% 比：")
+    print("     显著更高 ⇒ 分散化红利真实；≈9.20% ⇒ 改善全是「多吃信号」的功劳")
+    return pd.DataFrame(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", action="store_true",
                     help="P2① f×cap 解耦网格（默认跑 P1 的 6 档 A/B）")
+    ap.add_argument("--capscan", action="store_true",
+                    help="P2② 并发上限/分散度扫描（暴露归一化 f=E/cap + f 固定 0.20 对照 + 无 cap 平台口径）")
+    ap.add_argument("--attrib", action="store_true",
+                    help="P2④ 归因：随机丢弃 BUY 匹配成交笔数，拆分「分散化」vs「多吃信号」")
+    ap.add_argument("--wf", action="store_true",
+                    help="P2③ walk-forward：3 个不重叠窗口 + 5 个滚动窗口 × f 扫描")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -353,6 +574,24 @@ def main():
     nb = sum(1 for e in events if e["action"] == "BUY")
     ns = sum(1 for e in events if e["action"] == "SELL")
     print(f"  信号事件：BUY {nb} / SELL {ns}｜价格矩阵 {px.shape[0]} 日 × {px.shape[1]} 只\n")
+
+    if args.attrib:
+        df = run_attribution(events, px)
+        df.to_csv(OUT_DIR / "sizing_attribution.csv", index=False, encoding="utf-8-sig")
+        print(f"\n[已保存] {OUT_DIR}/sizing_attribution.csv")
+        return
+
+    if args.wf:
+        df = run_walkforward(events, px)
+        df.to_csv(OUT_DIR / "sizing_walkforward.csv", index=False, encoding="utf-8-sig")
+        print(f"\n[已保存] {OUT_DIR}/sizing_walkforward.csv")
+        return
+
+    if args.capscan:
+        df = run_capscan(events, px)
+        df.to_csv(OUT_DIR / "sizing_capscan.csv", index=False, encoding="utf-8-sig")
+        print(f"\n[已保存] {OUT_DIR}/sizing_capscan.csv")
+        return
 
     if args.grid:
         df = run_grid(events, px)
