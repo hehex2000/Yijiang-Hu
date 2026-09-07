@@ -1850,7 +1850,9 @@ def run_backtest(stocks):
                           f"{_prow['ret']:>+7.2f}% {_prow['exc']:>+7.2f}% {_prow['trades']:>6} "
                           f"{_prow['max_dd']:>6.2f}% {_dd_period_str(_prow['dd_period']):<24} "
                           f"{_prow['win_rate']:>6.1f}%")
-                    print(f"    └ 组合级口径: 单笔 f={_m['f']:.3f}｜暴露 {_m['exposure']*100:.1f}%｜"
+                    _f_tag = (f"{_m['f']:.3f}(自动2/N)" if _m.get("f_auto")
+                              else f"{_m['f']:.3f}")
+                    print(f"    └ 组合级口径: 单笔 f={_f_tag}｜暴露 {_m['exposure']*100:.1f}%｜"
                           f"均并发 {_m['avg_conc']:.2f}｜成交 {_m['n_taken']}/{_m['n_signal_buy']}"
                           f"（{_m['take_rate']*100:.1f}%）｜部署率 {_m['deploy']*100:.1f}%｜"
                           f"均笔 {_m['avg_rt_pct']:+.3f}%")

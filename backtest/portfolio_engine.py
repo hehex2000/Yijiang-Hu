@@ -258,6 +258,29 @@ def simulate(events: list, px: pd.DataFrame, init_capital: float,
 # ─────────────────────────────────────────────────────────────
 # 3. 平台入口：给 run_backtest 用
 # ─────────────────────────────────────────────────────────────
+def resolve_f(scfg: dict, n_stocks: int) -> float:
+    """确定单笔比例 f。
+
+    `portfolio_f=None` ⇒ **自动模式**：f = clamp(2/N, 0.05, 0.25)。
+
+    实证依据（run_small_capital_scan.py，20200103~20260825，同区间双池对照）：
+        N=10 → CAGR 峰 f=0.20   N=20 → 0.10   N=40 → 0.05      ⇒ f×N ≈ 2.0 恒定
+        N=5  → 两池 CAGR 峰【一致落在 0.25】；f>0.25 后掉得明显
+               （hs300: 0.25→0.30 掉 0.52pp，0.30→0.40 掉 1.55pp）⇒ clamp 上限取 0.25
+    ⚠️ 这是**经验规律不是理论最优**：峰值 f 会随池子/区间漂移。
+       auto 相对各 N 最优的损失实测：zz800 上 0.00~0.03pp；hs300 上 0.29~1.49pp
+       （N=40 时 hs300 峰在 0.083 而 auto 给 0.05，差 1.49pp）。
+       自动模式只保证**量级正确**——而量级才是主效应（平台当前 f=0.0125 差 10pp+）；
+       要精确值请用扫描脚本针对你的池子重跑。
+    """
+    f = scfg.get("portfolio_f", 0.10)
+    if f is not None:
+        return float(f)
+    if n_stocks <= 0:
+        return 0.10
+    return float(min(max(2.0 / n_stocks, 0.05), 0.25))
+
+
 def run_portfolio_mode(stock_data: dict, plugin_class, scfg: dict,
                        total_capital: float, start: str, end: str,
                        idx_ret: float = 0.0, bh_mean: float = 0.0,
@@ -267,7 +290,7 @@ def run_portfolio_mode(stock_data: dict, plugin_class, scfg: dict,
     返回的 dict 字段与逐票 results 元素一致（ret/ann_ret/exc/...），
     因此 all_summaries 的 mean/median/best 等聚合对它退化为自身值，无需改汇总代码。
     """
-    f = float(scfg.get("portfolio_f", 0.10))
+    f = resolve_f(scfg, len(stock_data))
     cap = int(scfg.get("portfolio_cap", 0) or 0)
 
     events, px = extract_signals(stock_data, plugin_class, scfg, start)
@@ -275,6 +298,7 @@ def run_portfolio_mode(stock_data: dict, plugin_class, scfg: dict,
         return None
 
     m, nav = simulate(events, px, float(total_capital), f=f, cap=cap)
+    m["f_auto"] = scfg.get("portfolio_f", 0.10) is None
 
     if save_nav:
         try:
